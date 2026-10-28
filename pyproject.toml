@@ -2,7 +2,8 @@
 name = "atlasbt"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["numpy", "pandas>=2.2", "pyarrow", "scipy", "statsmodels", "exchange_calendars", "yfinance", "requests"]
+dependencies = ["numpy", "pandas>=2.2", "pyarrow", "scipy", "statsmodels", "exchange_calendars", "yfinance", "requests", "matplotlib"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
