@@ -138,14 +138,16 @@ def size_swing_risk(nav: float, entry: float, stop: float, *, current_gross: flo
 
 # =============================================================== SWING_NOTIONAL
 def size_swing_notional(nav: float, price: float, side: int = 1, *, current_gross: float = 0.0,
-                        long_frac: float = 0.10, short_frac: float = 0.05, gross_cap: float = 1.0,
-                        allow_fractional: bool = False) -> float:
+                        existing_notional: float = 0.0, long_frac: float = 0.10, short_frac: float = 0.05,
+                        gross_cap: float = 1.0, allow_fractional: bool = False) -> float:
     """SWING_NOTIONAL: long 10% NAV per instrument, short 5% NAV; no implicit
-    leverage (aggregate gross after the trade <= 100% NAV)."""
+    leverage (aggregate gross after the trade <= 100% NAV). New notional =
+    frac*NAV - existing SAME-SIDE notional in the instrument, floored at 0."""
     if not (nav > 0 and price > 0):
         return 0.0
     frac = long_frac if side >= 0 else short_frac
-    notional = min(frac * nav, max(gross_cap * nav - current_gross, 0.0))
+    room = max(frac * nav - abs(existing_notional), 0.0)
+    notional = min(room, max(gross_cap * nav - current_gross, 0.0))
     return (1 if side >= 0 else -1) * _whole(notional / price, allow_fractional)
 
 
@@ -431,7 +433,7 @@ def size_opt_cashsec(cash: float, strike: float, *, nav: Optional[float] = None,
     the equity single-name cap (10% NAV) when ``nav`` is given."""
     if not (strike > 0):
         return 0
-    per = strike * deliverable * (multiplier / 100.0)
+    per = strike * deliverable          # cash per contract = strike x deliverable shares
     avail = collateral.available(cash) if collateral is not None else cash
     n = int(math.floor(max(avail, 0.0) / per + 1e-9))
     if nav is not None and nav > 0:
@@ -494,4 +496,7 @@ def size_swing_risk_ctx(ctx, symbol: str, entry: float, stop: float, **kw) -> fl
 
 
 def size_swing_notional_ctx(ctx, symbol: str, price: float, side: int = 1, **kw) -> float:
-    return size_swing_notional(ctx.nav, price, side, current_gross=equity_gross(ctx), **kw)
+    q0 = ctx.position(symbol)
+    same_side = abs(q0) * price if (q0 > 0 and side >= 0) or (q0 < 0 and side < 0) else 0.0
+    return size_swing_notional(ctx.nav, price, side, current_gross=equity_gross(ctx),
+                               existing_notional=same_side, **kw)

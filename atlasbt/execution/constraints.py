@@ -32,9 +32,9 @@ def round_to_tick(price: float, tick: float, mode: str = "nearest") -> float:
         return price
     q = price / tick
     if mode == "up":
-        n = math.ceil(q - 1e-9)
+        n = math.ceil(q - 1e-6)
     elif mode == "down":
-        n = math.floor(q + 1e-9)
+        n = math.floor(q + 1e-6)
     else:
         n = math.floor(q + 0.5)
     return round(n * tick, 10)

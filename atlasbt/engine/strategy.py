@@ -38,7 +38,9 @@ class Requirement:
     note: str = ""
 
 
-#: engine-enforced session rules implied by sizing profiles (sheet "Sizing Profiles")
+#: engine-enforced session rules implied by sizing profiles (sheet "Sizing Profiles").
+#: Times are ET on a regular 16:00 session; on early-close days they shift with
+#: the actual close (15:55 -> close-5m, 15:15 -> close-45m).
 PROFILE_SESSION_RULES = {
     "DAY_RISK": {"no_new_entries_after": "15:15", "flat_by": "15:55"},
     "DAY_NOTIONAL": {"no_new_entries_after": None, "flat_by": "15:55"},
@@ -100,4 +102,11 @@ class Strategy:
         pass
 
     def on_session_end(self, ctx) -> None:
+        pass
+
+    def on_order_event(self, ctx, event: dict) -> None:
+        """Engine-initiated order changes (corporate-action adjustments or
+        cancellations, session-rule cancellations, reduce-only shrinking,
+        margin-call cancellations). ``event`` keys: ts, order_id, symbol,
+        action ('ADJUSTED'|'CANCELLED'), reason, plus before/after fields."""
         pass

@@ -23,90 +23,98 @@ if TYPE_CHECKING:  # pragma: no cover
     from .backtester import Backtester
 
 
+def engine_of(ctx: "EngineContext") -> "Backtester":
+    """ENGINE-INTERNAL accessor (tests/diagnostics only; strategies must not use it -
+    enforced by tests/engine/test_eng_strategy_lint.py)."""
+    return ctx._EngineContext__bt
+
+
 class EngineContext:
+    __slots__ = ("__bt", "__pit", "strategy_id", "state", "__weakref__")
+
     def __init__(self, bt: "Backtester"):
-        self._bt = bt
+        self.__bt = bt
         self.strategy_id = bt.strategy.id
-        self._pit = PITPortal(bt.portal, lambda: self.now, on_access=bt._note_data_access)
+        self.__pit = PITPortal(bt.portal, lambda: self.now, on_access=bt._note_data_access)
         self.state: dict[str, Any] = {}        # free scratch space for strategies
 
     # ------------------------------------------------------------------ time
     @property
     def now(self) -> pd.Timestamp:
-        return self._bt.now
+        return self.__bt.now
 
     def now_et(self) -> pd.Timestamp:
         return to_et(self.now)
 
     def session_date(self) -> pd.Timestamp:
-        return self._bt.session
+        return self.__bt.session
 
     def minutes_since_open(self) -> float:
-        o, _ = self._bt.session_open_close
+        o, _ = self.__bt.session_open_close
         return (self.now - o).total_seconds() / 60.0
 
     def minutes_to_close(self) -> float:
-        _, c = self._bt.session_open_close
+        _, c = self.__bt.session_open_close
         return (c - self.now).total_seconds() / 60.0
 
     def is_session_close_bar(self) -> bool:
-        _, c = self._bt.session_open_close
+        _, c = self.__bt.session_open_close
         return self.now >= c
 
     def calendar(self):
-        return self._bt.cal
+        return self.__bt.cal
 
     # ------------------------------------------------------------------ account
     @property
     def nav(self) -> float:
-        return self._bt.account.nav
+        return self.__bt.account.nav
 
     @property
     def prior_nav(self) -> float:
-        return self._bt.prior_nav
+        return self.__bt.prior_nav
 
     @property
     def cash(self) -> float:
-        return self._bt.account.cash
+        return self.__bt.account.cash
 
     def position(self, symbol: str) -> float:
-        return self._bt.account.position(symbol)
+        return self.__bt.account.position(symbol)
 
     def positions(self) -> dict[str, float]:
-        return self._bt.account.qty_map()
+        return self.__bt.account.qty_map()
 
     def open_orders(self, symbol: Optional[str] = None) -> list[Order]:
-        return self._bt.om.active(symbol)
+        return self.__bt.om.active(symbol)
 
     def mark(self, symbol: str) -> float:
         """Latest known price (last completed bar close / position mark)."""
-        return self._bt.last_price(symbol)
+        return self.__bt.last_price(symbol)
 
     def account(self):
         """Read-only view of the account (positions with avg price/marks)."""
-        return self._bt.account
+        return self.__bt.account
 
     # ------------------------------------------------------------------ data
     def portal(self) -> PITPortal:
-        return self._pit
+        return self.__pit
 
     def instrument(self, symbol: str) -> Instrument:
-        return self._bt.instrument(symbol)
+        return self.__bt.instrument(symbol)
 
     def history(self, symbol: str, n: int, freq: Optional[str] = None, adjusted: bool = True,
                 sessions: Sequence[str] = ("RTH",)) -> pd.DataFrame:
         """Last ``n`` COMPLETED bars (known_at <= now). Daily bars of the
         current session are never included before the close."""
-        freq = canonical_freq(freq or self._bt.base_freq)
+        freq = canonical_freq(freq or self.__bt.base_freq)
         now = self.now
-        if not adjusted and freq == self._bt.base_freq and tuple(sessions) == tuple(self._bt.data_sessions):
-            b = self._bt.md.bars(symbol, freq)
+        if not adjusted and freq == self.__bt.base_freq and tuple(sessions) == tuple(self.__bt.data_sessions):
+            b = self.__bt.md.bars(symbol, freq)
             i1 = b.last_index_at(int(now.value)) + 1
             i0 = max(i1 - n, 0)
             return b.frame(i0, i1)
-        cal = self._bt.cal
+        cal = self.__bt.cal
         if is_daily(freq):
-            sess = self._bt.session
+            sess = self.__bt.session
             back = cal.prev_session(sess, min(n + 5, max(cal.session_index(sess), 1)))
             start = cal.open_close(back)[0] - pd.Timedelta(days=1)
         else:
@@ -115,31 +123,62 @@ class EngineContext:
             ext = 16 * 3600 / td.total_seconds() if any(s != "RTH" for s in sessions) else bars_per_day
             days = int(np.ceil(n / max(ext, 1))) + 3
             start = now - pd.Timedelta(days=int(days * 7 / 5) + 4)
-        df = self._pit.bars(symbol, freq, start, now + pd.Timedelta(1, "ns"), as_of=now, adjusted=adjusted,
+        df = self.__pit.bars(symbol, freq, start, now + pd.Timedelta(1, "ns"), as_of=now, adjusted=adjusted,
                             sessions=sessions)
         if df is None:
             return pd.DataFrame()
         return df.iloc[-n:] if n is not None else df
 
+    def history_arrays(self, symbol: str, n: int, freq: Optional[str] = None, adjusted: bool = False,
+                       sessions: Sequence[str] = ("RTH",)) -> dict:
+        """Fast PIT history: dict of READ-ONLY numpy arrays (start, end [int64 ns],
+        open, high, low, close, volume, session [int8: 0 RTH, 1 PRE, 2 POST, 3 DAY])
+        for the last ``n`` completed bars. Raw base-frequency bars are served as
+        views on the engine cache (no DataFrame); anything else falls back to
+        ``history`` and converts."""
+        freq = canonical_freq(freq or self.__bt.base_freq)
+        bt = self.__bt
+        if not adjusted and freq == bt.base_freq and tuple(sessions) == tuple(bt.data_sessions):
+            b = bt.md.bars(symbol, freq)
+            i1 = b.last_index_at(int(self.now.value)) + 1
+            i0 = max(i1 - n, 0)
+            out = {"start": b.start[i0:i1], "end": b.end[i0:i1], "open": b.o[i0:i1], "high": b.h[i0:i1],
+                   "low": b.l[i0:i1], "close": b.c[i0:i1], "volume": b.v[i0:i1], "session": b.sess[i0:i1]}
+            for v in out.values():
+                v.setflags(write=False)
+            return out
+        df = self.history(symbol, n, freq, adjusted=adjusted, sessions=sessions)
+        from .timeutil import as_ns_array
+        sess_map = {"RTH": 0, "PRE": 1, "POST": 2, "DAY": 3}
+        out = {"start": as_ns_array(df.index) if len(df) else np.zeros(0, np.int64),
+               "end": as_ns_array(df["known_at"]) if len(df) and "known_at" in df else np.zeros(0, np.int64)}
+        for c in ("open", "high", "low", "close", "volume"):
+            out[c] = df[c].to_numpy(float) if c in df else np.zeros(0)
+        out["session"] = np.array([sess_map.get(str(x), 0) for x in df["session"]], np.int8) \
+            if len(df) and "session" in df else np.zeros(len(df), np.int8)
+        for v in out.values():
+            v.setflags(write=False)
+        return out
+
     def session_bars(self, symbol: str, freq: Optional[str] = None,
                      sessions: Sequence[str] = ("RTH",)) -> pd.DataFrame:
-        freq = canonical_freq(freq or self._bt.base_freq)
+        freq = canonical_freq(freq or self.__bt.base_freq)
         now = self.now
-        o, _ = self._bt.session_open_close
+        o, _ = self.__bt.session_open_close
         start = o
         if "PRE" in sessions:
             start = o - pd.Timedelta(hours=5, minutes=30)
-        if freq == self._bt.base_freq and tuple(sessions) == tuple(self._bt.data_sessions):
-            b = self._bt.md.bars(symbol, freq)
+        if freq == self.__bt.base_freq and tuple(sessions) == tuple(self.__bt.data_sessions):
+            b = self.__bt.md.bars(symbol, freq)
             i1 = b.last_index_at(int(now.value)) + 1
             i0 = int(np.searchsorted(b.start, int(start.value), side="left"))
             return b.frame(i0, max(i0, i1))
-        return self._pit.bars(symbol, freq, start, now + pd.Timedelta(1, "ns"), as_of=now, adjusted=False,
+        return self.__pit.bars(symbol, freq, start, now + pd.Timedelta(1, "ns"), as_of=now, adjusted=False,
                               sessions=sessions)
 
     def last_quote(self, symbol: str) -> Optional[Quote]:
         now = self.now
-        df = self._pit.quotes(symbol, now - pd.Timedelta(days=4), now + pd.Timedelta(1, "ns"), as_of=now)
+        df = self.__pit.quotes(symbol, now - pd.Timedelta(days=4), now + pd.Timedelta(1, "ns"), as_of=now)
         if df is None or len(df) == 0:
             return None
         r = df.iloc[-1]
@@ -148,9 +187,9 @@ class EngineContext:
 
     # ------------------------------------------------------------------ orders
     def submit(self, order: Order, *, outside_rth: bool = False, initial_stop: Optional[float] = None,
-               activate_at: Optional[pd.Timestamp] = None) -> Order:
-        return self._bt.submit(order, outside_rth=outside_rth, initial_stop=initial_stop,
-                               activate_at=activate_at)
+               activate_at: Optional[pd.Timestamp] = None, planned_entry: Optional[float] = None) -> Order:
+        return self.__bt.submit(order, outside_rth=outside_rth, initial_stop=initial_stop,
+                                activate_at=activate_at, planned_entry=planned_entry)
 
     def order(self, symbol_or_inst: Union[str, Instrument], quantity: float, type: OrderType = OrderType.MARKET,
               limit_price: Optional[float] = None, stop_price: Optional[float] = None,
@@ -164,7 +203,8 @@ class EngineContext:
                 entry_stop: Optional[float] = None, stop: Optional[float] = None,
                 target: Optional[float] = None, time_exit: Optional[pd.Timestamp] = None,
                 tif: TimeInForce = TimeInForce.DAY, child_tif: TimeInForce = TimeInForce.GTC,
-                tag: str = "entry", outside_rth: bool = False) -> Order:
+                tag: str = "entry", outside_rth: bool = False,
+                planned_entry: Optional[float] = None) -> Order:
         """Entry + protective stop + profit target + time exit (OCO children
         created as the entry fills). ``stop`` is also recorded as the initial
         risk for R-multiples."""
@@ -178,13 +218,28 @@ class EngineContext:
             templates.append(ChildTemplate(OrderType.MARKET, tag="time_exit", tif=TimeInForce.GTC,
                                            activate_at=pd.Timestamp(time_exit)))
         parent = Order(inst, quantity, entry_type, entry_limit, entry_stop, tif, tag=tag)
-        return self._bt.submit(parent, outside_rth=outside_rth, initial_stop=stop, children=templates)
+        return self.__bt.submit(parent, outside_rth=outside_rth, initial_stop=stop, children=templates,
+                                planned_entry=planned_entry)
+
+    def bracket_group(self, parent: Union[Order, int]) -> Optional[str]:
+        """Public OCO group name of a bracket (children carry it as ``oco_group``)."""
+        pid = parent.id if isinstance(parent, Order) else int(parent)
+        spec = self.__bt.om.bracket_of(pid)
+        return spec.oco_group if spec is not None else None
+
+    def amend_bracket(self, parent_or_group: Union[Order, int, str], *, stop: Optional[float] = None,
+                      target: Optional[float] = None, time_exit: Optional[pd.Timestamp] = None) -> list[Order]:
+        """Add or replace the stop / target / time exit of an existing bracket.
+        Working children are re-priced (cancel/replace semantics: effective from
+        the next bar); missing legs are added (sized to the open exit
+        quantity, reduce-only). Returns the affected child orders."""
+        return self.__bt.amend_bracket(parent_or_group, stop=stop, target=target, time_exit=time_exit)
 
     def cancel(self, order_id: int) -> None:
-        self._bt.om.cancel(order_id, self.now, "cancelled by strategy")
+        self.__bt.om.cancel(order_id, self.now, "cancelled by strategy")
 
     def cancel_all(self, symbol: Optional[str] = None) -> None:
-        self._bt.om.cancel_all(self.now, symbol, "cancel_all by strategy")
+        self.__bt.om.cancel_all(self.now, symbol, "cancel_all by strategy")
 
     def flatten(self, symbol: Optional[str] = None, tag: str = "flatten") -> list[Order]:
         """Cancel open orders and submit market orders closing positions."""
@@ -199,7 +254,7 @@ class EngineContext:
 
     # ------------------------------------------------------------------ bookkeeping
     def log(self, msg: str, **kv) -> None:
-        self._bt.logs.append({"ts": self.now, "msg": msg, **kv})
+        self.__bt.logs.append({"ts": self.now, "msg": msg, **kv})
 
     def flag_fidelity(self, tier: Fidelity, reason: str) -> None:
-        self._bt.flag_fidelity(tier, reason)
+        self.__bt.flag_fidelity(tier, reason)

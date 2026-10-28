@@ -190,3 +190,12 @@ def test_ibkr_option_rate_table():
     assert ibkr_option_rate(0.09, 0) == 0.50
     assert ibkr_option_rate(0.04, 0) == 0.25
     assert ibkr_option_rate(1.0, 150_000) == 0.15
+
+
+def test_fee_estimate_does_not_mutate_state():
+    f = IBKRProTiered()
+    f.explicit_costs(STK, 299_000, 10.0, TS, order_id=1)
+    e1 = f.estimate(STK, 5_000, 10.0, TS)
+    e2 = f.estimate(STK, 5_000, 10.0, TS)
+    assert e1.commission == e2.commission == pytest.approx(1000 * 0.0035 + 4000 * 0.0020)
+    assert f._mtd_shares == 299_000

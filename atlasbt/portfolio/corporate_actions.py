@@ -48,6 +48,9 @@ class CorporateActionConfig:
     withholding_rate: float = 0.0          # e.g. 0.30 for non-resident alien
     fractional_shares: bool = False
     short_pays_in_lieu: bool = True
+    #: dividends without a pay_date (e.g. Yahoo): pay at ex_date + lag calendar days,
+    #: rolled to the next session (flagged T2). NAV is unaffected (receivable).
+    pay_date_lag_days: int = 7
 
 
 @dataclass
@@ -60,11 +63,21 @@ class ActionResult:
     closed_qty: float = 0.0
     close_price: float = float("nan")
     renamed_to: Optional[str] = None
+    split_ratio: float = 1.0                 # applied split ratio (1.0 = none)
+    cil_qty: float = 0.0                     # fractional shares (post-split units) cashed out, signed
+    cil_price: float = float("nan")
+    accrual: Optional[Accrual] = None        # dividend accrual created by THIS action
+    spinoff_symbol: Optional[str] = None
+    spinoff_qty: float = 0.0
+    spinoff_basis: float = 0.0               # USD cost basis moved from parent to child
 
 
 class CorporateActionProcessor:
-    def __init__(self, cfg: Optional[CorporateActionConfig] = None):
+    def __init__(self, cfg: Optional[CorporateActionConfig] = None,
+                 roll_to_session: Optional[Callable[[pd.Timestamp], pd.Timestamp]] = None):
         self.cfg = cfg or CorporateActionConfig()
+        #: maps a calendar date to the same-or-next trading session (engine supplies the NYSE calendar)
+        self.roll_to_session = roll_to_session
 
     # ---------------------------------------------------------------- entry
     def apply(self, action: CorporateAction, account: Account, ts: pd.Timestamp,
@@ -105,12 +118,15 @@ class CorporateActionProcessor:
         if not (r > 0):
             return ActionResult(a, False, "invalid split ratio")
         if pos is None:
-            return ActionResult(a, True, "no position", cancel_orders_for=(a.symbol,))
+            return ActionResult(a, True, "no position", cancel_orders_for=(a.symbol,), split_ratio=r)
         old_qty = pos.qty
         new_qty = old_qty * r
         pos.avg_price /= r
         if pos.mark == pos.mark:
             pos.mark /= r
+        # the adjusted mark supersedes pre-ex-date bars until a post-split bar prints
+        pos.mark_ts = ts
+        cil_qty, cil_px = 0.0, float("nan")
         note = f"split {r:g}: {old_qty:g} -> {new_qty:g}"
         if not self.cfg.fractional_shares and not pos.instrument.is_option:
             whole = math.trunc(round(new_qty, 9))
@@ -118,6 +134,7 @@ class CorporateActionProcessor:
             if abs(frac) > 1e-9:
                 cil_px = pos.mark if pos.mark == pos.mark else pos.avg_price
                 acct.post_cash(ts, Reason.CASH_IN_LIEU, frac * cil_px, a.symbol, f"{frac:.6f} sh @ {cil_px:.6g}")
+                cil_qty = frac
                 # realised PnL on the fractional piece
                 pnl = frac * (cil_px - pos.avg_price) * pos.multiplier
                 pos.realized += pnl
@@ -127,27 +144,40 @@ class CorporateActionProcessor:
         pos.qty = new_qty
         if pos.qty == 0:
             del acct.positions[a.symbol]
-        return ActionResult(a, True, note, cancel_orders_for=(a.symbol,))
+        return ActionResult(a, True, note, cancel_orders_for=(a.symbol,), split_ratio=r,
+                            cil_qty=cil_qty, cil_price=cil_px)
 
     def _dividend(self, a: CorporateAction, acct: Account, ts, session) -> ActionResult:
         pos = acct.get(a.symbol)
         if pos is None or pos.instrument.is_option:
             return ActionResult(a, True, "no position")
         amt = float(a.amount)
-        pay = as_session_date(a.pay_date) if a.pay_date is not None else session
+        fid = a.fidelity
+        assumed = ""
+        if a.pay_date is not None:
+            pay = as_session_date(a.pay_date)
+        else:
+            pay = session + pd.Timedelta(days=self.cfg.pay_date_lag_days)
+            if self.roll_to_session is not None:
+                pay = self.roll_to_session(pay)
+            fid = Fidelity.T2_PROXY
+            assumed = f"pay_date unknown, assumed ex+{self.cfg.pay_date_lag_days}d"
         gross = pos.qty * amt * pos.multiplier
         if pos.qty > 0:
             wh = gross * self.cfg.withholding_rate
-            acct.accruals.append(Accrual(a.symbol, gross - wh, gross, wh, pay, session, "DIVIDEND"))
+            acc = Accrual(a.symbol, gross - wh, gross, wh, pay, session, "DIVIDEND")
             note = f"dividend entitlement {gross:.2f} (withholding {wh:.2f}) pay {pay.date()}"
         else:
             if not self.cfg.short_pays_in_lieu:
                 return ActionResult(a, True, "short: in-lieu disabled")
-            acct.accruals.append(Accrual(a.symbol, gross, gross, 0.0, pay, session, "DIVIDEND_IN_LIEU"))
+            acc = Accrual(a.symbol, gross, gross, 0.0, pay, session, "DIVIDEND_IN_LIEU")
             note = f"short owes in lieu {gross:.2f} pay {pay.date()}"
+        acct.accruals.append(acc)
         # Dividends paid at/before the ex-date session start (pay_date <= session)
         # are posted immediately by the caller via pay_due.
-        return ActionResult(a, True, note)
+        if assumed:
+            note = f"{assumed}; {note}"
+        return ActionResult(a, True, note, accrual=acc, fidelity=fid)
 
     def _delist(self, a: CorporateAction, acct: Account, ts) -> ActionResult:
         pos = acct.get(a.symbol)
@@ -227,4 +257,6 @@ class CorporateActionProcessor:
             if px != px:
                 fid = Fidelity.T2_PROXY
         # NOTE: parent price drop on ex-date is reflected by the parent's next mark.
-        return ActionResult(a, True, f"spin-off {new_qty:g} {a.new_symbol}", fidelity=fid)
+        return ActionResult(a, True, f"spin-off {new_qty:g} {a.new_symbol}", fidelity=fid,
+                            cancel_orders_for=(a.symbol,), spinoff_symbol=a.new_symbol,
+                            spinoff_qty=new_qty, spinoff_basis=alloc)

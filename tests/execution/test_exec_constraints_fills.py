@@ -57,6 +57,10 @@ def run(model, orders, bars, pos0=0.0, ssr=False):
     return fills, rejects
 
 
+def up(x, tick=0.01):
+    return round_to_tick(x, tick, "up")
+
+
 def mk(q, t=OrderType.MARKET, lp=None, sp=None, oid=1, oco=None):
     o = Order(STK, q, t, lp, sp, oco_group=oco)
     o.id = oid
@@ -131,7 +135,8 @@ def test_market_fills_at_open_with_half_spread():
     o = mk(100)
     f, _ = run(m, [o], [bar(50.0, 51, 49, 50.5, mso=120)])
     hs = 0.5 * m.spread.full_spread(1e-12, 50.0, 0.01, 120, 300)
-    assert f[0].price == pytest.approx(50.0 * (1 + hs)) and f[0].pos == 0.0 and f[0].liquidity == "TAKER"
+    assert f[0].price == pytest.approx(up(50.0 * (1 + hs))) and f[0].pos == 0.0 and f[0].liquidity == "TAKER"
+    assert abs(f[0].price * 100 - round(f[0].price * 100)) < 1e-9          # on the penny grid
 
 
 def test_gap_through_stop_fills_at_open():
@@ -207,7 +212,7 @@ def test_ssr_short_sale_cannot_hit_bid():
     o.is_short_sale = True
     f, _ = run(m, [o], [bar(50.0, 50.5, 49, 49.5, mso=120)], ssr=True)
     hs = 0.5 * m.spread.full_spread(1e-12, 50.0, 0.01, 120, 300)
-    assert f[0].price == pytest.approx(50.0 * (1 + hs)) and f[0].liquidity == "MAKER"
+    assert f[0].price == pytest.approx(up(50.0 * (1 + hs))) and f[0].liquidity == "MAKER"
     o2 = mk(-100, oid=2)
     o2.is_short_sale = True
     f, _ = run(m, [o2], [bar(50.0, 50.0, 49, 49.5, mso=120)], ssr=True)    # never trades above the ask
@@ -228,8 +233,31 @@ def test_impact_increases_buy_price():
     m.simulate(mkt, [bar(10.0, 10.2, 9.8, 10, v=1e6)], lambda: [(o, Ex())] if not out else [],
                lambda d: out.append(d), lambda o, r: None)
     exp = 10.0 * (1 + 0.1 * 0.02 * math.sqrt(1e5 / 1e7))
-    assert out[0].price == pytest.approx(exp)
-    assert out[0].impact_cost == pytest.approx((exp - 10.0) * 10_000, rel=1e-6)
+    assert out[0].price == pytest.approx(up(exp))                       # rounded against the buyer
+    assert out[0].impact_cost == pytest.approx((up(exp) - 10.0) * 10_000, rel=1e-6)
+
+
+def test_marketable_limit_takes_only_size_within_limit_and_nan_volume_no_fill():
+    m = BarFillModel(BarFillConfig(), SpreadModel(ZERO_SPREAD), SquareRootImpact(k=0.1))
+    o = mk(100_000, OrderType.LIMIT, lp=10.01)
+    state = {"q": 0.0}
+    mkt = SymbolMarket(STK, 1e-12, "t", 1e6, 0.02, lambda b: False, lambda: state["q"])
+    out = []
+    ex = Ex()
+
+    def on_fill(d):
+        d.order.filled_qty += d.qty
+        state["q"] += d.qty
+        out.append(d)
+    m.simulate(mkt, [bar(10.0, 10.0, 10.0, 10.0, v=1e7)], lambda: [(o, ex)] if abs(o.remaining) > 0 else [],
+               on_fill, lambda o, r: None)
+    # room 0.1% = 0.1*0.02*sqrt(q*10/1e6) -> q = 25,000
+    assert out[0].qty in (24_999, 25_000) and out[0].price <= 10.01 and out[0].liquidity == "TAKER"
+    # the remainder rests passively: it only fills as MAKER at the limit when price trades through it
+    assert all(d.liquidity == "MAKER" and d.price == 10.01 for d in out[1:])
+    o2 = mk(100, oid=2)
+    f, _ = run(model(), [o2], [bar(10.0, 10.1, 9.9, 10, v=float("nan"))])
+    assert f == []
 
 
 # --------------------------------------------------------------------------- quotes

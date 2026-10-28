@@ -182,6 +182,30 @@ class InMemoryPortal:
         return df[(df.index >= s) & (df.index < e) & (df.index <= a)]
 
     def has(self, symbol: str, kind: str, freq: Optional[str] = None) -> bool:
+        """``symbol="*"`` asks portal-wide; for kind 'events' ``freq`` is the event
+        KIND and for 'fundamentals' it is the FIELD (contract used by
+        Requirement(symbols=("*",)))."""
+        if kind == "events":
+            kinds = {e.kind for e in self._events if symbol == "*" or e.symbol == symbol}
+            return (freq in kinds) if freq else bool(kinds)
+        if kind == "fundamentals":
+            f = self._fund
+            if f is None or len(f) == 0:
+                return False
+            m = f if symbol == "*" else f[f["symbol"] == symbol]
+            return bool(len(m)) if freq is None else bool((m["field"] == freq).any())
+        if symbol == "*":
+            if kind == "bars":
+                return any(freq is None or fq == canonical_freq(freq) for _, fq in self._bars)
+            if kind == "quotes":
+                return bool(self._quotes)
+            if kind == "options":
+                return bool(self._optq)
+            if kind == "actions":
+                return bool(self._actions)
+            if kind == "borrow":
+                return bool(self._borrow)
+            return False
         if kind == "bars":
             if freq is None:
                 return any(s == symbol for s, _ in self._bars)
@@ -250,6 +274,18 @@ class InMemoryPortal:
             latest = df["ts"].max()
             df = df[df["ts"] == latest]
         return df
+
+    def option_quotes(self, instrument: Instrument, start: pd.Timestamp, end: pd.Timestamp,
+                      as_of: pd.Timestamp) -> pd.DataFrame:
+        """Snapshots with ts in (start, end] and ts <= as_of, ascending."""
+        df = self._optq.get(instrument.symbol)
+        if df is None:
+            return pd.DataFrame(columns=["bid", "ask"], index=pd.DatetimeIndex([], tz="UTC", name="ts"))
+        s, e, a = _utc(start), _utc(end), _utc(as_of)
+        out = df[(df.index > s) & (df.index <= e) & (df.index <= a)].copy()
+        if "fidelity" not in out.columns:
+            out["fidelity"] = int(Fidelity.T0_QUOTE)
+        return out
 
     def option_quote(self, instrument: Instrument, as_of: pd.Timestamp) -> Optional[OptionQuote]:
         df = self._optq.get(instrument.symbol)

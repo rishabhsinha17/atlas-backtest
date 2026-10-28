@@ -35,6 +35,11 @@ class OrderExtras:
     in_bar_from: Optional[float] = None      # activated inside the current bar at path position
     is_liquidation: bool = False
     is_flatten: bool = False
+    reduce_only: bool = False                # exits: never open/flip; shrunk to the position
+    taker_bar: Optional[int] = None          # marketable limit already took liquidity in this bar
+    planned_entry: Optional[float] = None    # optional planned entry price (planned R)
+    last_snap_ns: int = 0                    # option/combo: last snapshot evaluated
+    original_quantity: Optional[float] = None  # quantity at submission (before OCO/CA/reduce-only changes)
     submitted_ns: int = 0
     eligible_ns: int = 0
     fills: int = 0
@@ -94,6 +99,8 @@ class OrderManager:
         if order.id < 0:
             order.id = self.next_id()
         order.status = OrderStatus.WORKING
+        if extras.original_quantity is None:
+            extras.original_quantity = order.quantity
         self.orders[order.id] = order
         self.extras[order.id] = extras
         self._active_by_symbol.setdefault(self.symbol_of(order), []).append(order.id)
@@ -136,6 +143,13 @@ class OrderManager:
         for oid in list(self.active_ids(symbol)):
             n += self.cancel(oid, ts, reason)
         return n
+
+    def rekey(self, order: Order, old_key: str) -> None:
+        """Move an active order to its (new) symbol key after an instrument change."""
+        lst = self._active_by_symbol.get(old_key)
+        if lst and order.id in lst:
+            lst.remove(order.id)
+            self._active_by_symbol.setdefault(self.symbol_of(order), []).append(order.id)
 
     # ------------------------------------------------------------- queries
     def active_ids(self, symbol: Optional[str] = None) -> list[int]:
@@ -223,7 +237,8 @@ class OrderManager:
             o = self.orders[oid]
             ex = self.extras.get(oid, OrderExtras())
             rows.append({"order_id": oid, "symbol": self.symbol_of(o), "type": o.type.value,
-                         "quantity": o.quantity, "filled_qty": o.filled_qty, "limit_price": o.limit_price,
+                         "quantity": o.quantity, "original_quantity": ex.original_quantity
+                         if ex.original_quantity is not None else o.quantity, "filled_qty": o.filled_qty, "limit_price": o.limit_price,
                          "stop_price": o.stop_price, "tif": o.tif.value, "tag": o.tag, "oco_group": o.oco_group,
                          "status": o.status.value, "submitted_at": o.submitted_at, "eligible_at": o.eligible_at,
                          "reason": o.reject_reason, "parent_id": ex.parent_id, "short_sale": o.is_short_sale})

@@ -584,7 +584,8 @@ def test_execution_state_protocol():
     seen = {}
 
     def script(ctx, st):
-        es = ctx._bt.execution_state
+        from atlasbt.engine.context import engine_of
+        es = engine_of(ctx).execution_state
         seen["adv"] = es.adv("XYZ", ctx.now)
         seen["vol"] = es.daily_vol("XYZ", ctx.now)
         seen["ssr"] = es.is_ssr_active("XYZ", ctx.now)
@@ -593,3 +594,117 @@ def test_execution_state_protocol():
         "2023-03-01", "2023-03-31", raise_errors=True)
     assert seen["adv"] == pytest.approx(2e6, rel=0.05) and 0 < seen["vol"] < 0.05
     assert seen["ssr"] is False and seen["pos"] == 0
+
+
+# =================================================================== red-team follow-ups (engine-side)
+def test_split_adjusts_sell_stop_and_notifies_strategy():
+    rows = [(100, 101, 99, 100)] * 2 + [(50, 51, 49, 50)] * 3
+    ss = sessions("2024-03-04", 5)
+    acts = [CorporateAction("XYZ", ActionType.SPLIT, ss[2], pd.Timestamp("2024-02-01", tz="UTC"), ratio=2.0)]
+    portal = InMemoryPortal(bars={("XYZ", "1d"): synthetic_bars_from_rows(rows, "1d", session_dates=ss)},
+                            actions=acts)
+    events = []
+
+    class S(make()):
+        def on_order_event(self, ctx, ev):
+            events.append(ev)
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket("XYZ", 100, stop=90.0, target=130.0)
+    r = Backtester(S(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    by = {e["tag"]: e for e in events}
+    assert by["stop"]["action"] == "ADJUSTED" and by["stop"]["after"]["stop_price"] == 45.0
+    assert by["stop"]["after"]["quantity"] == -200
+    assert by["target"]["action"] == "CANCELLED"          # sell limits are not adjusted (FINRA 5330)
+    assert r.diagnostics["order_events"] and r.trades.iloc[0].quantity == 200
+
+
+def test_daily_bars_with_day_profile_not_testable():
+    portal, ss = daily_portal(FLAT)
+    r = Backtester(make(sizing="DAY_RISK")(None), portal, zero_cost()).run(ss[0], ss[-1])
+    assert r.status == RunStatus.NOT_TESTABLE and "intraday" in r.not_testable_reason
+
+
+def test_planned_risk_column():
+    rows = [(100, 101, 99, 100), (101, 101.5, 97, 97.5), (97.5, 98, 97, 97.5)]
+    portal, ss = daily_portal(rows)
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket("XYZ", 100, stop=98.0, planned_entry=100.0)
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    t = r.trades.iloc[0]
+    assert t.initial_risk == pytest.approx(300.0) and t.r_multiple == pytest.approx(-1.0)
+    assert t.planned_risk == pytest.approx(200.0) and t.planned_r_multiple == pytest.approx(-1.5)
+
+
+def test_early_close_rules_shift_with_close():
+    s = pd.Timestamp("2024-07-03")                         # 13:00 ET close
+    mdf = synthetic_intraday_bars(str(s.date()), str(s.date()), seed=3)
+    portal = InMemoryPortal(bars={("XYZ", "1m"): mdf})
+
+    def script(ctx, st):
+        t = ctx.now_et()
+        if (t.hour, t.minute) == (10, 0):
+            ctx.order("XYZ", 100, tag="entry")
+        if (t.hour, t.minute) == (12, 20):
+            ctx.order("XYZ", 100, tag="late")
+    r = Backtester(make("1m", sizing="DAY_RISK")(script), portal, zero_cost()).run(s, s, raise_errors=True)
+    assert any(x["tag"] == "late" for x in r.diagnostics["rejected_orders"])      # after close-45m = 12:15
+    assert r.fills[r.fills.tag == "flat_by"].iloc[0].ts == et(s, "12:55")
+
+
+def test_option_plugin_defaults_and_conservative_selectable():
+    from atlasbt.options.plugins import CboeStrategyMargin, OccOptionLifecycle
+    from atlasbt.portfolio.hooks import DefaultOptionLifecycle
+    from atlasbt.portfolio.margin import ConservativeOptionMargin
+    portal, ss = daily_portal(FLAT, rf=0.05)
+    bt = Backtester(make()(None), portal, BacktestConfig())
+    assert isinstance(bt.lifecycle, OccOptionLifecycle) and isinstance(bt.margin.option_model, CboeStrategyMargin)
+    assert bt.lifecycle.rate(ss[0]) == pytest.approx(math.log1p(0.05))
+    bt2 = Backtester(make()(None), portal, BacktestConfig(option_margin="conservative",
+                                                          option_lifecycle="conservative"))
+    assert isinstance(bt2.lifecycle, DefaultOptionLifecycle)
+    assert isinstance(bt2.margin.option_model, ConservativeOptionMargin)
+
+
+def test_amend_bracket_and_history_arrays_and_original_quantity():
+    rows = [(100, 101, 99, 100), (100, 101, 99, 100), (100, 101, 99, 100), (100, 104, 99, 103), (103, 104, 102, 103)]
+    portal, ss = daily_portal(rows)
+
+    def script(ctx, st):
+        d = ctx.session_date()
+        if d == ss[0]:
+            st.parent = ctx.bracket("XYZ", 100, stop=90.0)
+            st.seen.append(ctx.bracket_group(st.parent))
+        if d == ss[2]:
+            ctx.amend_bracket(st.parent, target=102.0, stop=95.0)
+        h = ctx.history_arrays("XYZ", 3)
+        assert not h["close"].flags.writeable and (h["end"] <= ctx.now.value).all()
+        st.seen.append(len(h["close"]))
+    st = make()(script)
+    r = Backtester(st, portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert st.seen[0] == f"bracket-{st.parent.id}" and st.seen[1:4] == [1, 2, 3]
+    tgt = r.fills[r.fills.tag == "target"]
+    assert len(tgt) == 1 and tgt.price.iloc[0] == 102.0 and tgt.ts.iloc[0] >= CAL.open_close(ss[3])[0]
+    o = r.diagnostics["orders"].set_index("tag")
+    assert o.loc["stop", "stop_price"] == 95.0 and o.loc["stop", "original_quantity"] == -100
+
+
+def test_requirements_universe_star_and_premarket_probe():
+    from atlasbt.core.types import MarketEvent
+    s = pd.Timestamp("2024-03-04")
+    mdf = synthetic_intraday_bars(str(s.date()), str(s.date()), seed=1)     # RTH only
+    ev = [MarketEvent("EARNINGS", "XYZ", pd.Timestamp("2024-03-01", tz="UTC"))]
+    portal = InMemoryPortal(bars={("XYZ", "1m"): mdf}, events=ev, universes={"U": ["XYZ", "NOPE"]})
+    pre = make("1m", requires=[Requirement("bars", "1m", sessions=("PRE", "RTH"))])
+    r = Backtester(pre(None), portal, zero_cost()).run(s, s)
+    assert r.status == RunStatus.NOT_TESTABLE and "PRE" in r.not_testable_reason
+    star = make("1m", requires=[Requirement("events", "EARNINGS", symbols=("*",))])
+    assert Backtester(star(None), portal, zero_cost()).run(s, s).status == RunStatus.OK
+    star2 = make("1m", requires=[Requirement("events", "FOMC", symbols=("*",))])
+    assert Backtester(star2(None), portal, zero_cost()).run(s, s).status == RunStatus.NOT_TESTABLE
+    uni = make("1m", universe=[], universe_name="U", requires=[Requirement("bars", "1m")])
+    r = Backtester(uni(None), portal, zero_cost()).run(s, s)
+    assert r.status == RunStatus.NOT_TESTABLE and "NOPE" in r.not_testable_reason

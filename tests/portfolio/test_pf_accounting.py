@@ -276,3 +276,53 @@ def test_default_lifecycle_physical_and_cash():
                              _P(open_=4950.0))
     assert ev[0].kind == "CASH_SETTLE" and ev[0].option_price == pytest.approx(50.0)
     assert ev[0].fidelity == Fidelity.T2_PROXY
+
+
+def test_non_standard_deliverable_exercise_and_missing_price_fallbacks():
+    from dataclasses import replace
+    lc = DefaultOptionLifecycle()
+    exp = pd.Timestamp("2024-06-21")
+    nonstd = replace(Instrument.option("XYZ", exp, 100.0, Right.CALL, root="XYZ1"), deliverable_shares=150.0)
+    a = acct()
+    a.apply_fill(fill(1, 5.0, inst=nonstd))
+    ev = lc.at_session_end(exp, a.option_positions(), _P(close=80.0))       # 150 sh x 80 = 12,000 > 10,000
+    assert ev[0].kind == "EXERCISE" and ev[0].underlying_qty == 150
+    assert ev[0].underlying_price == pytest.approx(100.0 * 100 / 150)       # aggregate strike 10,000 / 150 sh
+
+    class _Last(_P):
+        def last_close(self, s):
+            return 120.0
+    std = Instrument.option("XYZ", exp, 100.0, Right.CALL)
+    b = acct()
+    b.apply_fill(fill(-1, 5.0, inst=std))
+    ev = lc.at_session_end(exp, b.option_positions(), _Last(close=float("nan")))
+    assert ev[0].kind == "ASSIGNMENT" and ev[0].fidelity == Fidelity.T2_PROXY
+    b.mark(std.symbol, 7.0)
+    ev = lc.at_session_end(exp, b.option_positions(), _P(close=float("nan")))
+    assert ev[0].kind == "SETTLE_AT_MARK" and ev[0].option_price == 7.0
+
+
+def test_long_options_have_no_loan_value_and_long_dated_75pct():
+    m = RegTMarginModel()
+    a = acct()
+    near = Instrument.option("XYZ", pd.Timestamp("2024-06-21"), 50, Right.CALL)
+    far = Instrument.option("XYZ", pd.Timestamp("2025-06-20"), 50, Right.CALL)
+    a.apply_fill(fill(1, 10.0, inst=near))
+    a.apply_fill(fill(1, 10.0, inst=far))
+    a.mark(near.symbol, 10.0)
+    a.mark(far.symbol, 10.0)
+    snap = m.snapshot(a, lambda s: 50.0, as_of=TS)
+    assert snap.initial == pytest.approx(1000 + 750)
+
+
+def test_dividend_without_pay_date_assumes_ex_plus_7_rolled():
+    from atlasbt.core.clock import nyse
+    cal = nyse()
+    a = acct()
+    a.apply_fill(fill(100, 50.0))
+    proc = CorporateActionProcessor(roll_to_session=lambda d: d if cal.is_session(d) else cal.next_session(d))
+    res = proc.apply(ca(ActionType.CASH_DIVIDEND, amount=0.5, ex="2024-03-01"), a, TS, pd.Timestamp("2024-03-01"))
+    assert res.fidelity == Fidelity.T2_PROXY and "assumed ex+7d" in res.note
+    assert a.accruals[0].pay_date == pd.Timestamp("2024-03-08")
+    res = proc.apply(ca(ActionType.CASH_DIVIDEND, amount=0.5, ex="2024-03-02"), a, TS, pd.Timestamp("2024-03-02"))
+    assert a.accruals[1].pay_date == pd.Timestamp("2024-03-11")          # Sat 03-09 rolled to Monday

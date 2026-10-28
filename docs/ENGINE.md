@@ -19,15 +19,21 @@ NYSE calendar (`core.clock`), including early closes, not from the data, so miss
 For each session:
 
 1. **Session start** (`ctx.now` = start of the first bar): dividends whose pay date has come are posted; corporate
-   actions with `ex_date == session` are applied (splits, dividends, delistings, symbol changes, spin-offs; open
-   orders on the symbol are cancelled and logged); AM-settled options are settled (option lifecycle hook);
+   actions with `ex_date` in `(previous session, session]` are applied (an ex-date on an exchange holiday is applied
+   on the next session, with a warning): splits, dividends, delistings, symbol changes, spin-offs — including the
+   OCC adjustment of option positions/orders on a split underlying and the open trade in the trades table; resting
+   orders are adjusted or cancelled (see Orders); AM-settled options are settled (option lifecycle hook);
    `strategy.on_session_start(ctx)`.
 2. **Each step t** (end of bar `[t-Δ, t)`):
    1. *Fills*: every working order is offered the bars/quotes in `(prev_t, t]` whose bar **start** is at or after
       the order's `eligible_at` (`submitted_at + latency`). An order submitted at the close of bar k can therefore
       only fill from bar k+1's open onward; nothing ever fills at a price printed before the order existed.
-   2. *Mark to market* at the last completed bar close (stocks), quote mid when only quotes exist.
-   3. Queued `on_fill` callbacks, engine session rules (`flat_by`), then `strategy.on_bar(ctx)` with `ctx.now = t`.
+   2. `on_fill` (and `on_order_event`) callbacks for this step's fills, delivered in the SAME step right after
+      the fills and before marking, with `ctx.now = t` (no data beyond `t` is visible); an order submitted there
+      (e.g. a protective stop) is eligible from the next bar. Use `ctx.bracket` when the stop must protect the
+      position from the entry fill itself (bracket children are evaluated inside the entry bar). Fills booked
+      during session-end processing (expiry/assignment) are delivered at the end of that session.
+   3. Mark to market; engine session rules (`flat_by`), then `strategy.on_bar(ctx)` with `ctx.now = t`.
    4. MAE/MFE and bars-held tracking for open trades; debug invariants.
 3. **Session end** (`ctx.now` = last step): `strategy.on_session_end`; PM/physical option expiry
    (exercise/assignment/cash settlement); option marks from quote snapshots; financing (cash interest, margin
@@ -42,6 +48,9 @@ open (or later per their type).
 * `ctx.portal()` is a `PITPortal`: every query is pinned to `as_of = ctx.now`; an explicit later `as_of` raises
   `LookaheadError`; any row the portal returns with a knowledge time after `now` raises (data-layer contract breach,
   never silently dropped); bar `end` bounds are clipped to `now`, so the in-progress bar is never returned.
+* `ctx.history_arrays(symbol, n, freq)` is the fast path: a dict of READ-ONLY numpy arrays (start, end, open,
+  high, low, close, volume, session) for the last `n` completed bars (raw base-frequency bars are views on the
+  engine cache; ~40x faster than `history` for a 50-symbol 1-minute scan). Same PIT guarantee.
 * `ctx.history(symbol, n, freq)` returns completed bars only (daily bars of the current session are invisible
   until the close). Raw same-frequency history is served from the engine cache (fast path), everything else
   through the PIT portal.
@@ -55,9 +64,14 @@ open (or later per their type).
 Within one bar the price path is `open -> adverse extreme -> favourable extreme -> close` for the position being
 managed (long: low first; short: high first; flat: adverse for the side of the pending orders, nearest extreme if
 mixed). Each potential fill gets a position on this path; orders on a symbol are processed in path order, OCO
-reductions and bracket-child activations happen in that order, and children of an entry that filled inside the
-bar are evaluated on the remainder of the bar (path restarted from the entry price, adverse first). Fills that
-depended on this assumption are tagged T2 ("intrabar order assumed adverse-first"). If finer bars exist
+reductions and bracket-child activations happen in that order. After an entry fills at path position `s` inside a
+bar, the remainder of the bar is `entry -> adverse extreme -> favourable extreme -> close` **only if the original
+path reaches the favourable extreme at or after `s`**; otherwise (the favourable extreme already happened before
+the entry, e.g. a buy limit filled on the way down from the high) the remainder is `entry -> adverse extreme ->
+close`. The adverse extreme is always assumed still reachable. A market entry at the open (`s = 0`) keeps the full
+adverse-first path. Fill timestamps after a same-bar entry are mapped onto `[entry time, bar end]`, so an exit is
+never stamped before its entry. Fills that depended on this assumption are tagged T2 ("intrabar order assumed
+adverse-first"). If finer bars exist
 (`resolve_intrabar_freq`, default `'1m'`) and a coarse bar is ambiguous (two or more orders could trigger, or a
 bracket parent may fill), the bar is replayed on the finer bars and the fill is tagged "intrabar path resolved with
 1m bars" (stays T1). Intrabar fill timestamps are interpolated from the path position (floored to the second).
@@ -68,16 +82,42 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
 * DAY validity = the session containing `eligible_at` if before its close (+4 h with `outside_rth`), else the next
   session. MOO joins the open of the first session whose 09:28 cutoff is after `eligible_at`; MOC the first close
   whose 15:50 cutoff is after it. Unfilled auction remainder is cancelled.
+* Bracket handles: `ctx.bracket(...)` returns the entry order; `ctx.bracket_group(order)` gives the public OCO group
+  (children carry it as `oco_group`); `ctx.amend_bracket(order|group, stop=, target=, time_exit=)` re-prices
+  working children (cancel/replace: effective from the next bar) or adds a missing leg sized to the open exit
+  quantity (reduce-only). `diagnostics["orders"]` keeps `original_quantity` next to the (possibly OCO-reduced)
+  `quantity`.
 * OCO groups use reduce-on-fill semantics (partial fills reduce the siblings). Brackets: entry + protective stop +
   target + time exit; children are created in proportion to the entry's fills, share an OCO group and default to
   GTC. `initial_stop` (or the bracket stop) is recorded for R-multiples.
 * Submit-time validation: quantity (whole shares unless `allow_fractional`; integer contracts), required prices,
   tick rounding (buy limits down / sell limits up; stops away from the market), session rules, short-sale
-  detection + locate, cash-account restrictions, Reg-T initial margin / cash sufficiency including pending orders.
-  Rejections are listed in `diagnostics["rejected_orders"]`; all orders in `diagnostics["orders"]`.
-* Session rules from sizing profiles: DAY_RISK => no exposure-increasing orders after 15:15 ET, all positions
-  flattened at 15:55 ET (market orders, tag `flat_by`); DAY_NOTIONAL => flat at 15:55 ET. Strategies may override
-  `no_new_entries_after` / `flat_by`.
+  detection + locate, cash-account restrictions, buying power. Rejections are listed in
+  `diagnostics["rejected_orders"]`; all orders in `diagnostics["orders"]`.
+* Buying power: the order is priced at the WORSE of its order price and the current reference price (a
+  non-marketable buy limit keeps its limit); pending orders get NO credit unless they increase exposure (then they
+  are added, priced the same conservative way); estimated explicit fees are included (non-mutating fee estimate).
+  Consequence (realistic, as at a broker): a 100% -> 100% rotation submitted in one step is rejected unless cash
+  covers the buys before the sells fill; the reject reason says so explicitly. Keep a cash buffer or sequence it.
+* "Exposure-increasing" is measured against position + pending non-child working orders (engine flatten orders
+  included), so two sells cannot open a short that neither looks like on its own.
+* Short-sale marking is decided at FILL time (position after earlier fills in the bar + earlier-entered pending
+  sells that are not reduce-only exits); a mark set at submission is never cleared; the locate check follows.
+* Exits are reduce-only: bracket children and engine flatten/liquidation orders are shrunk to the remaining
+  position and cancelled when flat (a margin-call liquidation shrinks the protective stop instead of deleting it).
+* Corporate actions (FINRA Rule 5330 style): forward split -> resting sell stops / sell stop-limits / buy limits are
+  adjusted (price ÷ ratio, quantity × ratio, bracket links and child templates kept); every other order on the
+  symbol is cancelled; reverse splits, symbol changes, spin-offs and delistings cancel all orders on the symbol.
+  Every engine-initiated change (also session-rule and margin-call cancellations, reduce-only shrinking) is
+  delivered to `Strategy.on_order_event(ctx, event)` and logged in `diagnostics["order_events"]`.
+* Session rules from sizing profiles: DAY_RISK => no new entries after 15:15 ET, flat by 15:55 ET; DAY_NOTIONAL =>
+  flat by 15:55 ET. Times are defined on a regular session and shift with the actual close on early-close days
+  (close − 45 min / close − 5 min). At the entry cutoff resting exposure-increasing non-child orders are cancelled
+  (logged); non-market entries submitted exactly at the cutoff are rejected. Flattening happens at the last step
+  that ends at or before `flat_by` (e.g. 15:30 with 30-minute bars) with market orders (tag `flat_by`); after
+  that only orders reducing exposure net of pending orders are accepted, and every step until the close the engine
+  re-checks that position + pending flatten orders net to zero. A daily-bar run with a DAY_* profile, or an
+  intraday frequency with no step before `flat_by`, is `NOT_TESTABLE` (it cannot exit before the close).
 
 ## 2. Execution realism (`atlasbt/execution`) — assumptions, defaults, sources
 
@@ -88,11 +128,13 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
 | Limit (resting) | fills only if price trades THROUGH by >= 1 tick, at the limit price, no spread cost (MAKER) | queue position unknown; touch is not enough |
 | Marketable limit | fills like a market order capped at the limit (TAKER) | |
 | Stop-limit | stop trigger, then marketable-if-possible else resting limit | |
-| Participation cap | 10% of bar volume per fill; remainder keeps working | ARCHITECTURE §5 |
-| Halts | zero/NaN-volume RTH/DAY bars and `HALT` events (`effective_at`..`resume_at`) => no fills | |
-| Quotes (T0) | buy at ask, sell at bid, first quote strictly after `eligible_at`; displayed size caps each fill; resting limits never fill on quotes alone; locked/crossed quotes skipped | |
+| Marketable limit | takes only the largest size whose MODELLED price base·(1+hs+impact(q)) is within the limit, at that modelled price; the rest rests passively under the trade-through rule | |
+| Tick grid | taker fill prices rounded to the tick against the trader (buys up, sells down), capped at any limit | Rule 612 |
+| Participation cap | 10% of bar volume per fill; remainder keeps working; NaN volume = no available liquidity (no fill, counted) in every session | ARCHITECTURE §5 |
+| Halts | zero-volume RTH/DAY bars and `HALT` events (`effective_at`..`resume_at`) => no fills | |
+| Quotes (T0) | buy at ask, sell at bid, first quote strictly after `eligible_at`; quotes classified PRE/RTH/POST from the calendar and only used for RTH unless `outside_rth`, never before the order's validity session; displayed size is consumed across orders in priority order; resting limits never fill on quotes alone; locked/crossed quotes skipped | |
 | MOO / MOC | official open/close print ± impact, no spread; cap 10% of estimated auction volume (2% / 8% of daily volume in daily-bar mode, open/close bar volume intraday) | NYSE cutoffs 09:28 / 15:50 ET |
-| Options & combos | one quote snapshot strictly after `eligible_at`; all legs same snapshot timestamp (tolerance 0) or REJECT; natural prices (buy ask / sell bid) with optional `price_improvement` toward mid; stock legs priced from the bar close ± estimated half-spread (T2) | ARCHITECTURE §7 |
+| Options & combos | every snapshot in `(eligible_at, now]` is evaluated in time order via `portal.option_quotes` (the FIRST snapshot after submission first; GTC limits re-checked on each); all option legs from the same snapshot timestamp or REJECT; natural prices (buy ask / sell bid) with optional `price_improvement`; stock legs priced from the open of the first bar STARTING at/after submission ± estimated half-spread + impact (T2), and the combo WAITs if that bar has not started by the snapshot time | ARCHITECTURE §7 |
 | Spread estimator | Corwin-Schultz (2012) 21-day mean of two-day estimates, negatives set to 0, overnight adjustment; fallback Abdi-Ranaldo (2017) monthly, then Roll (1984); all PIT (session i uses <= i-1), split-consistent | papers; known-answer tests |
 | Spread floors | full spread >= 1 tick (Rule 612: $0.01 >= $1, $0.0001 below) and price buckets <$1: 100bp, <$5: 30bp, <$10: 10bp, <$20: 4bp, else 1bp; default 20bp if no estimate (T2) | engineering defaults (conservative), configurable |
 | Time-of-day | x2.5 first 5 min, x1.75 to 15 min, x1.3 to 30 min, x1.3 last 5 min, x1.1 last 15 min, x3 extended hours; daily-bar open fills use the daily average (x1.0, `daily_open_spread_mult`) | U-shaped intraday spreads: McInish & Wood (1992), Chung, Van Ness & Van Ness (1999) |
@@ -147,9 +189,16 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
   Invariants (debug mode, every step): `cash == sum(ledger)`; `NAV == cash + Σ qty·multiplier·mark + accrued
   dividends`; every position marked; no order over-filled; no fill after `now`.
 * Average-cost realized PnL; flips close then reopen. Multipliers honoured everywhere.
+* Marks: a corporate-action-adjusted mark (e.g. post-split) is used — by `ctx.mark` and by buying-power pricing —
+  until a post-ex-date bar prints; prices of symbols without a position are divided by split ratios that went ex
+  after their last bar. A held symbol with no bar for `stale_price_sessions` (5) sessions is flagged T2 with a
+  warning ("stale price").
 * Splits: qty×ratio, prices÷ratio, fractional shares cashed out at the post-split mark (unless fractional shares
   allowed). Cash dividends: entitlement at ex-date on the prior-close position (receivable, NAV-neutral), cash on
   `pay_date`, optional withholding (`CorporateActionConfig.withholding_rate`, default 0); shorts pay in lieu.
+  Dividends without a `pay_date` (e.g. Yahoo) are paid at ex-date + `pay_date_lag_days` (7) calendar days rolled
+  to the next session, flagged T2 ("pay_date unknown, assumed ex+7d"); the receivable keeps NAV neutral meanwhile,
+  so only cash-interest timing is affected.
   Delisting: cash-out at `amount`; missing value => last mark (T2 flag). Symbol change: position moved.
   Spin-off: `ratio` new shares, `amount` = cost-basis fraction. Action dates accept naive dates, UTC-midnight
   date labels, or ET times.
@@ -159,11 +208,23 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
   benchmark ± spread schedule for small balances. `rf` = `portal.risk_free_rate(as_of, '3M')`; recorded per session
   in `meta["rf_daily"]`.
 * Reg-T margin (`margin.py`): initial 50% long / 50% short (150% total); maintenance 25% long, short max($5/sh, 30%)
-  at ≥ $5 and max($2.50/sh, 100%) below $5 (FINRA 4210). Pre-trade check includes pending exposure-increasing
-  orders. Margin call when equity < maintenance at a session end => proportional reduction of every
-  requirement-carrying position to maintenance ≤ equity/1.10, filled at the next open. CASH accounts: no shorts,
-  purchases need cash, short puts must be cash-secured, naked calls rejected.
-* **Plug-in interfaces for the OPTIONS agent**
+  at ≥ $5 and max($2.50/sh, 100%) below $5 (FINRA 4210). Long options have no loan value: 100% of their market value
+  is added to the requirement (75% when more than 9 months to expiry, FINRA 4210(f)(2)(C)). Pre-trade check includes
+  pending exposure-increasing orders only. Margin call when equity < maintenance at a session end => proportional
+  reduction of every requirement-carrying position to maintenance ≤ equity/1.10, filled at the next open; only
+  exposure-increasing orders are cancelled, exits are kept and shrink with the position. CASH accounts: no shorts;
+  purchases need cash net of estimated fees and of cash reserved for short puts (strike × deliverable per
+  contract, existing and pending); naked calls rejected.
+* **Option plug-ins — defaults are the OPTIONS agent's implementations** (`atlasbt/options/plugins.py`):
+  `BacktestConfig.option_margin=None|"cboe"` -> `CboeStrategyMargin()` (Cboe strategy-based requirement; it charges
+  long options in full itself, so the Reg-T model does not add them again), and
+  `option_lifecycle=None|"occ"` -> `OccOptionLifecycle(rate=portal risk-free (simple -> continuous),
+  dividends=portal CASH_DIVIDEND/SPECIAL_DIVIDEND actions known at the session, next 120 days)` (OCC ex-by-ex,
+  AM/PM settlement, early-assignment model). The conservative stand-ins below stay selectable with
+  `"conservative"` (or pass any instance). Whatever plug-in is used, the engine's price adapter falls back to the
+  last known underlying close when a settlement close is missing (T2 flag), and an option the plug-in would expire
+  worthless WITHOUT any settlement price is instead closed at its last mark (T2).
+* **Plug-in interfaces**
   * `portfolio.margin.OptionMarginModel.requirement(account, underlying_price) -> float` (total option margin,
     never 0 for naked shorts). Default `ConservativeOptionMargin`: long premium paid in full; covered calls/puts;
     verticals/calendars at max loss; naked max(premium + 20% (15% broad index) of underlying − OTM, premium + 10%
@@ -171,10 +232,15 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
     `BacktestConfig(option_margin=...)`.
   * `portfolio.hooks.OptionLifecycle` with `at_session_start(session, prev_session, option_positions, prices)` and
     `at_session_end(session, option_positions, prices)` returning `OptionEvent`s (EXPIRE_WORTHLESS, EXERCISE,
-    ASSIGNMENT, CASH_SETTLE with option close price and optional stock delivery). The engine books them.
-    Default `DefaultOptionLifecycle`: PHYSICAL/CASH_PM expire at the expiry session close (official close);
-    CASH_AM settle at the next session's open (SOQ proxy, T2); automatic exercise if ITM by ≥ $0.01; no early
+    ASSIGNMENT, CASH_SETTLE, SETTLE_AT_MARK with option close price and optional stock delivery). The engine books
+    them. `prices` also offers `last_close(symbol)`. Default `DefaultOptionLifecycle`: PHYSICAL/CASH_PM expire at the
+    expiry session close (official close); CASH_AM settle at the next session's open (SOQ proxy, T2); automatic
+    exercise if ITM by ≥ $0.01; non-standard deliverables honoured (intrinsic = deliverable·S/multiplier − strike;
+    delivery price = strike·multiplier/deliverable); a missing settlement price falls back to the last known
+    underlying close (T2), else the option is closed at its last mark (T2) — never at 0. No early
     exercise/assignment. Plug in via `BacktestConfig(option_lifecycle=...)`.
+  * Splits of an underlying apply the OCC contract adjustment from `atlasbt.options.lifecycle.adjust_for_split`
+    (OPTIONS agent) to every option position and working option order on it (logged as `OCC_SPLIT_ADJUSTMENT`).
 * Options are marked at session ends from `portal.option_quote` mids (intraday option NAV is stale).
 
 ## 4. Results (`core.types.BacktestResult`, columns per `core/schemas.py`)
@@ -184,17 +250,25 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
   fidelity_reason, liquidity, note, reference_mid, adv (20d shares known at fill), underlying_price (options),
   notional, tag.
 * `trades`: position-level round trips — trade_id, symbol, side, entry/exit ts and prices, quantity, pnl (net of
-  fees + attributed borrow fees, dividends, in-lieu payments and withholding), pnl_gross, costs, r_multiple and
-  initial_risk (from the initial stop), mae/mfe (USD, on max size), bars_held, multiplier, exit_reason (exit
-  order tag: stop/target/time_exit/flat_by/margin_liquidation/delist/assignment/...; `open` if still open).
+  fees + attributed borrow fees, dividends (only the accrual created by each action), in-lieu payments and
+  withholding), pnl_gross, costs, r_multiple and initial_risk (from the ACTUAL entry fill to the initial stop),
+  mae/mfe (USD, on max size), bars_held, multiplier, exit_reason (exit order tag:
+  stop/target/time_exit/flat_by/margin_liquidation/delist/assignment/cash_in_lieu/...; `open` if still open);
+  extra `planned_risk` / `planned_r_multiple` when the strategy passes `planned_entry=` to `ctx.bracket/submit`.
+  Splits rescale the open trade (quantities × ratio, prices ÷ ratio, cash-in-lieu booked as a partial exit),
+  symbol changes re-key it, spin-offs move the allocated basis into a child trade.
 * `positions` (end-of-day snapshots), `ledger`, `fidelity` = `{"tiers": {...}, "reasons": [{"tier", "reason",
   "count"}], "grade"}` (grade = worst tier carrying ≥ 5% of notional, any strategy/engine T2+ flag, or required data
   input: T0→A, T1→B, T2→C, T3→D, NA→E), `diagnostics` (rejected orders, all orders, margin calls, corporate actions,
   option events, financing totals, simulation counters, invariant checks, guard violations, runtime, logs),
-  `meta` (initial_capital, rf_daily, risk_free_rate, start, end, bar_freq, universe, config, data_sources,
+  `meta` (initial_capital, rf_daily, risk_free_rate = Σ rf_daily × 360 / total calendar days, start, end, bar_freq,
+  universe, config, data_sources,
   survivorship_bias, n_trials = grid size, plus engine details).
 * `RunStatus.NOT_TESTABLE` when a critical `Requirement` is unavailable (`portal.has` False or fidelity NA/worse
-  than `min_fidelity`); `FAILED` on strategy exceptions (traceback in diagnostics; `raise_errors=True` re-raises).
+  than `min_fidelity`). Symbols come from `Requirement.symbols`, the strategy `universe`, or `universe_name`
+  resolved via `portal.universe(name, as_of=first open)`; `symbols=("*",)` asks portal-wide
+  (`portal.has("*", "events", KIND)`, `portal.has("*", "fundamentals", FIELD)`); bars requirements with
+  `sessions` including PRE/POST are probed over the first 10 sessions and fail if that session has no bars; `FAILED` on strategy exceptions (traceback in diagnostics; `raise_errors=True` re-raises).
   `LookaheadError` always propagates.
 
 ## 5. Sizing profiles (`atlasbt/risk/sizing.py`)
@@ -209,7 +283,8 @@ package, ≤ 5% total option debit, `verify_contract` checks multiplier/delivera
 `is_defined_risk` + `max_loss_vertical` (max defined loss ≤ 0.50% NAV, collateral returned for reservation),
 `size_opt_naked` + `stress_loss_short_option` (stress loss ≤ 1% NAV on the predefined ±10/±20% move with
 extrinsic×2 scenario; raises if margin is zero), `size_opt_covered` (100 shares per call, underlying ≤ 10% NAV),
-`size_opt_cashsec` + `CollateralBook` (strike×100 reserved, no double counting, 10% name cap),
+`size_opt_cashsec` + `CollateralBook` (strike × deliverable shares reserved per contract, no double counting, 10%
+name cap), `size_swing_notional` also nets the existing same-side notional in the instrument,
 `arbitrage_edge` (trade only if executable edge after fees, borrow, funding and margin > 0 and shorts located).
 `*_ctx` helpers read NAV/positions from the Context.
 
@@ -222,17 +297,23 @@ IBKR_PRO_TIERED), `latency_bars` (0), `latency_quotes` (1 s), `bar_fill` (`parti
 `daily_open_spread_mult` (1.0), `use_quotes` ('auto'), `resolve_intrabar_freq` ('1m'), `short_sale_rules`,
 `borrow` (`BorrowConfig`: default 0.30%, `require_borrow_data`), `enforce_locates`, `halt_events`,
 `financing` (`FinancingConfig`: spreads 0.50%/1.50%, rebate 0, day count 360), `corporate_actions`
-(withholding, fractional shares), `option_margin`, `option_lifecycle`, `check_margin_on_submit`, `margin_calls`,
+(withholding, fractional shares), `option_margin` (None/'cboe'/'conservative'/instance), `option_lifecycle` (None/'occ'/'conservative'/instance), `check_margin_on_submit`, `margin_calls`,
 `rf_tenor` ('3M'), `stats_window` (20), `lookback_sessions` (60), `debug` (invariants every step),
-`record_intraday_equity`, `max_option_mark_staleness` (5 days).
+`record_intraday_equity`, `max_option_mark_staleness` (5 days), `stale_price_sessions` (5).
 
 ## 7. Testing support
 `atlasbt/engine/testing.py`: `InMemoryPortal` (DataPortal over DataFrames incl. PIT adjustment, quotes, option
-quote snapshots, actions, events, borrow, rf) and `synthetic_*` builders — synthetic data for mechanics tests only.
+quote snapshots incl. `option_quotes(instrument, start, end, as_of)`, actions, events, borrow, rf) and `synthetic_*`
+builders — synthetic data for mechanics tests only.
+
+PIT hardening: the Context and the PIT portal are slotted proxies with name-mangled fields (no `ctx._bt`,
+no `ctx.portal()._p`), and `tests/engine/test_eng_strategy_lint.py` statically rejects strategy code that accesses
+private attributes of non-`self` objects, uses `getattr(x, "_...")`, imports `inspect`/`gc`/`ctypes`, touches
+`sys.modules`, or imports engine internals (`backtester`, `context`, `market`, `pit`).
 
 ## 8. Performance (single core, synthetic data)
-~3.7 s per year of 1-minute bars on one symbol with a bracket strategy (≈ 75 s for 20 years); ~10 s for
-2 years × 1,000 symbols daily with ~500 open positions (≈ 100 s for 20 years).
+~4-8 s per year of 1-minute bars on one symbol with a bracket strategy (≈ 1.5-3 min for 20 years; the range
+reflects machine load); ~10-20 s for 2 years × 1,000 symbols daily with ~500 open positions.
 
 ## 9. Known limitations
 * Bar-mode fills assume trade prints are mid prices; maker fills ignore queue position beyond the 1-tick rule and
@@ -241,8 +322,12 @@ quote snapshots, actions, events, borrow, rf) and `synthetic_*` builders — syn
   commission schedules are the 2026 ones applied to all history.
 * Leveraged-ETF maintenance surcharges, portfolio margin, pattern-day-trader rules, settlement-date (T+1/T+2) cash
   restrictions and good-faith violations in cash accounts are not modelled.
-* Early exercise/assignment, pin risk and non-standard deliverables are left to the OPTIONS agent's lifecycle;
-  option marks are updated only at session ends.
+* Early exercise/assignment and pin risk come from the OPTIONS agent's `OccOptionLifecycle` (default); its
+  physical-delivery price is the strike per share, which is only exact for standard 100-share deliverables (the
+  conservative `DefaultOptionLifecycle` handles non-standard deliverables). Option marks are updated only at session
+  ends; OCC-adjusted contracts keep their scaled mark until quotes exist under the new symbol (stale-mark T2 flag).
+* Resting orders after corporate actions follow FINRA 5330 for forward splits only (dividend price adjustments of
+  resting orders are not applied).
 * SSR uses bar lows (a trigger inside the current bar applies to the whole bar: conservative); the 2005-2007
   Reg SHO pilot exemptions are not modelled.
 * Dividends paid after a trade closes are attributed to the trade at the ex-date (entitlement amount).

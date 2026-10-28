@@ -100,7 +100,11 @@ class Trigger:
     liquidity: str                 # 'TAKER' | 'MAKER'
     cap: Optional[float] = None    # taker: limit cap; maker: exact fill price
     reasons: tuple[str, ...] = ()
-    ssr_reject: bool = False
+    reject_reason: str = ""
+
+    @property
+    def ssr_reject(self) -> bool:
+        return bool(self.reject_reason)
 
 
 @dataclass
@@ -132,6 +136,8 @@ class SymbolMarket:
     position: Callable[[], float] = lambda: 0.0
     daily_mode: bool = False
     daily_open_spread_mult: float = 1.0
+    #: fill-time short-sale classification: order -> (is_short_sale, locate_available)
+    short_sale_state: Optional[Callable[[Order], tuple[bool, bool]]] = None
 
 
 @dataclass
@@ -191,7 +197,8 @@ class BarFillModel:
             full *= mkt.daily_open_spread_mult
         return 0.5 * full
 
-    def trigger(self, order: Order, path: Path, s: float, mkt: SymbolMarket, bar: BarView) -> Optional[Trigger]:
+    def trigger(self, order: Order, path: Path, s: float, mkt: SymbolMarket, bar: BarView,
+                passive_only: bool = False) -> Optional[Trigger]:
         buy = order.quantity > 0
         t = order.type
         p0 = path.price_at(s)
@@ -200,7 +207,7 @@ class BarFillModel:
         if t == OrderType.MARKET:
             trig = Trigger(s, p0, "TAKER", None, ("market",))
         elif t == OrderType.LIMIT:
-            trig = self._limit(order.limit_price, buy, path, s, mkt, bar, through)
+            trig = self._limit(order.limit_price, buy, path, s, mkt, bar, through, passive_only=passive_only)
         elif t == OrderType.STOP:
             r = path.first_reach(s, order.stop_price, up=buy)
             if r is None:
@@ -212,20 +219,31 @@ class BarFillModel:
             if r is None:
                 return None
             pos, px, gapped = r
-            trig = self._limit(order.limit_price, buy, path, pos, mkt, bar, through, base_override=px)
+            trig = self._limit(order.limit_price, buy, path, pos, mkt, bar, through, base_override=px,
+                               passive_only=passive_only)
             if trig is not None:
                 trig.reasons = ("stop-limit triggered",) + trig.reasons
         else:
             return None
         if trig is None:
             return None
+        # short-sale marking decided at fill time (after earlier fills in this bar);
+        # a mark set at submission is never cleared
+        if (not buy) and mkt.short_sale_state is not None and not order.is_short_sale:
+            is_short, located = mkt.short_sale_state(order)
+            if is_short:
+                order.is_short_sale = True
+                if not located:
+                    return Trigger(trig.pos, trig.base, "TAKER", None, ("no locate",),
+                                   reject_reason="short sale rejected at fill time: no locate / not shortable")
         # Reg SHO price test for short sales hitting the bid
         if (not buy) and order.is_short_sale and trig.liquidity == "TAKER" and self.cfg.ssr_mode != "ignore" \
                 and mkt.ssr_active(bar):
             if self.cfg.ssr_mode == "reject":
-                return Trigger(trig.pos, trig.base, "TAKER", None, ("SSR active",), ssr_reject=True)
+                return Trigger(trig.pos, trig.base, "TAKER", None, ("SSR active",),
+                               reject_reason="short sale rejected: SSR (Rule 201) active")
             hs = self.half_spread(mkt, trig.base, bar)
-            ask = trig.base * (1.0 + hs)
+            ask = round_to_tick(trig.base * (1.0 + hs), tick, "up")
             if order.limit_price is not None:
                 ask = max(ask, order.limit_price)
             r = path.first_reach(trig.pos, ask + tick, up=True)
@@ -235,24 +253,43 @@ class BarFillModel:
         return trig
 
     def _limit(self, L: float, buy: bool, path: Path, s: float, mkt: SymbolMarket, bar: BarView,
-               through: float, base_override: Optional[float] = None) -> Optional[Trigger]:
+               through: float, base_override: Optional[float] = None,
+               passive_only: bool = False) -> Optional[Trigger]:
         p0 = path.price_at(s) if base_override is None else base_override
         hs = self.half_spread(mkt, p0, bar)
         if buy:
-            if p0 * (1.0 + hs) <= L + 1e-12:
+            if not passive_only and p0 * (1.0 + hs) <= L + 1e-12:
                 return Trigger(s, p0, "TAKER", L, ("marketable limit",))
             r = path.first_reach(s, L - through, up=False)
         else:
-            if p0 * (1.0 - hs) >= L - 1e-12:
+            if not passive_only and p0 * (1.0 - hs) >= L - 1e-12:
                 return Trigger(s, p0, "TAKER", L, ("marketable limit",))
             r = path.first_reach(s, L + through, up=True)
         if r is None:
             return None
         return Trigger(r[0], L, "MAKER", L, ("limit traded through by >=1 tick",))
 
+    def max_qty_within_limit(self, base: float, hs: float, limit: float, buy: bool, mkt: SymbolMarket) -> float:
+        """Largest quantity whose modelled price base*(1 +/- hs +/- imp(q)) stays
+        within ``limit`` (square-root impact inverted). inf if impact is not
+        modelled."""
+        room = (limit / base - 1.0 - hs) if buy else (1.0 - hs - limit / base)
+        if room < -1e-12:
+            return 0.0
+        room = max(room, 0.0)
+        coef = self.impact.k * mkt.sigma if mkt.sigma == mkt.sigma else float("nan")
+        if not (coef == coef and coef > 0 and mkt.adv_dollar == mkt.adv_dollar and mkt.adv_dollar > 0):
+            return INF
+        x = min(room, self.impact.max_impact) / coef
+        if room >= self.impact.max_impact:
+            return INF
+        return mkt.adv_dollar * x * x / base
+
     def price(self, order: Order, trig: Trigger, qty_abs: float, mkt: SymbolMarket, bar: BarView
               ) -> tuple[float, float, float, list[str]]:
-        """Returns (price, spread_cost_usd, impact_cost_usd, reasons)."""
+        """Returns (price, spread_cost_usd, impact_cost_usd, reasons). Taker
+        prices are rounded to the tick AGAINST the trader (buys up, sells down)
+        and capped at any limit."""
         mult = mkt.instrument.multiplier
         reasons: list[str] = []
         if trig.liquidity == "MAKER":
@@ -264,11 +301,13 @@ class BarFillModel:
         if not (mkt.adv_dollar == mkt.adv_dollar and mkt.sigma == mkt.sigma):
             reasons.append("impact not modelled: ADV/vol unavailable")
         if buy:
-            px = base * (1.0 + hs + imp)
+            raw = base * (1.0 + hs + imp)
+            px = round_to_tick(raw, valid_tick(raw, mkt.instrument), "up")
             if trig.cap is not None:
                 px = min(px, trig.cap)
         else:
-            px = base * (1.0 - hs - imp)
+            raw = base * (1.0 - hs - imp)
+            px = round_to_tick(raw, valid_tick(raw, mkt.instrument), "down")
             if trig.cap is not None:
                 px = max(px, trig.cap)
         spread_cost = abs(min(abs(px - base), base * hs)) * qty_abs * mult
@@ -276,6 +315,20 @@ class BarFillModel:
         return px, spread_cost, impact_cost, reasons
 
     # ---------------------------------------------------------------- simulation
+    @staticmethod
+    def _restart_path(path: Path, bar: BarView, fill_pos: float, fill_base: float, long: bool) -> Path:
+        """Remainder of the bar after an entry at path position ``fill_pos``.
+
+        The adverse extreme for the new position is assumed still reachable;
+        the favourable extreme only if the ORIGINAL path reaches it at or after
+        the entry (otherwise it already happened before the entry)."""
+        adverse = bar.l if long else bar.h
+        fav = bar.h if long else bar.l
+        fav_ok = fill_pos <= 0.0 or any(path.pts[k] == fav and k >= fill_pos for k in (1, 2))
+        if fav_ok:
+            return Path([fill_base, adverse, fav, bar.c])
+        return Path([fill_base, adverse, adverse, bar.c])
+
     def simulate(self, mkt: SymbolMarket, bars: Sequence[BarView],
                  get_orders: Callable[[], list[tuple[Order, object]]],
                  on_fill: Callable[[FillDecision], None],
@@ -284,20 +337,20 @@ class BarFillModel:
         stats = SimStats()
         cfg = self.cfg
         for bar in bars:
+            if not (bar.v == bar.v):
+                stats.nan_volume_bars += 1          # unknown volume = no available liquidity
+                continue
             if bar_is_halted(bar.v, bar.sess, bar.o):
                 stats.halted_bars += 1
                 continue
-            if not (bar.v == bar.v):
-                stats.nan_volume_bars += 1
-                cap_left = INF
-            else:
-                cap_left = cfg.participation_cap * bar.v
+            cap_left = cfg.participation_cap * bar.v
             orders0 = [o for o, _ in get_orders()]
             if not orders0:
                 break
             pos_before = mkt.position()
             path = self.adverse_path(bar, self.low_first_for(pos_before, orders0, bar))
             s = 0.0
+            t0 = bar.start
             restarted = False
             nfills = 0
             for _guard in range(64):
@@ -317,27 +370,41 @@ class BarFillModel:
                     else:
                         start = s
                     ex.evaluated = True
-                    tr = self.trigger(o, path, start, mkt, bar)
+                    passive = getattr(ex, "taker_bar", None) == bar.start
+                    tr = self.trigger(o, path, start, mkt, bar, passive_only=passive)
                     if tr is not None:
                         cands.append((tr.pos, o.id, o, ex, tr))
                 if not cands:
                     break
                 cands.sort(key=lambda x: (x[0], x[1]))
                 pos, _, o, ex, tr = cands[0]
-                if tr.ssr_reject:
-                    stats.ssr_blocked += 1
-                    on_reject(o, "short sale rejected: SSR (Rule 201) active")
+                if tr.reject_reason:
+                    if "SSR" in tr.reject_reason:
+                        stats.ssr_blocked += 1
+                    on_reject(o, tr.reject_reason)
                     continue
                 rem = abs(o.remaining)
                 q = min(rem, cap_left)
-                if not cfg.allow_fractional and not mkt.instrument.is_option:
-                    q = math.floor(q + 1e-9)
-                elif mkt.instrument.is_option:
+                limit_bound = False
+                if tr.liquidity == "TAKER" and tr.cap is not None:
+                    hs = self.half_spread(mkt, tr.base, bar)
+                    qmax = self.max_qty_within_limit(tr.base, hs, tr.cap, o.quantity > 0, mkt)
+                    if qmax < q:
+                        q = qmax
+                        limit_bound = True
+                if not cfg.allow_fractional or mkt.instrument.is_option:
                     q = math.floor(q + 1e-9)
                 if q <= 0:
+                    if limit_bound:
+                        ex.taker_bar = bar.start     # rest passively for the remainder of the bar
+                        continue
                     break
+                if limit_bound:
+                    ex.taker_bar = bar.start
                 price, sc, ic, preasons = self.price(o, tr, q, mkt, bar)
                 reasons = list(tr.reasons) + preasons
+                if limit_bound:
+                    reasons.append("marketable limit: only size whose modelled cost is within the limit taken")
                 fid = Fidelity.T1_BAR
                 if mkt.spread_source == "default" and tr.liquidity == "TAKER":
                     reasons.append("spread default (no estimate)")
@@ -354,12 +421,16 @@ class BarFillModel:
                     stats.ambiguous_bars += 1
                 if "SSR" in " ".join(tr.reasons):
                     stats.ssr_blocked += 1
-                # approximate intrabar time from the path position (floored to the second)
-                ts_ns = int(bar.start + ((bar.end - bar.start) * min(pos, 3.0) / 3.0) // 10**9 * 10**9)
+                # approximate intrabar time from the path position (floored to the second),
+                # mapped onto [t0, bar.end] (t0 = entry time after a same-bar entry)
+                frac = min(pos, 3.0) / 3.0
+                ts_ns = int(t0 + int((bar.end - t0) * frac) // 10**9 * 10**9)
+                ts_ns = max(ts_ns, t0)
                 partial = q < rem - 1e-9
                 if partial:
                     stats.partial_fills += 1
-                    reasons.append(f"participation cap {cfg.participation_cap:.0%} of bar volume")
+                    if not limit_bound:
+                        reasons.append(f"participation cap {cfg.participation_cap:.0%} of bar volume")
                 dec = FillDecision(o, pos, ts_ns, math.copysign(q, o.quantity), price, tr.base, tr.liquidity,
                                    sc, ic, fid, tuple(reasons), partial)
                 on_fill(dec)
@@ -369,8 +440,9 @@ class BarFillModel:
                 pos_after = mkt.position()
                 if cfg.same_bar_exit and pos_before == 0 and pos_after != 0 and not restarted:
                     fill_base = tr.base if tr.liquidity == "TAKER" else price
-                    path = self.adverse_path(bar, pos_after > 0, start_price=fill_base)
+                    path = self._restart_path(path, bar, pos, fill_base, pos_after > 0)
                     s = 0.0
+                    t0 = ts_ns
                     restarted = True
                     for _o, _ex in get_orders():
                         if getattr(_ex, "in_bar_from", None) is not None:
@@ -435,6 +507,8 @@ class QuoteView:
     ask: float
     bid_size: float = float("nan")
     ask_size: float = float("nan")
+    sess: str = "RTH"              # 'PRE' | 'RTH' | 'POST' (classified from the calendar)
+    session_ns: int = 0            # session date (naive ns) the quote belongs to (0 = unknown)
 
 
 class QuoteFillModel:
@@ -463,8 +537,15 @@ class QuoteFillModel:
         for q in quotes:
             if not (q.bid > 0 and q.ask > 0) or q.ask <= q.bid:
                 continue
+            # displayed size is consumed across orders in priority (order id) order
+            left = {True: q.ask_size, False: q.bid_size}
             for o, ex in get_orders():
                 if ex.eligible_ns >= q.ts:
+                    continue
+                if not session_allows(q.sess, getattr(ex, "outside_rth", False)):
+                    continue
+                vs = getattr(ex, "valid_session_ns", None)
+                if vs is not None and q.session_ns and q.session_ns < vs:
                     continue
                 if o.type in (OrderType.MOO, OrderType.MOC, OrderType.COMBO):
                     continue
@@ -473,7 +554,9 @@ class QuoteFillModel:
                 ex.evaluated = True
                 buy = o.quantity > 0
                 touch = q.ask if buy else q.bid
-                size = q.ask_size if buy else q.bid_size
+                size = left[buy]
+                if size == size and size <= 0:
+                    continue
                 ok = False
                 cap_px = None
                 if o.type == OrderType.MARKET:
@@ -495,6 +578,13 @@ class QuoteFillModel:
                 reasons = ["NBBO quote fill"]
                 liq = "TAKER"
                 px = touch
+                if (not buy) and mkt.short_sale_state is not None and not o.is_short_sale:
+                    is_short, located = mkt.short_sale_state(o)
+                    if is_short:
+                        o.is_short_sale = True
+                        if not located:
+                            on_reject(o, "short sale rejected at fill time: no locate / not shortable")
+                            continue
                 if (not buy) and o.is_short_sale and mkt.ssr_active(BarView(q.ts, q.ts, q.bid, q.ask, q.bid, q.bid, 0.0)) \
                         and self.ssr_mode != "ignore":
                     if self.ssr_mode == "reject":
@@ -524,6 +614,8 @@ class QuoteFillModel:
                 partial = qty < rem - 1e-9
                 if partial:
                     stats.partial_fills += 1
+                if size == size:
+                    left[buy] = size - qty
                 on_fill(FillDecision(o, 0.0, q.ts, math.copysign(qty, o.quantity), px, mid, liq, sc, ic,
                                      Fidelity.T0_QUOTE, tuple(reasons), partial))
         return stats
@@ -595,6 +687,8 @@ class AuctionFillModel:
             if buy and price > order.limit_price or (not buy) and price < order.limit_price:
                 return None
         px = price * (1 + imp) if buy else price * (1 - imp)
+        if imp > 0:
+            px = round_to_tick(px, valid_tick(px, mkt.instrument), "up" if buy else "down")
         mult = mkt.instrument.multiplier
         reasons = ["opening auction" if is_open else "closing auction"]
         if daily_bar:

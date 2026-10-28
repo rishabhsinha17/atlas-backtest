@@ -44,8 +44,13 @@ class BacktestConfig:
     # portfolio
     financing: FinancingConfig = field(default_factory=FinancingConfig)
     corporate_actions: CorporateActionConfig = field(default_factory=CorporateActionConfig)
-    option_margin: Optional[OptionMarginModel] = None      # None -> ConservativeOptionMargin
-    option_lifecycle: Optional[OptionLifecycle] = None     # None -> DefaultOptionLifecycle
+    #: None or "cboe" -> atlasbt.options.plugins.CboeStrategyMargin (OPTIONS agent);
+    #: "conservative" -> portfolio.margin.ConservativeOptionMargin; or any OptionMarginModel instance
+    option_margin: Union[None, str, OptionMarginModel] = None
+    #: None or "occ" -> atlasbt.options.plugins.OccOptionLifecycle bound to the portal (rate = portal
+    #: risk-free, dividends = portal CASH_DIVIDEND actions known at the session);
+    #: "conservative" -> portfolio.hooks.DefaultOptionLifecycle; or any OptionLifecycle instance
+    option_lifecycle: Union[None, str, OptionLifecycle] = None
     check_margin_on_submit: bool = True
     margin_calls: bool = True
     rf_tenor: str = "3M"
@@ -55,11 +60,65 @@ class BacktestConfig:
     debug: bool = False
     record_intraday_equity: bool = False
     max_option_mark_staleness: pd.Timedelta = pd.Timedelta(days=5)
+    stale_price_sessions: int = 5          # held symbol without a bar for N sessions -> T2 flag + warning
 
     def make_fees(self) -> FeeSchedule:
         if isinstance(self.fees, FeeSchedule):
             return self.fees
         return make_fee_schedule(self.fees)
 
-    def lifecycle(self) -> OptionLifecycle:
-        return self.option_lifecycle or DefaultOptionLifecycle()
+    def margin_model(self) -> OptionMarginModel:
+        m = self.option_margin
+        if m is None or m == "cboe":
+            from ..options.plugins import CboeStrategyMargin
+            return CboeStrategyMargin()
+        if m == "conservative":
+            from ..portfolio.margin import ConservativeOptionMargin
+            return ConservativeOptionMargin()
+        if isinstance(m, str):
+            raise ValueError(f"unknown option_margin {m!r}")
+        return m
+
+    def lifecycle(self, portal=None, now_fn=None) -> OptionLifecycle:
+        lc = self.option_lifecycle
+        if lc == "conservative":
+            return DefaultOptionLifecycle()
+        if lc is None or lc == "occ":
+            from ..options.plugins import OccOptionLifecycle
+            if portal is None:
+                return OccOptionLifecycle()
+            return OccOptionLifecycle(rate=_portal_rate(portal, self.rf_tenor, now_fn),
+                                      dividends=_portal_dividends(portal, now_fn))
+        if isinstance(lc, str):
+            raise ValueError(f"unknown option_lifecycle {lc!r}")
+        return lc
+
+
+def _portal_rate(portal, tenor, now_fn):
+    import math
+
+    def rate(session) -> float:
+        as_of = now_fn() if now_fn else None
+        try:
+            r = float(portal.risk_free_rate(as_of, tenor))
+        except Exception:
+            return 0.0
+        return math.log1p(r) if r == r and r > -1 else 0.0       # simple annual -> continuous
+    return rate
+
+
+def _portal_dividends(portal, now_fn, horizon_days: int = 120):
+    from ..core.types import ActionType
+    from ..portfolio.corporate_actions import as_session_date
+
+    def dividends(underlying: str, session) -> list:
+        as_of = now_fn() if now_fn else None
+        s = pd.Timestamp(session)
+        try:
+            acts = portal.corporate_actions([underlying], s, s + pd.Timedelta(days=horizon_days), as_of=as_of)
+        except Exception:
+            return []
+        return sorted((as_session_date(a.ex_date), float(a.amount)) for a in acts
+                      if a.type in (ActionType.CASH_DIVIDEND, ActionType.SPECIAL_DIVIDEND)
+                      and as_session_date(a.ex_date) > as_session_date(s))
+    return dividends

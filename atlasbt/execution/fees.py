@@ -146,6 +146,16 @@ class FeeSchedule:
             return self._stock_costs(instrument, qty, abs(price), date, liquidity, is_sale, order_id)
         return CostBreakdown()
 
+    def estimate(self, instrument: Instrument, quantity: float, price: float, ts: pd.Timestamp,
+                 liquidity: str = "TAKER") -> CostBreakdown:
+        """Pre-trade estimate of explicit costs WITHOUT mutating schedule state
+        (month-to-date volume, per-order accumulators)."""
+        saved = (self._month_key, self._mtd_shares, self._mtd_contracts)
+        try:
+            return self.explicit_costs(instrument, quantity, price, ts, liquidity, order_id=None)
+        finally:
+            self._month_key, self._mtd_shares, self._mtd_contracts = saved
+
     # -- helpers
     def _roll_month(self, date: pd.Timestamp) -> None:
         key = (date.year, date.month)

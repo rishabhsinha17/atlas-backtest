@@ -24,6 +24,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional, Protocol, runtime_checkable
 
+import pandas as pd
+
 from ..core.types import Instrument, Right
 from .account import Account, AccountType, Position
 
@@ -41,9 +43,14 @@ class OptionMarginModel(Protocol):
 
     def requirement(self, account: Account, underlying_price: Callable[[str], float]) -> float: ...
 
+    # Optional attribute ``includes_long_premium: bool``: True if the requirement
+    # already charges long options in full (no loan value); otherwise the Reg-T
+    # model adds 100% (75% if > 9 months) of long-option market value itself.
+
 
 @dataclass
 class ConservativeOptionMargin:
+    includes_long_premium = False
     naked_pct: float = 0.20
     naked_pct_index: float = 0.15
     min_pct: float = 0.10
@@ -115,7 +122,7 @@ class ConservativeOptionMargin:
                 s = k
             if account.account_type == AccountType.CASH:
                 if inst.right == Right.PUT:
-                    req += n * k * mult        # cash secured
+                    req += n * k * inst.deliverable_shares   # cash secured: strike x deliverable
                 else:
                     req += n * 10 * s * mult   # naked call not allowed; huge requirement
                 continue
@@ -170,7 +177,30 @@ class RegTMarginModel:
             return max(5.0 * qty_abs, self.maint_short * price * qty_abs)
         return max(2.5 * qty_abs, 1.0 * price * qty_abs)
 
-    def snapshot(self, account: Account, underlying_price: Callable[[str], float]) -> MarginSnapshot:
+    long_option_loan_value_months: float = 9.0
+    long_option_long_dated_req: float = 0.75
+
+    def _long_option_req(self, account: Account, as_of=None) -> float:
+        """Long options have no loan value (Reg T / FINRA 4210(f)(2)(C)):
+        100% of market value; listed options with > 9 months to expiry may be
+        financed at 25% loan value -> 75% requirement."""
+        req = 0.0
+        for p in account.option_positions():
+            if p.qty <= 0:
+                continue
+            mv = p.market_value
+            frac = 1.0
+            ref = as_of if as_of is not None else p.mark_ts
+            if p.instrument.expiry is not None and ref is not None:
+                r = pd.Timestamp(ref)
+                r = r.tz_convert("America/New_York").tz_localize(None) if r.tzinfo is not None else r
+                months = (pd.Timestamp(p.instrument.expiry) - r.normalize()).days / 30.4375
+                if months > self.long_option_loan_value_months:
+                    frac = self.long_option_long_dated_req
+            req += frac * mv
+        return req
+
+    def snapshot(self, account: Account, underlying_price: Callable[[str], float], as_of=None) -> MarginSnapshot:
         long_mv = 0.0
         short_mv = 0.0
         init = 0.0
@@ -192,50 +222,77 @@ class RegTMarginModel:
             init = opt
             maint = opt
         else:
-            init += opt
-            maint += opt
+            includes = getattr(self.option_model, "includes_long_premium", None)
+            if includes is None:   # OPTIONS agent's CboeStrategyMargin charges longs in full itself
+                includes = type(self.option_model).__name__ == "CboeStrategyMargin"
+            lo = 0.0 if includes else self._long_option_req(account, as_of)
+            init += opt + lo
+            maint += opt + lo
+            opt += lo
         return MarginSnapshot(account.nav, init, maint, long_mv, short_mv, opt)
 
     # -- pre-trade check
     def check_order(self, account: Account, instrument: Instrument, delta_qty: float, price: float,
                     underlying_price: Callable[[str], float],
-                    pending: Iterable[tuple[Instrument, float, float]] = ()) -> tuple[bool, str]:
+                    pending: Iterable[tuple[Instrument, float, float]] = (), est_cost: float = 0.0,
+                    as_of=None) -> tuple[bool, str]:
         """Would the account still satisfy *initial* margin (margin account) /
-        have non-negative cash (cash account) after this order and all other
-        pending exposure-increasing orders fill at ``price``?"""
+        have enough unreserved cash (cash account) after this order and all
+        other pending EXPOSURE-INCREASING orders fill? ``price`` and pending
+        prices must already be conservative (the caller prices orders at the
+        worse of order and reference price); ``est_cost`` = estimated explicit
+        fees. Pending orders that reduce exposure get NO credit."""
         if not (price == price and price > 0):
             return True, ""
         mult = instrument.multiplier
+        # keep only pending orders that increase |position| (cumulatively per symbol)
+        proj: dict[str, float] = {}
+        inc: list[tuple[Instrument, float, float]] = []
+        for inst, q, px in pending:
+            cur_p = proj.get(inst.symbol, account.position(inst.symbol))
+            if abs(cur_p + q) > abs(cur_p) + 1e-12 and px == px and px > 0:
+                inc.append((inst, q, px))
+                proj[inst.symbol] = cur_p + q
         if account.account_type == AccountType.CASH:
             cur = account.position(instrument.symbol)
             new = cur + delta_qty
             if not instrument.is_option and new < -1e-9:
                 return False, "cash account: short selling not permitted"
-            cash_after = account.cash - delta_qty * price * mult
-            for inst, q, px in pending:
-                if q > 0:
-                    cash_after -= q * px * inst.multiplier
+            cash_after = account.cash - delta_qty * price * mult - max(est_cost, 0.0)
+            reserve = 0.0
+            for p in account.option_positions():
+                if p.qty < 0 and p.instrument.right == Right.PUT and p.symbol != instrument.symbol:
+                    reserve += -p.qty * (p.instrument.strike or 0.0) * p.instrument.deliverable_shares
+            for inst, q, px in inc:
+                cash_after -= q * px * inst.multiplier
+                if inst.is_option and q < 0 and inst.right == Right.PUT:
+                    reserve += -q * (inst.strike or 0.0) * inst.deliverable_shares
+            if instrument.is_option and new < 0 and instrument.right == Right.PUT:
+                reserve += -new * (instrument.strike or 0.0) * instrument.deliverable_shares
             if instrument.is_option and new < 0:
                 # short option in cash account: only covered call / cash-secured put
                 if instrument.right == Right.PUT:
-                    reserve = -new * (instrument.strike or 0.0) * mult
                     if cash_after < reserve - 1e-6:
                         return False, "cash account: put not fully cash-secured"
                 else:
                     shares = account.position(instrument.underlying or "")
                     if shares < -new * instrument.deliverable_shares - 1e-9:
                         return False, "cash account: naked call not permitted"
-            if delta_qty > 0 and cash_after < -1e-6:
-                return False, f"cash account: insufficient cash ({cash_after:.2f} after order)"
+            if delta_qty > 0 and cash_after - reserve < -1e-6:
+                return False, (f"cash account: insufficient unreserved cash ({cash_after:.2f} after order, "
+                               f"{reserve:.2f} reserved for short puts)")
             return True, ""
         # margin account: simulate post-trade initial requirement
         tmp = _ShadowAccount(account)
-        for inst, q, px in pending:
+        for inst, q, px in inc:
             tmp.add(inst, q, px)
         tmp.add(instrument, delta_qty, price)
-        snap = self.snapshot(tmp.account, underlying_price)
+        tmp.account.cash -= max(est_cost, 0.0)
+        snap = self.snapshot(tmp.account, underlying_price, as_of)
         if snap.initial > snap.equity + 1e-6 and _increases_exposure(account, instrument, delta_qty):
-            return False, (f"Reg-T initial margin: requirement {snap.initial:.2f} > equity {snap.equity:.2f}")
+            return False, (f"Reg-T initial margin: requirement {snap.initial:.2f} > equity {snap.equity:.2f} "
+                           f"(pending exposure-reducing orders, e.g. sells in a rotation, get no buying-power "
+                           f"credit until they fill)")
         return True, ""
 
     # -- margin call liquidation plan
