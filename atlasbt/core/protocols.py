@@ -43,7 +43,9 @@ class DataPortal(Protocol):
                as_of: pd.Timestamp) -> pd.DataFrame: ...
 
     def has(self, symbol: str, kind: str, freq: Optional[str] = None) -> bool:
-        """kind in {'bars','quotes','options','actions','borrow'}"""
+        """kind in {'bars','quotes','options','actions','borrow','events','fundamentals'}.
+        Portal-wide kinds use symbol='*': has('*','events','EARNINGS'),
+        has('*','fundamentals','Assets') (freq carries the event kind / field)."""
         ...
 
     def fidelity_of(self, symbol: str, kind: str, freq: Optional[str] = None) -> Fidelity: ...

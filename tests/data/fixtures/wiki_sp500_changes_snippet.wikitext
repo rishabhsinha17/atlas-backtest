@@ -1,0 +1,42 @@
+{| class="wikitable sortable" id="changes"
+|-
+! data-sort-type="date" rowspan="2" | Effective Date
+! colspan="2" | Added
+! colspan="2" | Removed
+! rowspan="2" | Reason
+! rowspan="2" | Refs
+|-
+! Ticker || Security || Ticker || Security
+|-
+|October 6, 2026
+|TWLO
+|[[Twilio]]
+|WBD
+|[[Warner Bros. Discovery]]
+|[[Paramount Skydance]] acquired Warner Bros. Discovery
+|<ref name=":1">{{Cite web |title=Vylor Added to the S&P 500; Twilio Set to Join S&P 500; Others to Join S&P MidCap 400 and S&P SmallCap 600 |url=https://press.spglobal.com/2026-10-01-Vylor-Added-to-the-S-P-500-Twilio-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600 |access-date=2026-10-08 |website=News Release Archive |language=en}}</ref>
+|-
+|October 6, 2026
+|
+|
+|CTVA
+|[[Corteva]]
+|Market capitalization changes.
+|<ref name=":1" />
+|-
+|October 1, 2026
+|VYLR
+|[[Vylor]]
+|
+|
+|Corteva completed the corporate spin-off of Vylor
+|<ref name=":1" />
+|-
+|| September 21, 2026
+|| BE
+|| [[Bloom Energy]]
+|| TAP
+|| [[Molson Coors]]
+|| Market capitalization changes.
+|| <ref name=bloomeverpure>{{Cite web |date=September 4, 2026 |title=Bloom Energy, Illumina, and Everpure Set to Join S&P 500; Others to Join S&P 100, S&P MidCap 400, and S&P SmallCap 600|url=https://www.spglobal.com/spdji/en/documents/indexnews/announcements/20260904-1484999/1484999_shuffle5461-sept2026.pdf |access-date=September 21, 2026 |website=S&P Dow Jones Indices}}</ref>
+|}

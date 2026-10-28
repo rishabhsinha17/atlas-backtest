@@ -38,8 +38,10 @@ owner that does not exist yet, write against the documented interface below and 
 * **option_chain**: columns `ts, underlying, symbol, expiry (naive date), strike, right ('C'/'P'), bid, ask, mid, iv, delta, gamma, vega, theta, underlying_price, volume, open_interest, exercise, settlement, multiplier, fidelity`; optional `root` (e.g. SPX vs SPXW), `settlement_date`, `kind`. Expiry = LAST TRADING DAY (vendor SPX AM monthlies listed on Friday must be converted to the Thursday).
 * **corporate actions / events**: `core.types.CorporateAction`, `core.types.MarketEvent`.
   Event payloads: `EARNINGS{timing:'BMO'|'AMC'|'DURING'|'UNKNOWN', eps_actual, eps_estimate, estimate_known_at, fiscal_period}`,
+  `EARNINGS_RELEASE` (actual release, known_at = SEC acceptance time) and `EARNINGS_SCHEDULE` (scheduled date, assumed known 7 days ahead), payload extras `estimate_fidelity, estimate_reason, first_tradeable_session`;
   `INDEX_ADD/INDEX_DEL{index, effective_date}`, `FOMC{type:'STATEMENT'}`, `BUYBACK{amount_usd, pct_mcap, with_earnings:bool}`, `HALT{reason, resume_at}`.
 * **fundamentals**: long frame `symbol, field, value, period_end, known_at (filing acceptance time), source`.
+* Optional DataPortal extras (implemented by atlasbt.data.portal.Portal): `bars(..., source=)`, `option_chain(..., synthetic=True|False)`, `has/fidelity_of(..., sessions=)`, `universe_survivorship_bias(name, as_of)`.
 * Every frame carries `attrs['fidelity']` (or a `fidelity` column) and `attrs['source']`.
 
 ## 4. Engine loop (ENGINE agent implements; everyone must understand)
