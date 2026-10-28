@@ -1,0 +1,860 @@
+S001 | Intraday breakout / momentum | 5-minute opening range breakout long | STK/ETF | 1m | DAY_RISK
+  ENTRY: At 09:35 ET calculate H=max(highs 09:30-09:34); enter at first 1m close >H after 09:35; require 09:35 RVOL(5m)>=1.5 versus time-of-day historical median and last price>session VWAP.
+  EXIT: Stop L=min(lows 09:30-09:34); optional take 2R; otherwise exit 15:55; at most one entry/day.
+  PARAMS: opening 5/15/30m; RVOL 1/1.5/2; target none/1.5R/2R; stop OR low/1 ATR(5m)
+  CAVEAT: None | FAIL: False breakouts and open spreads
+S002 | Intraday breakout / momentum | 15-minute opening range breakout short | STK/ETF | 1m | DAY_RISK
+  ENTRY: At 09:45 calculate L=min 09:30-09:44; short on first 1m close <L before 12:00, price<VWAP, opening 15m turnover >=0.05% of 20d ADV.
+  EXIT: Stop H=max 09:30-09:44; exit 15:55 or 2R; one short/day.
+  PARAMS: OR 5/15/30m; turnover .025/.05/.1% ADV; target 1/2R
+  CAVEAT: Require historical borrow locate | FAIL: None
+S003 | Intraday breakout / momentum | Opening-range breakout with retest | STK/ETF | 1m | DAY_RISK
+  ENTRY: After 15m OR, first 1m close >OR high; do not chase. Enter when low of next 15 bars <=OR high and a later 1m close >OR high+0.05% (sequence ordered).
+  EXIT: Stop min(retest swing low,OR midpoint); exit 15:55 or 2R.
+  PARAMS: Retest window 5/15/30 bars; buffer 0/5/10bp
+  CAVEAT: None | FAIL: None
+S004 | Intraday breakout / momentum | Opening-drive momentum | STK/ETF | 1m | DAY_RISK
+  ENTRY: At 09:40 last price >= open*(1+0.01), first 10m closes >=8/10 positive, VWAP slope >0; enter next 1m open.
+  EXIT: Stop 09:30-09:39 low; exit on two closes < VWAP or at 11:30.
+  PARAMS: Move 0.5/1/1.5%; 7/8/9 positive candles; cutoff 10:30/11:30
+  CAVEAT: None | FAIL: None
+S005 | Intraday breakout / momentum | Gap-and-go upward | STK | 1m | DAY_RISK
+  ENTRY: Premarket 09:29 midpoint / prior adjusted close -1 >=+2%; premarket turnover >=0.2*20d ADV; enter on first 5m close >09:30 open and above premarket VWAP.
+  EXIT: Stop 09:30-09:34 low; exit 15:55 or 2R.
+  PARAMS: Gap 1/2/4%; PM turnover 0.1/0.2/0.5 ADV
+  CAVEAT: Use historical premarket bars and corporate-action aligned close | FAIL: None
+S006 | Intraday breakout / momentum | Gap-and-go downward | STK | 1m | DAY_RISK
+  ENTRY: Gap at 09:29 midpoint <=-2%; premarket volume >=0.2*20d ADV; enter short on first 5m close below 09:30 open and below premarket VWAP.
+  EXIT: Stop opening 5m high; exit 15:55 or 2R.
+  PARAMS: Gap -1/-2/-4%; profit 1.5/2R
+  CAVEAT: Require borrow locate | FAIL: None
+S007 | Intraday breakout / momentum | Premarket-high breakout | STK | 1m | DAY_RISK
+  ENTRY: Premarket 07:00-09:29 high P; gap >=1%; at 09:35 or later close 1m >P, price>VWAP and RTH volume to time>time-of-day median*2.
+  EXIT: Stop 5m swing low before breakout; exit 15:55 or at 2R.
+  PARAMS: Gap 1/2%; RVOL 1.5/2/3
+  CAVEAT: None | FAIL: None
+S008 | Intraday breakout / momentum | Previous-day-high intraday breakout | STK/ETF | 1m | DAY_RISK
+  ENTRY: After 09:45 enter long first 5m close >prior RTH high and day VWAP, if prior 20d return>0.
+  EXIT: Stop most recent 5m swing low; 3R target or close 15:55.
+  PARAMS: Lookback 1/2/5d high; confirmation 1/5m
+  CAVEAT: None | FAIL: None
+S009 | Intraday breakout / momentum | Intraday NR7 compression break | STK/ETF | 5m | DAY_RISK
+  ENTRY: Identify prior 7 5m bar high-low ranges; if completed prior bar has minimum range of prior 7, enter when next 5m close crosses its high; VWAP positive.
+  EXIT: Stop compression bar low; exit after 6 bars or 2R.
+  PARAMS: Compression 5/7/10 bars; expiration 4/6/10 bars
+  CAVEAT: None | FAIL: None
+S010 | Intraday breakout / momentum | Intraday flag continuation | STK | 1m | DAY_RISK
+  ENTRY: At least +2% from 09:30 open within 45m; next 5-15 bars retrace 20-50% of impulse and have lower aggregate volume than impulse; enter close above flag high.
+  EXIT: Stop low of flag; exit 2R or 15:55.
+  PARAMS: Impulse 1/2/3%; retrace 20-50/30-60%; max flag 10/20m
+  CAVEAT: None | FAIL: None
+S011 | Intraday breakout / momentum | First-hour range break | STK/ETF | 5m | DAY_RISK
+  ENTRY: At 10:30 store first-hour high and low; enter on first complete 5m close > high and RSI(14,5m)>55.
+  EXIT: Stop first-hour midpoint; exit 15:55.
+  PARAMS: Break threshold 0/5bp; RSI 50/55/60
+  CAVEAT: None | FAIL: None
+S012 | Intraday breakout / momentum | Intraday VWAP continuation long | STK/ETF | 5m | DAY_RISK
+  ENTRY: After 10:00, require close>session VWAP, VWAP today rising 3 bars and a pullback low touches VWAP within 10bp then current 5m close>previous 5m high.
+  EXIT: Stop pullback low; exit on 5m close <VWAP or 15:55.
+  PARAMS: VWAP touch 5/10/20bp; confirmation 1/2 bars
+  CAVEAT: None | FAIL: None
+S013 | Intraday breakout / momentum | Intraday VWAP reclaim long | STK/ETF | 1m | DAY_RISK
+  ENTRY: After 10:00 require at least 15 consecutive minutes below VWAP; first 5m close above VWAP with volume >prior 20 completed 5m bars mean*1.5.
+  EXIT: Stop low of reclaim 5m bar; exit on 5m close below VWAP or 15:55.
+  PARAMS: Below 10/15/30m; rel volume 1/1.5/2
+  CAVEAT: None | FAIL: None
+S014 | Intraday breakout / momentum | VWAP-band momentum acceleration | STK/ETF | 5m | DAY_RISK
+  ENTRY: After 10:00, z=(close-VWAP)/VWAP-weighted intraday stdev >=+1.5 and last 3 5m bars rise; buy next open.
+  EXIT: Stop below session VWAP or 1ATR(5m), nearer; exit after 6 bars or at 2R.
+  PARAMS: z 1/1.5/2; hold 3/6/12 bars
+  CAVEAT: None | FAIL: None
+S015 | Intraday breakout / momentum | Closing half-hour momentum | ETF | 1m | DAY_NOTIONAL
+  ENTRY: At 15:25 compare current midpoint to previous day close: return >=+0.5%; if realized first half-hour return positive, buy at 15:30 next bar.
+  EXIT: Exit at 15:55 ET; reverse and short on return <=-0.5%, subject to borrow.
+  PARAMS: Threshold 0/0.25/0.5%; gate first 30m on/off
+  CAVEAT: None | FAIL: Closing auction effects
+S016 | Intraday breakout / momentum | Afternoon high-of-day breakout | STK/ETF | 5m | DAY_RISK
+  ENTRY: Between 13:30-15:00 close >max high 09:30 through prior bar, while cumulative volume >=1.3*same-time historical median.
+  EXIT: Stop preceding 3 completed 5m bars low; exit 15:55.
+  PARAMS: Break buffer 0/5/10bp; rel volume 1/1.3/2
+  CAVEAT: None | FAIL: None
+S017 | Intraday breakout / momentum | First-pullback after high of day | STK/ETF | 1m | DAY_RISK
+  ENTRY: First break of daily high after 10:00; wait first 3-10 1m bars with <0.5*impulse retracement; buy next 1m close >pullback high.
+  EXIT: Stop pullback low; profit 1.5R or 15:55.
+  PARAMS: Pullback bars 3/5/10; retrace 25/50%
+  CAVEAT: None | FAIL: None
+S018 | Intraday breakout / momentum | Trend day pullback 20EMA | STK/ETF | 5m | DAY_RISK
+  ENTRY: By 11:00 price>open by 1%, >VWAP; buy first 5m close above EMA20 after prior bar low <=EMA20 and no daily VWAP breach since 10:00.
+  EXIT: Stop previous two bars low; exit on 2 consecutive closes <EMA20 or 15:55.
+  PARAMS: Daily change .5/1/1.5%; EMA 10/20/30
+  CAVEAT: None | FAIL: None
+S019 | Intraday breakout / momentum | Intraday breakout with relative strength | STK | 5m | DAY_RISK
+  ENTRY: Rank RTH return minus SPY RTH return at 11:00; top 10% candidates with >1% excess; buy first close above 11:00 high until 14:00.
+  EXIT: Stop 30m swing low; exit 15:55.
+  PARAMS: Rank top 5/10/20%; excess 0.5/1/2%
+  CAVEAT: None | FAIL: None
+S020 | Intraday breakout / momentum | Intraday volume spike continuation | STK | 1m | DAY_RISK
+  ENTRY: After 10:00 1m volume >=5*historical same minute median and 1m close > prior 20m high; enter next bar.
+  EXIT: Stop triggering bar low or 1ATR(1m), lower; exit after 15m or 2R.
+  PARAMS: Volume spike 3/5/10x; 10/20m highs
+  CAVEAT: None | FAIL: None
+S021 | Intraday fades / reversals | Gap fade to prior close | STK/ETF | 5m | DAY_RISK
+  ENTRY: At 09:35 gap >=+1.5%; 5m candle closes <09:30 open and RSI(14,5m)<50; short next open. Mirror long on -1.5% gap.
+  EXIT: Target previous-day close; stop 09:30-09:34 extreme; exit 15:55 if not reached.
+  PARAMS: Gap 1/1.5/3%; bar 5/15m
+  CAVEAT: Shorts require locate; avoid earnings test as separate stratum | FAIL: None
+S022 | Intraday fades / reversals | Opening range false breakout reversal | STK/ETF | 1m | DAY_RISK
+  ENTRY: After 15m range first 1m close >OR high but within next 10 bars first close <OR high; short next bar if VWAP below; mirror false break down.
+  EXIT: Stop false break high; target OR low; exit 15:55.
+  PARAMS: Failure window 5/10/20 bars; VWAP filter on/off
+  CAVEAT: None | FAIL: None
+S023 | Intraday fades / reversals | VWAP sigma reversion long | ETF | 5m | DAY_RISK
+  ENTRY: After 10:00 z=(price-VWAP)/weighted intraday std <=-2; require price> SMA200 daily and 5m RSI(2)<10.
+  EXIT: Exit on first 5m close >=VWAP or after 12 bars; stop at z=-3 (next-bar stops conservative).
+  PARAMS: z -1.5/-2/-2.5; stop -2.5/-3/-3.5
+  CAVEAT: None | FAIL: None
+S024 | Intraday fades / reversals | VWAP sigma reversion short | ETF | 5m | DAY_RISK
+  ENTRY: After 10:00 z>=+2 and daily close<SMA200 or no-trend filter; 5m RSI(2)>90; short next bar.
+  EXIT: Exit at VWAP/12 bars; stop z=+3.
+  PARAMS: z 1.5/2/2.5; gate on/off
+  CAVEAT: None | FAIL: None
+S025 | Intraday fades / reversals | First-hour oversold reversal | ETF | 5m | DAY_RISK
+  ENTRY: At 10:30 return from 09:30 open <=-1%; buy if RSI(2,5m)<5 and first 5m bar closes above previous bar high.
+  EXIT: Stop day low; exit VWAP or 15:55.
+  PARAMS: Loss -0.5/-1/-1.5%; RSI 2/5/10
+  CAVEAT: None | FAIL: None
+S026 | Intraday fades / reversals | Late-day mean reversion | ETF | 5m | DAY_RISK
+  ENTRY: At 14:30 return from prev close <=-1.25%, >1.5*20d daily vol scaled to time, and price below VWAP by >=1%; buy at 14:35.
+  EXIT: Exit at 15:55 or VWAP touch; stop below 14:30 low by .25 ATR5m.
+  PARAMS: Threshold 0.75/1.25/2%; VWAP 0.5/1%
+  CAVEAT: None | FAIL: None
+S027 | Intraday fades / reversals | Intraday double-bottom reversal | STK/ETF | 5m | DAY_RISK
+  ENTRY: Between 10:00-14:00 identify two local 5m lows separated 3-12 bars with prices within 0.25% and neckline high between them; buy close above neckline.
+  EXIT: Stop min(two lows)-0.1ATR5m; exit 2R or 15:55.
+  PARAMS: Tolerance 10/25/50bp; separation 3-12/5-20 bars
+  CAVEAT: None | FAIL: None
+S028 | Intraday fades / reversals | Intraday RSI exhaustion fade | ETF | 5m | DAY_RISK
+  ENTRY: After 10:00 5m RSI14 >=80 and price>=VWAP+2 intraday σ; short on first RSI crossing below 75. Mirror RSI<=20 long.
+  EXIT: Stop day extreme; cover at VWAP or 15:55.
+  PARAMS: RSI extreme 75/80/85; sigma 1.5/2/2.5
+  CAVEAT: None | FAIL: None
+S029 | Intraday fades / reversals | Previous-close magnet | ETF | 5m | DAY_RISK
+  ENTRY: At 11:00 gap from previous close absolute >=0.75%, price has retraced at least 25% of gap, trade toward previous close if VWAP slope supports trade.
+  EXIT: Target previous close; stop at 11:00 RTH extreme; exit 15:55.
+  PARAMS: Gap 0.5/0.75/1%; retrace 25/50%
+  CAVEAT: None | FAIL: None
+S030 | Intraday fades / reversals | Intraday exhaustion spike reversal | STK | 1m | DAY_RISK
+  ENTRY: Completed 1m bar range>=4*median of previous 60m; next 1m closes inside prior bar midpoint, fade initial spike direction.
+  EXIT: Stop spike extreme; target pre-spike midpoint; exit 30m later.
+  PARAMS: Range 3/4/5x; confirm 1/2 bars
+  CAVEAT: None | FAIL: Volatility halts and adverse selection
+S031 | Overnight / calendar / events | Overnight close-to-next-open drift | ETF | 1d | SWING_NOTIONAL
+  ENTRY: At 15:45 ET if trailing 10 COMPLETED sessions close-to-close total return >0, buy at first executable quote after 15:50 ET; do not use the final close.
+  EXIT: Sell at next RTH 09:35 ET; no overnight stop assumed; compare all-days long unconditional.
+  PARAMS: Momentum filter 0/5/10d; 1/3/5 nights
+  CAVEAT: None | FAIL: Overnight gap; cannot use same close signal to fill historic close
+S032 | Overnight / calendar / events | Overnight large-down-day reversal | ETF | 1d | SWING_NOTIONAL
+  ENTRY: If 15:45 same-day return relative to prior completed close <=-2*20d prior-completed daily realized sigma, buy using 15:50 quote.
+  EXIT: Exit next day 09:35, unless next day is holiday then next RTH; hard risk cap via size only.
+  PARAMS: Shock 1.5/2/2.5 σ; close time 15:45/15:50
+  CAVEAT: None | FAIL: None
+S033 | Overnight / calendar / events | Overnight large-up-day continuation | ETF | 1d | SWING_NOTIONAL
+  ENTRY: If 15:45 same-day return relative to prior close >=+1.5*20d realized daily volatility computed from prior completed days and previous SPY close>SMA200, buy 15:50.
+  EXIT: Exit next 09:35 or after 3 overnight intervals.
+  PARAMS: Shock 1/1.5/2σ; horizons 1/3 nights
+  CAVEAT: None | FAIL: None
+S034 | Overnight / calendar / events | Turn-of-month market exposure | ETF | 1d | SWING_NOTIONAL
+  ENTRY: Buy at 15:50 on trading day immediately before the final trading day of the month (T-1).
+  EXIT: Sell at 09:35 on fourth trading day of new month; compare a T0-close to T+3-close variant.
+  PARAMS: Window start -1/0; end +2/+3/+4
+  CAVEAT: None | FAIL: None
+S035 | Overnight / calendar / events | First trading day monthly seasonality | ETF | 1d | SWING_NOTIONAL
+  ENTRY: Buy near close of final trading day of month (15:50).
+  EXIT: Sell near close of first trading day next month at 15:50.
+  PARAMS: Horizon 1/2/3 days
+  CAVEAT: None | FAIL: None
+S036 | Overnight / calendar / events | Monday open to Friday close | ETF | 1d | SWING_NOTIONAL
+  ENTRY: At first Monday RTH 09:35 buy only if previous Friday SPY close>SMA200.
+  EXIT: Sell Friday 15:50 or final trading day that week; hold through week.
+  PARAMS: Trend gate on/off; start Mon/Tue; exit Thu/Fri
+  CAVEAT: None | FAIL: None
+S037 | Overnight / calendar / events | Preholiday drift | ETF | 1d | SWING_NOTIONAL
+  ENTRY: Buy 15:50 on trading day two business sessions before a full exchange holiday.
+  EXIT: Sell 15:50 on the day immediately preceding holiday.
+  PARAMS: Entry 1/2/3 days before; exit before/after holiday
+  CAVEAT: None | FAIL: None
+S038 | Overnight / calendar / events | Post-earnings announcement drift SUE | STK | 1d | CROSS_SECTION
+  ENTRY: After public earnings timestamp, compute surprise=(reported quarterly EPS - consensus EPS frozen before release)/cross-sectional surprise σ; go long top decile surprise, short bottom decile; enter first RTH open >=15m after disseminated release.
+  EXIT: Exit after 20 trading sessions or opposite next earnings release; no overlapping same stock.
+  PARAMS: Decile 5/10/20%; hold 5/20/60 days
+  CAVEAT: Point-in-time consensus revisions and exact release time | FAIL: None
+S039 | Overnight / calendar / events | Post-earnings gap continuation | STK | 5m | SWING_RISK
+  ENTRY: First RTH day after report: open gap>=+3% and first 30m close above open; buy 10:05 next bar with RVOL >=2.
+  EXIT: Exit after 3 sessions or 2 ATR14 trailing close stop.
+  PARAMS: Gap 2/3/5%; hold 1/3/5d
+  CAVEAT: None | FAIL: None
+S040 | Overnight / calendar / events | Post-earnings gap fade | STK | 5m | DAY_RISK
+  ENTRY: First RTH day after report: open gap >=+6%; first 30m close below open and below VWAP; short 10:05, if locate.
+  EXIT: Target midpoint between open and previous close; stop opening high; exit 15:55.
+  PARAMS: Gap 4/6/10%; target gap 25/50/100%
+  CAVEAT: None | FAIL: None
+S041 | Overnight / calendar / events | Analyst earnings revision drift | STK | 1d | CROSS_SECTION
+  ENTRY: At month-end rank change in consensus next-12m EPS last 30 calendar days, require >=5 analysts; long top decile, short bottom decile next RTH open.
+  EXIT: Rebalance monthly; close if rank leaves top/bottom quintile.
+  PARAMS: Revision window 30/60d; buckets 10/20%; analyst minimum 3/5
+  CAVEAT: Point-in-time forecast database | FAIL: None
+S042 | Overnight / calendar / events | Scheduled dividend ex-date gap test | ETF/STK | 1d | SWING_NOTIONAL
+  ENTRY: Buy at 15:50 one trading day before known ex-dividend date, with next announced cash dividend recorded point-in-time.
+  EXIT: Sell next 09:35 ex-date; include dividend entitlement and ex-price adjustment, tax and withholding if applicable.
+  PARAMS: High vs low yield splits; window 1/2d
+  CAVEAT: None | FAIL: Gross price gaps are not profit without dividends
+S043 | Overnight / calendar / events | Index addition announcement drift | STK | 1d | SWING_NOTIONAL
+  ENTRY: Following timestamped public index addition announcement, buy first next RTH open if announcement is after-hours, or next 5m open if during RTH.
+  EXIT: Exit at index effective date 15:50; net return vs beta hedge SPY.
+  PARAMS: Announcement+1min/next day; effective+0/1
+  CAVEAT: Historical announcement archive, not current index memberships | FAIL: None
+S044 | Overnight / calendar / events | Index deletion event short | STK | 1d | SWING_RISK
+  ENTRY: Following timestamped index deletion announcement, short at next RTH open only if borrow available and no SSR restriction.
+  EXIT: Cover effective date 15:50, or if stop 2ATR above initial mid.
+  PARAMS: Event window 1/5/10d; cap borrow annualized 5/20/50%
+  CAVEAT: Historical borrow pricing and index changes | FAIL: None
+S045 | Overnight / calendar / events | Buyback announcement continuation | STK | 1d | SWING_RISK
+  ENTRY: Publicly announced repurchase authorization >=5% of market cap, exclude releases bundled with earnings, buy first next RTH open.
+  EXIT: Exit after 10 trading sessions or 2ATR trailing stop.
+  PARAMS: Size 3/5/10%; hold 5/10/20d
+  CAVEAT: Accurate timestamped filings/news; corporate actions | FAIL: None
+S046 | Swing trend / breakouts | 20-day Donchian breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: At close C_t>max(H_{t-20:t-1}); long next day open; shorts mirror below prior 20d low.
+  EXIT: Stop 2*ATR20 from fill, execute on next available trade/gap; exit on close below prior 10d low next open.
+  PARAMS: Entry 20/40/55d; exit 10/20d; stop 1.5/2/3 ATR
+  CAVEAT: None | FAIL: None
+S047 | Swing trend / breakouts | 55-day Turtle-style breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: At close above prior 55d high, buy next open (short mirror); choose no-skip variant explicitly.
+  EXIT: Trailing stop 2*ATR20; exit after close below prior 20d low next open.
+  PARAMS: 55/60 day entry; 20/25 day exit; pyramid 0/1/2 adds
+  CAVEAT: None | FAIL: None
+S048 | Swing trend / breakouts | Turtle 20-day with skip filter | STK/ETF | 1d | SWING_RISK
+  ENTRY: Long close > previous 20d high only if the prior same-instrument completed S1 breakout would not have won by system exit test; enter next open.
+  EXIT: 10d opposite channel or 2*Wilder ATR20, first; no pyramids in baseline.
+  PARAMS: Skip rule on/off; entry 20/55; add threshold 0.5ATR
+  CAVEAT: None | FAIL: None
+S049 | Swing trend / breakouts | SMA 20/50 bullish crossover | STK/ETF | 1d | SWING_NOTIONAL
+  ENTRY: At end of day SMA20 crosses above SMA50; buy next open, require close>SMA200.
+  EXIT: Exit on 20 below 50 crossover or 2.5ATR trailing stop next fill.
+  PARAMS: Fast 10/20/30; slow 50/100; filter 200 on/off
+  CAVEAT: None | FAIL: None
+S050 | Swing trend / breakouts | Golden cross 50/200 | STK/ETF | 1d | SWING_NOTIONAL
+  ENTRY: SMA50_{t-1}<=SMA200_{t-1} and SMA50_t>SMA200_t; buy next open.
+  EXIT: Exit on death cross, no price stop by default; include cash interest.
+  PARAMS: Fast 40/50/60; slow 150/200/250
+  CAVEAT: None | FAIL: None
+S051 | Swing trend / breakouts | EMA 9/21 pullback trend | STK/ETF | 1d | SWING_RISK
+  ENTRY: Close>EMA21>EMA50, prior day low<=EMA9 and current close>prior high; buy next open.
+  EXIT: Stop beneath last 5-day low, exit close<EMA21.
+  PARAMS: EMA fast 8/9/10; medium 20/21; exit 20/21
+  CAVEAT: None | FAIL: None
+S052 | Swing trend / breakouts | MACD zero-line crossover | STK/ETF | 1d | SWING_RISK
+  ENTRY: MACD=EMA12-EMA26; histogram crosses positive and MACD>0 and C>SMA200; buy next open.
+  EXIT: Exit histogram crosses negative or 2ATR trailing stop.
+  PARAMS: fast 8/12/16; slow 21/26/35; signal 5/9/12
+  CAVEAT: None | FAIL: None
+S053 | Swing trend / breakouts | ADX-confirmed directional breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: C>highest prior 20d high; ADX14>25; +DI14>-DI14; buy next open.
+  EXIT: Exit C<EMA20 or trailing 2ATR14 stop.
+  PARAMS: ADX 20/25/30; channel 20/40/55
+  CAVEAT: None | FAIL: None
+S054 | Swing trend / breakouts | 52-week high proximity momentum | STK | 1d | CROSS_SECTION
+  ENTRY: At month-end rank C/max(H last 252 days); long top decile ratio; short bottom decile; rebalance next open.
+  EXIT: Hold one month; close if moves out of quintile at rebalance.
+  PARAMS: high 126/252d; rank top 10/20%; lag 1/5 days
+  CAVEAT: None | FAIL: None
+S055 | Swing trend / breakouts | New all-time-high breakout | STK | 1d | SWING_RISK
+  ENTRY: C_t>max(all prior split-adjusted H since IPO, minimum 252 bars); 20d dollar volume >=$20m; enter next open.
+  EXIT: Exit close<lowest prior 20d low; 3ATR stop.
+  PARAMS: History >=126/252; exit 10/20/40
+  CAVEAT: None | FAIL: None
+S056 | Swing trend / breakouts | Bollinger squeeze breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: Bandwidth=(BBupper-BBlower)/SMA20 is in bottom 10% of previous 252 values; buy if close crosses above upper BB(20,2) following squeeze.
+  EXIT: Exit close below SMA20 or 2ATR trailing stop.
+  PARAMS: Bandwidth pct 5/10/20; BB 20, 1.5/2/2.5
+  CAVEAT: None | FAIL: None
+S057 | Swing trend / breakouts | Keltner/Bollinger squeeze release | STK/ETF | 1d | SWING_RISK
+  ENTRY: BB(20,2) sits fully inside Keltner(EMA20 +/-1.5ATR20) previous day, and today C > BB upper on release.
+  EXIT: Exit close <EMA20 or 3ATR stop.
+  PARAMS: KC ATR multiple 1/1.5/2; BB sigma 1.5/2
+  CAVEAT: None | FAIL: None
+S058 | Swing trend / breakouts | NR7 daily breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: Today high-low is the smallest of previous 7 completed days (including today); tomorrow buy if tomorrow intraday high exceeds signal day high by 1 tick using resting stop, with no look-ahead.
+  EXIT: Initial stop signal low; exit after 5 sessions or at 2R.
+  PARAMS: Range 4/7/10; hold 3/5/10 days
+  CAVEAT: None | FAIL: None
+S059 | Swing trend / breakouts | Inside-day breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: Today high<yesterday high and low>yesterday low; place next-day buy stop 1 tick above inside-day high (short stop below low is separate).
+  EXIT: Stop inside-day low; exit after 5d or 2R.
+  PARAMS: Inside 1/2 nested days; target 1.5/2R
+  CAVEAT: None | FAIL: None
+S060 | Swing trend / breakouts | Darvas box breakout | STK/ETF | 1d | SWING_RISK
+  ENTRY: Define resistance as max high of last 20 sessions; require past 5d highs <resistance and min 5d low >resistance-2ATR20; buy close > resistance.
+  EXIT: Stop below 5d floor; exit after close under 20d low.
+  PARAMS: Lookback 15/20/30d; depth 1/2/3ATR
+  CAVEAT: None | FAIL: None
+S061 | Swing trend / breakouts | Volatility contraction pattern | STK | 1d | SWING_RISK
+  ENTRY: Three successive 10-day true-range means decline (ATR10 now<ATR10 ten days ago<ATR10 twenty days ago), C within 5% of 126d high, close above prior 20d high.
+  EXIT: Stop low prior 10d; exit 3ATR trailing stop.
+  PARAMS: Contractions 2/3/4; proximity 3/5/10%
+  CAVEAT: None | FAIL: None
+S062 | Swing trend / breakouts | Ichimoku cloud trend | STK/ETF | 1d | SWING_RISK
+  ENTRY: Tenkan=(9d high+low)/2, Kijun=(26d high+low)/2; Tenkan crosses above Kijun; price at signal exceeds previously plotted known cloud (avoid future data).
+  EXIT: Exit on reverse tenkan/kijun cross; 2ATR stop.
+  PARAMS: Tenkan 9/12; kijun 26/30; cloud filter on/off
+  CAVEAT: Cloud forward displacement must be aligned to information-time, no future leakage | FAIL: None
+S063 | Swing trend / breakouts | Parabolic SAR reversal | STK/ETF | 1d | SWING_RISK
+  ENTRY: Wilder Parabolic SAR flips from above price to below price at completed daily bar; buy next open if 200SMA positive.
+  EXIT: Exit at SAR stop (gap-aware), or SAR flips bearish.
+  PARAMS: Acceleration .01/.02/.03; maximum .1/.2/.3
+  CAVEAT: None | FAIL: None
+S064 | Swing trend / breakouts | Supertrend ATR band | STK/ETF | 1d | SWING_RISK
+  ENTRY: Supertrend(ATR10, multiplier3) flips bullish on completed bar; buy next open.
+  EXIT: Exit when trend flips bearish; apply price band as trailing stop next session only.
+  PARAMS: ATR 7/10/14; factor 2/3/4
+  CAVEAT: None | FAIL: None
+S065 | Swing trend / breakouts | 20-day high with volatility scaling | STK/ETF | 1d | SWING_RISK
+  ENTRY: C > previous 20d high, and realized 20d volatility <80th percentile of rolling 252d distribution.
+  EXIT: Exit 10-day low or 2ATR20 trailing, first.
+  PARAMS: Vol percentile 60/80/100%; high 20/55
+  CAVEAT: None | FAIL: None
+S066 | Swing trend / breakouts | Bullish engulfing with trend filter | STK/ETF | 1d | SWING_RISK
+  ENTRY: Prior C<O; today C>O, today O<prior C, today C>prior O; C>SMA200 and RSI14<60; buy next open.
+  EXIT: Stop min(signal low, prior low); exit 3d or 2R.
+  PARAMS: RSI max 50/60; hold 3/5/10d
+  CAVEAT: None | FAIL: None
+S067 | Swing trend / breakouts | Head-and-shoulders neckline break | STK/ETF | 1d | SWING_RISK
+  ENTRY: Find 3 pivot highs using fixed 3-bar confirmation lag: head >both shoulders by >=1ATR; shoulders within 1ATR; short next open if C crosses below straight line through two reaction lows.
+  EXIT: Stop right shoulder high; cover after close above neckline or 3R.
+  PARAMS: Pivot lag 3/5; symmetry 1/2 ATR
+  CAVEAT: Pattern pivots only become known after 3/5 confirmation bars | FAIL: None
+S068 | Swing mean reversion | Connors RSI(2) dip | STK/ETF | 1d | SWING_NOTIONAL
+  ENTRY: C>SMA200 and Wilder RSI2<5 at close; buy next open.
+  EXIT: Sell next open after first C>SMA5; primary published-style baseline has NO protective stop; cap notional and model gap.
+  PARAMS: RSI 2/5/10; exit SMA3/5/10; max hold none/10
+  CAVEAT: None | FAIL: None
+S069 | Swing mean reversion | RSI(14) oversold rebound | STK/ETF | 1d | SWING_NOTIONAL
+  ENTRY: C>SMA200 and RSI14 crosses above 30 from below; buy next open.
+  EXIT: Exit at RSI14>=55 or day close<SMA200, max hold 15 sessions.
+  PARAMS: RSI oversold 20/30/40; exit 50/55/60
+  CAVEAT: None | FAIL: None
+S070 | Swing mean reversion | Bollinger lower-band rebound | STK/ETF | 1d | SWING_RISK
+  ENTRY: Prior close below lower BB20,2; today close back inside band; SMA200 up; buy next open.
+  EXIT: Sell on close>=SMA20; disaster 3ATR14 stop; max hold 15d.
+  PARAMS: BB 20/30; sigma 1.5/2/2.5
+  CAVEAT: None | FAIL: None
+S071 | Swing mean reversion | Bollinger band touch mean reversion | ETF | 1d | SWING_NOTIONAL
+  ENTRY: Close <lower BB(20,2) and C>SMA200, buy next open without confirmation.
+  EXIT: Exit close>=SMA20, or after 10d, optional stop 3ATR.
+  PARAMS: band 1.5/2/2.5sigma; hold 5/10/15
+  CAVEAT: None | FAIL: None
+S072 | Swing mean reversion | 20-day z-score mean reversion | ETF | 1d | SWING_NOTIONAL
+  ENTRY: z=(C-SMA20)/std20(C)<-2; SMA200 trend positive; enter next open.
+  EXIT: Exit z>=0 or 10 sessions; stop z<-3 by next-open fill.
+  PARAMS: z -1.5/-2/-2.5; maxhold 5/10
+  CAVEAT: None | FAIL: None
+S073 | Swing mean reversion | Three consecutive down closes | ETF | 1d | SWING_NOTIONAL
+  ENTRY: C_t<C_t-1<C_t-2<C_t-3 and C>SMA200; buy next open.
+  EXIT: Exit first C>SMA5 or after 5 sessions.
+  PARAMS: Consecutive 2/3/4/5; exit 3/5day SMA
+  CAVEAT: None | FAIL: None
+S074 | Swing mean reversion | Short-term 1-week loser reversal | STK | 1d | CROSS_SECTION
+  ENTRY: At Friday close rank last 5d total returns, long bottom decile and short top decile in sector-neutral groups; enter Monday open.
+  EXIT: Exit following Friday close proxy: signal Thu EOD to next Fri open or next Mon open uniformly.
+  PARAMS: Formation 3/5/10d; decile 10/20%; sector neutral on/off
+  CAVEAT: None | FAIL: None
+S075 | Swing mean reversion | Internal bar strength dip | ETF | 1d | SWING_NOTIONAL
+  ENTRY: IBS=(C-L)/(H-L), skip H=L; C>SMA200 and IBS<0.2; buy next open.
+  EXIT: Exit IBS>0.8 or C>SMA5; time stop 5d.
+  PARAMS: IBS .1/.2/.3; exit .7/.8/.9
+  CAVEAT: None | FAIL: None
+S076 | Swing mean reversion | Williams %R oversold | ETF | 1d | SWING_NOTIONAL
+  ENTRY: Williams%R14 <=-90 and C>SMA200; buy next open after oscillator crosses back above -80.
+  EXIT: Exit %R>-20 or after 10d.
+  PARAMS: 14/21 lookback; threshold -80/-90
+  CAVEAT: None | FAIL: None
+S077 | Swing mean reversion | Stochastic bullish crossover | STK/ETF | 1d | SWING_NOTIONAL
+  ENTRY: Slow stochastic %K14,3 crosses above %D3 when both <20, C>SMA200; buy next open.
+  EXIT: Exit %K>80 or %K crosses below %D; max hold 15d.
+  PARAMS: %K 10/14/21; oversold 15/20/25
+  CAVEAT: None | FAIL: None
+S078 | Swing mean reversion | CCI oversold recovery | ETF | 1d | SWING_NOTIONAL
+  ENTRY: Commodity Channel Index20 crosses above -100 from below, with C>SMA200; buy next open.
+  EXIT: Exit CCI>+100 or 10d.
+  PARAMS: CCI lookback 14/20/30; thresholds -100/-150
+  CAVEAT: None | FAIL: None
+S079 | Swing mean reversion | 2ATR flash selloff reversal | ETF | 1d | SWING_RISK
+  ENTRY: C <= previous close -2*ATR14 with SMA200 positive and volume >=1.5*20d average; buy next open.
+  EXIT: Exit C>=SMA5 or 7d; stop 3ATR14.
+  PARAMS: Drop 1.5/2/2.5ATR; volume 1/1.5/2
+  CAVEAT: None | FAIL: None
+S080 | Swing mean reversion | Trend pullback to 200SMA | STK/ETF | 1d | SWING_NOTIONAL
+  ENTRY: SMA200 slope positive over 20d; C within 1% of SMA200 from above and RSI14<40, buy next open.
+  EXIT: Exit at SMA20 or after 20d; stop C<0.97*SMA200 next open.
+  PARAMS: Near 1/2/3%; RSI 30/40
+  CAVEAT: None | FAIL: None
+S081 | Swing mean reversion | Keltner channel lower-band fade | ETF | 1d | SWING_NOTIONAL
+  ENTRY: C<EMA20 -2ATR20 and EMA200 rising; buy next open.
+  EXIT: Exit C>=EMA20 or after 12d; stop -3ATR below EMA20.
+  PARAMS: Keltner factor 1.5/2/2.5; hold 8/12
+  CAVEAT: None | FAIL: None
+S082 | Swing mean reversion | Residual sector-neutral dip | STK | 1d | CROSS_SECTION
+  ENTRY: Compute stock 5-day return minus beta*SPY return minus sector ETF return coefficient using 252d trailing OLS; long bottom decile residual, short top.
+  EXIT: Hold 5d then rebalance; cap sector and borrow.
+  PARAMS: Residual 3/5/10d; beta lookback 126/252
+  CAVEAT: None | FAIL: None
+S083 | Swing mean reversion | Volatility shock oversold ETF | ETF | 1d | SWING_NOTIONAL
+  ENTRY: At close VIX above trailing 252d 90th percentile and SPY RSI2<5; buy SPY next open.
+  EXIT: Exit at SPY C>SMA5 or VIX below its 20d median; max 10d.
+  PARAMS: VIX pct 80/90/95; RSI2 2/5/10
+  CAVEAT: VIX official index historical time stamp | FAIL: None
+S084 | Swing mean reversion | Distance-from-52wk-low bounce | STK | 1d | SWING_RISK
+  ENTRY: C within 3% of prior 252d lowest low, RSI14 crosses above 30, ADV>=$20m; buy next open.
+  EXIT: Exit C reaches SMA20 or max 15 sessions, stop below 252d low.
+  PARAMS: Near 2/3/5%; hold 10/15/20
+  CAVEAT: None | FAIL: Distress and bankruptcies dominate sample without delisting data
+S085 | Position / cross-sectional factors | Cross-sectional 12-2 momentum | STK | 1mo | CROSS_SECTION
+  ENTRY: At last trading day month t rank cumulative stock total return t-12 to t-2, skipping most recent 1m; long top decile, short bottom, enter next first-month RTH open.
+  EXIT: Rebalance monthly; top/bottom deciles; volatility scale and industry neutral optionally.
+  PARAMS: Lookback 6/9/12m; skip 1m; decile 10/20%
+  CAVEAT: None | FAIL: None
+S086 | Position / cross-sectional factors | Cross-sectional 6-1 momentum | STK | 1mo | CROSS_SECTION
+  ENTRY: At month end rank total return over months t-6 to t-1; long top decile, short bottom, enter next-month opening.
+  EXIT: Monthly rebalance; replace positions exiting decile.
+  PARAMS: Formation 3/6/9m; hold 1/3m
+  CAVEAT: None | FAIL: None
+S087 | Position / cross-sectional factors | Industry momentum | STK | 1mo | CROSS_SECTION
+  ENTRY: At month end compute value-weight industry returns over previous 6m excluding latest 1m; long stocks in top quintile industries vs bottom quintile industries.
+  EXIT: Rebalance next-month open, sector-balanced long/short.
+  PARAMS: Industry mapping GICS/SIC; rank 3/6/12m
+  CAVEAT: None | FAIL: None
+S088 | Position / cross-sectional factors | Residual momentum | STK | 1mo | CROSS_SECTION
+  ENTRY: OLS each stock daily return vs market and sector past 252 sessions, rank residual cumulative return months t-12:t-2; long top decile, short bottom.
+  EXIT: Rebalance monthly; preserve dollar and estimated beta neutrality.
+  PARAMS: Regression 126/252; momentum 6/12m
+  CAVEAT: None | FAIL: None
+S089 | Position / cross-sectional factors | Dual momentum sector ETF rotation | ETF | 1mo | PORTFOLIO
+  ENTRY: At month end rank 12m total return minus 1m T-bill return across predefined sector ETF list; buy strongest ETF only if excess>0, else invest in short T-bill ETF (use historical total return).
+  EXIT: Rebalance next trading day opening; hold 1m.
+  PARAMS: Lookback 3/6/12m; choose top 1/2/3; cash gate 0
+  CAVEAT: None | FAIL: None
+S090 | Position / cross-sectional factors | Time-series momentum ETF | ETF | 1mo | PORTFOLIO
+  ENTRY: Monthly for each ETF compute trailing 12m total return; long next month if >risk-free return for period; otherwise hold cash (or mirror short as separate test).
+  EXIT: Rebalance next month open; volatility normalize by trailing 63d sigma.
+  PARAMS: Lookback 3/6/12m; volatility 20/63d; long/cash vs long/short
+  CAVEAT: None | FAIL: None
+S091 | Position / cross-sectional factors | Value factor (book-to-market) | STK | 1mo | CROSS_SECTION
+  ENTRY: At June end use latest filing-available prior fiscal-year book equity / December previous year market equity; within NYSE size breakpoints long top value decile, short bottom.
+  EXIT: Rebalance annually in July; track delists; release-lagged filings.
+  PARAMS: Book-to-market deciles 10/20%; annual/semiannual
+  CAVEAT: Point-in-time financial statements and filing dates | FAIL: None
+S092 | Position / cross-sectional factors | Earnings yield value | STK | 1mo | CROSS_SECTION
+  ENTRY: At each quarter end rank trailing-12m reported earnings / current market cap, only filings public before signal; long top quintile, short bottom among positive earners.
+  EXIT: Rebalance quarterly.
+  PARAMS: TTM/recent FY; top 10/20%; exclude negatives yes/no
+  CAVEAT: None | FAIL: None
+S093 | Position / cross-sectional factors | Free-cash-flow yield value | STK | 1mo | CROSS_SECTION
+  ENTRY: Rank (cash flow from operations - capital expenditures TTM)/enterprise value (EV positive), with publication lag; long top quintile, short bottom.
+  EXIT: Quarterly rebalance; handle negative FCF and EV explicitly.
+  PARAMS: Rank 10/20%; lag filing date exactly/30d
+  CAVEAT: None | FAIL: None
+S094 | Position / cross-sectional factors | Gross profitability factor | STK | 1mo | CROSS_SECTION
+  ENTRY: Gross profits divided by assets from latest public annual report; within size buckets long top quintile, short bottom, enter next open.
+  EXIT: Annual June rebalance and monthly maintenance.
+  PARAMS: Rank decile/quintile; annual vs quarterly update
+  CAVEAT: None | FAIL: None
+S095 | Position / cross-sectional factors | Quality minus junk composite | STK | 1mo | CROSS_SECTION
+  ENTRY: For each industry cross-section z-score ROE, gross profit/assets, 5y sales growth, -debt/assets, -earnings volatility; mean available z; long top decile and short bottom.
+  EXIT: Monthly rebalance; 60/60 long/short; sector neutrality.
+  PARAMS: 5 metrics equal vs weighted; top 10/20%; trim winsorize 1/5%
+  CAVEAT: None | FAIL: None
+S096 | Position / cross-sectional factors | Low-volatility equity factor | STK | 1mo | CROSS_SECTION
+  ENTRY: At each month end estimate 252d daily realized volatility; long bottom decile stocks, short top decile stocks, NYSE size-bucket neutral.
+  EXIT: Monthly rebalance; sector neutral optional.
+  PARAMS: Vol lookback 63/126/252; decile/quintile
+  CAVEAT: None | FAIL: None
+S097 | Position / cross-sectional factors | Low-beta defensive factor | STK | 1mo | CROSS_SECTION
+  ENTRY: Compute trailing 252d OLS beta to SPY; long lowest beta quintile, short highest beta quintile; target equal beta gross exposure rather than equal dollars.
+  EXIT: Monthly rebalance; beta neutral, leverage and borrowing constrained.
+  PARAMS: beta lookback 126/252; shrink 0/.5 to 1
+  CAVEAT: None | FAIL: None
+S098 | Position / cross-sectional factors | Shareholder yield | STK | 1mo | CROSS_SECTION
+  ENTRY: Quarterly rank cash dividends yield + net share repurchase yield (net issuance negative); public filing only; long top quintile/short bottom.
+  EXIT: Rebalance quarterly; dividend adjusted total return.
+  PARAMS: TTM/3y net issuance; rank 10/20%
+  CAVEAT: None | FAIL: None
+S099 | Position / cross-sectional factors | Investment (conservative minus aggressive) | STK | 1mo | CROSS_SECTION
+  ENTRY: At June end rank fiscal year asset growth=(A_t-A_{t-1})/A_{t-1} using public filings; long bottom quintile, short top quintile.
+  EXIT: Rebalance following first July open annually.
+  PARAMS: Asset growth window 1/2y; deciles 10/20%
+  CAVEAT: None | FAIL: None
+S100 | Position / cross-sectional factors | Multifactor value-quality-momentum | STK | 1mo | CROSS_SECTION
+  ENTRY: Monthly industry z-score book-to-market, ROA, and 12-2 momentum; combined score=(zV+zQ+zM)/3; long top decile, short bottom.
+  EXIT: Rebalance monthly with 15% monthly turnover optional cap.
+  PARAMS: Weights 1/3 equal vs 0.25/0.25/0.5; rank 10/20%
+  CAVEAT: None | FAIL: None
+S101 | Position / cross-sectional factors | ETF defensive asset rotation | ETF | 1mo | PORTFOLIO
+  ENTRY: Universe historical 1 broad equity, 1 intermediate T-note, 1 gold ETF, 1 short Treasury ETF; rank 3m excess total returns; buy top ETF if return>0 else short-T bills.
+  EXIT: Monthly rebalance; hold 1m; no in-sample universe selection.
+  PARAMS: Lookback 1/3/6/12m; top 1/2; gate yes/no
+  CAVEAT: None | FAIL: None
+S102 | Position / cross-sectional factors | Top-N sector relative strength | ETF | 1mo | PORTFOLIO
+  ENTRY: At month end rank eligible fixed sector ETFs by 6m return, choose top 3 if each return>3m Tbill; equal capital weight.
+  EXIT: Monthly rebalance next session; cash in T-bill ETF for unfilled slots.
+  PARAMS: Lookback 3/6/12m; N 1/3/5
+  CAVEAT: None | FAIL: None
+S103 | Position / cross-sectional factors | 200d trend-filtered buy-and-hold | ETF | 1d | PORTFOLIO
+  ENTRY: Hold SPY if last close>SMA200; otherwise hold 1-3m Treasury proxy; compute signal close then buy next open.
+  EXIT: Update only after daily signal changes; execute following open.
+  PARAMS: SMA 150/200/250; hysteresis 0/1/2%
+  CAVEAT: None | FAIL: None
+S104 | Position / cross-sectional factors | Volatility targeting equity ETF | ETF | 1d | PORTFOLIO
+  ENTRY: Compute 20d annualized realized sigma using prior closing returns; at next open hold SPY exposure min(1.5,0.12/sigma); cash earning Tbill on residual.
+  EXIT: Rebalance weekly Monday open; limit daily turnover to 20% equity; avoid leveraged product proxy unless instrument matches.
+  PARAMS: Target vol 8/12/15%; lookback 20/63; cap 1/1.5
+  CAVEAT: None | FAIL: None
+S105 | Position / cross-sectional factors | Monthly 60/40 balanced allocation | ETF | 1mo | PORTFOLIO
+  ENTRY: Buy equity ETF at 60% NAV and T-note ETF at 40% at first possible session; total-return prices.
+  EXIT: At month end rebalance to 60/40 next open; include expense ratios and distributions.
+  PARAMS: Equity fraction 40/60/80%; frequency quarterly/monthly
+  CAVEAT: None | FAIL: None
+S106 | Statistical arbitrage / relative value | Distance pairs trading | STK | 1d | PAIRS
+  ENTRY: Form eligible same-sector stock pairs using 252d sum squared distance of normalized total-return prices; choose best 20 nonoverlapping pairs; spread=z of standardized normalized difference; enter short-rich long-cheap if |z|>=2.
+  EXIT: Close pair at |z|<=0.5, z beyond 4, or after 60d; hedge equal dollars.
+  PARAMS: Lookback 126/252; z 1.5/2/2.5; exit 0/0.5
+  CAVEAT: None | FAIL: None
+S107 | Statistical arbitrage / relative value | Cointegrated stock pairs | STK | 1d | PAIRS
+  ENTRY: For industry pairs use 252d Engle-Granger residual ADF p<0.05, OLS hedge beta fixed in formation, z residual using 60d prior rolling sigma; enter |z|>2.
+  EXIT: Close z crosses 0, ADF cointegration fails at monthly review, or 30d.
+  PARAMS: p .01/.05; z 1.5/2.5; hedge 126/252
+  CAVEAT: None | FAIL: None
+S108 | Statistical arbitrage / relative value | Kalman-filter adaptive pairs | STK | 1d | PAIRS
+  ENTRY: Within predeclared paired ETFs e.g. same-sector funds, estimate dynamic hedge coefficient via one-step-ahead Kalman filter; long spread when filtered innovation z<-2, short z>2.
+  EXIT: Exit |z|<0.5 or 20d; constrain beta coefficient [0.5,2].
+  PARAMS: Q/R process ratio .001/.01; z 1.5/2/2.5
+  CAVEAT: Use filter UPDATE only after observation; trade at next open | FAIL: None
+S109 | Statistical arbitrage / relative value | Sector-neutral residual equity spread | STK | 1d | PAIRS
+  ENTRY: Rolling 252d regression stock daily return vs SPY and corresponding fixed sector ETF; long bottom 10% of cumulative 5-day regression residuals and short top 10%.
+  EXIT: Exit after 5d, rebalance Friday; beta and sector neutral.
+  PARAMS: Residual 3/5/10d; selection 5/10/20%
+  CAVEAT: None | FAIL: None
+S110 | Statistical arbitrage / relative value | ETF tracking discount convergence proxy | ETF | 1d | PAIRS
+  ENTRY: If timestamped published official intraday iNAV and ETF quote are available simultaneously, enter when mid-iNAV deviation < -0.5% and estimated basket spread lower than deviation.
+  EXIT: Exit deviation within 0.1% or day close; skip stale/illiquid NAV; no guaranteed creation/redemption access.
+  PARAMS: Deviation 20/50/100bp; stale quote 1/5/10 sec
+  CAVEAT: None | FAIL: iNAV staleness, no retail arbitrage access
+S111 | Statistical arbitrage / relative value | Same-index ETF spread | ETF | 1d | PAIRS
+  ENTRY: Pair two ETFs tracking same published index; compute 126d total-return ratio z; buy cheap short expensive at |z|>2 with dollar-neutral exposure.
+  EXIT: Exit z within 0.25; borrow, dividends and expense drag.
+  PARAMS: Z lookback 60/126/252; enter 1.5/2
+  CAVEAT: None | FAIL: None
+S112 | Statistical arbitrage / relative value | PCA residual statistical arbitrage | STK | 1d | PAIRS
+  ENTRY: For PIT universe top 100 liquid stocks run PCA on 252d covariance through t-1; reconstruct daily returns using first 5 PCs; cumulate residual over 5d; buy bottom decile sell top.
+  EXIT: Exit 5 trading days later or if residual z crosses 0; net beta neutral.
+  PARAMS: PCs 3/5/10; formation 126/252; residual 3/5/10d
+  CAVEAT: Refit only with observations public at signal date | FAIL: None
+S113 | Statistical arbitrage / relative value | Beta-neutral relative strength pairs | STK | 1mo | PAIRS
+  ENTRY: For matching industry pairs regress 126d beta; if 3m momentum difference >20pp, long winner/short loser beta-adjusted (distinct from reversion).
+  EXIT: Close after one month; monthly re-sort.
+  PARAMS: Momentum diff 10/20/30pp; beta fit 126/252
+  CAVEAT: None | FAIL: None
+S114 | Statistical arbitrage / relative value | ETF/sector basket lagged underreaction | STK/ETF | 1d | PAIRS
+  ENTRY: At day close a sector ETF daily return>2σ, rank member stock beta-residual return; long member underperformers in that sector, short overperformers to neutral.
+  EXIT: Exit next close or 3d; costs, hard-to-borrow screened.
+  PARAMS: shock 1.5/2/2.5σ; hold 1/3d
+  CAVEAT: None | FAIL: None
+S115 | Statistical arbitrage / relative value | Spread momentum after pairs breakout | ETF | 1d | PAIRS
+  ENTRY: If standardized spread of two ETFs exceeds prior 60d extreme and 20d spread slope same direction, trade with spread direction; not a reversion trade.
+  EXIT: Exit spread crosses 20d mean or 30d.
+  PARAMS: Break 40/60/90; exit 10/20d mean
+  CAVEAT: None | FAIL: None
+S116 | ETF-specific / allocations | Broad-market ETF opening gap fade | ETF | 1m | DAY_RISK
+  ENTRY: Gap SPY/QQQ/IWM abs>0.5%; at 09:40 trade toward prior-close only if first 10m closes back toward it at least 25%.
+  EXIT: Take at prior close or exit 15:55, stop opposite opening 10m extreme.
+  PARAMS: Gap 0.3/0.5/0.75%; reversal 20/25/50%
+  CAVEAT: None | FAIL: None
+S117 | ETF-specific / allocations | Sector ETF monthly winner rotation | ETF | 1mo | PORTFOLIO
+  ENTRY: Rank frozen universe of sector ETFs by prior calendar-month total return, buy best 2 next first RTH open.
+  EXIT: Hold next month, equal weight, monthly rebalance.
+  PARAMS: Lookback 1/3/6m; N 1/2/3
+  CAVEAT: None | FAIL: None
+S118 | ETF-specific / allocations | Leveraged ETF 200SMA gate | ETF | 1d | PORTFOLIO
+  ENTRY: Hold a specified historically listed 2x or 3x daily reset ETF only when its unlevered reference ETF close>SMA200 and reference 20d vol<25% annualized; otherwise T-bills.
+  EXIT: Switch next open; no synthetic leveraged return scaling across multiple days.
+  PARAMS: SMA150/200; vol threshold 20/25/30%
+  CAVEAT: Use ACTUAL daily-reset ETF total returns; inception dates | FAIL: None
+S119 | ETF-specific / allocations | Inverse ETF tactical hedge | ETF | 1d | PORTFOLIO
+  ENTRY: If SPY close<SMA200 and RSI14<45, move 20% NAV to inverse -1x ETF, funded from SPY allocation; cash remainder as fixed baseline.
+  EXIT: Close inverse position if SPY close>SMA200; rebalance weekly.
+  PARAMS: Hedge fraction 10/20/30%; SMA150/200
+  CAVEAT: None | FAIL: Inverse ETF path dependence and reset
+S120 | ETF-specific / allocations | Volatility-managed sector basket | ETF | 1mo | PORTFOLIO
+  ENTRY: Equal risk contributions approximated weights proportional to 1/63d sigma for fixed eligible sector ETF universe (exclude missing listing history).
+  EXIT: Monthly rebalance; cap each weight 30%, redistribute remainder iteratively.
+  PARAMS: Sigma lookback 20/63/126; cap 20/30/40%
+  CAVEAT: None | FAIL: None
+S121 | ETF-specific / allocations | Bond-equity defensive switch | ETF | 1mo | PORTFOLIO
+  ENTRY: At month end choose SPY if SPY 12m excess return >0 and its 63d volatility<=20%, else 1-3m Treasury ETF.
+  EXIT: Rebalance next first-month open.
+  PARAMS: Trend 6/12m; vol 15/20/25%
+  CAVEAT: None | FAIL: None
+S122 | ETF-specific / allocations | Cross-asset relative momentum ETFs | ETF | 1mo | PORTFOLIO
+  ENTRY: Frozen diversified ETF basket (US equity, intl equity, T-bills, long Treasuries, gold, REITs); choose top 3 by 6m Sharpe (excess/vol), positive score required.
+  EXIT: Equal weight top 3 next-month open, fill cash otherwise.
+  PARAMS: window 3/6/12m; N 2/3/4
+  CAVEAT: None | FAIL: None
+S123 | ETF-specific / allocations | Equal weight vs cap weight spread | ETF | 1mo | PAIRS
+  ENTRY: Compute 63d excess momentum RSP vs SPY; hold RSP and short equal-notional SPY if excess >2%, reverse if <-2%; no position in band.
+  EXIT: Exit/reverse when signal crosses +/-0.5%; rebalance monthly.
+  PARAMS: Threshold 1/2/3%; exit 0/.5/1%
+  CAVEAT: None | FAIL: None
+S124 | ETF-specific / allocations | Treasury duration momentum | ETF | 1mo | PORTFOLIO
+  ENTRY: Frozen basket of 3 fixed-duration Treasury ETFs; choose duration ETF with max previous 3m total return when >Tbill, else short T-bills.
+  EXIT: Monthly switch next first session.
+  PARAMS: Lookback 1/3/6m; max duration class
+  CAVEAT: None | FAIL: None
+S125 | ETF-specific / allocations | Sector breadth risk-on filter | ETF | 1d | PORTFOLIO
+  ENTRY: At day close count fixed sector ETFs above their SMA200; if count>=7 out of 11 invest in SPY, otherwise in Tbill proxy.
+  EXIT: Next open switch; evaluate weekly Fridays to reduce churn.
+  PARAMS: Breadth threshold 5/7/9; SMA150/200
+  CAVEAT: None | FAIL: None
+S126 | Options directional / income | Long 30DTE ATM call | OPT | 1d | OPT_DEBIT
+  ENTRY: If underlying closes above SMA200 and EMA20 crosses above EMA50, buy nearest listed call delta +0.50, expiry 25-35 calendar days, next valid quote timestamp.
+  EXIT: Sell option if underlying closes below EMA20 OR DTE<=7; optional option loss -50% and profit +100%, tested separately.
+  PARAMS: delta .45/.50/.55; DTE 21/30/45; option stop 0/50%
+  CAVEAT: None | FAIL: None
+S127 | Options directional / income | Long 30DTE ATM put | OPT | 1d | OPT_DEBIT
+  ENTRY: If underlying closes below SMA200 and EMA20 crosses below EMA50, buy put delta -0.50, expiry 25-35 days.
+  EXIT: Close if price closes above EMA20 or DTE<=7.
+  PARAMS: delta .40/.50/.60 absolute; 21/30/45 DTE
+  CAVEAT: None | FAIL: None
+S128 | Options directional / income | Covered call monthly | STK+OPT | 1mo | OPT_COVERED
+  ENTRY: Own exactly 100 underlying shares; monthly sell 25-35DTE call with delta closest +0.30 above stock spot, on publicly available quote.
+  EXIT: Buy back call at DTE<=5 or close on assignment; keep shares unless explicitly write buywrite rebalancing rule.
+  PARAMS: short delta .2/.3/.4; DTE 21/30/45
+  CAVEAT: None | FAIL: None
+S129 | Options directional / income | Cboe-style ATM putwrite | OPT | 1mo | OPT_CASHSEC
+  ENTRY: On monthly roll hold 1m/3m T-bill collateral sufficient for maximum cash-settled SPX put settlement; sell near ATM SPX monthly put.
+  EXIT: Expire cash-settled per actual AM/PM contract or close near expiration before settlement as separate test; roll next cycle.
+  PARAMS: ATM strike nearest; roll monthly; alternate delta .35
+  CAVEAT: Match SPX settlement and roll methodology | FAIL: None
+S130 | Options directional / income | Cash-secured 0.30 delta put | OPT | 1mo | OPT_CASHSEC
+  ENTRY: Reserve strike*100 cash per contract; sell put with delta approx -0.30 and DTE 25-45, liquid stock or ETF with no earnings before expiration.
+  EXIT: Buy to close at <=50% original credit or DTE<=7; if assigned acquire shares and continue accounting.
+  PARAMS: delta .20/.30/.40; DTE 30/45; TP 25/50/75%
+  CAVEAT: None | FAIL: None
+S131 | Options directional / income | Wheel options plus shares | STK+OPT | 1mo | OPT_CASHSEC
+  ENTRY: State CASH: sell cash-secured -0.30delta put 30DTE; if assigned 100 shares switch SHARE: sell +0.30delta call 30DTE against 100 shares.
+  EXIT: At 7 DTE roll profitable options; assignments trigger state transition; share dividends included; PnL across ALL states.
+  PARAMS: delta .2/.3/.4; DTE 30/45; roll 7/14
+  CAVEAT: None | FAIL: Stock exposure dominates downside; premium is not free yield
+S132 | Options directional / income | Protective put monthly | STK+OPT | 1mo | OPT_COVERED
+  ENTRY: Hold 100 underlying shares; buy 60-90DTE put at delta -0.25 on first month signal.
+  EXIT: Roll when DTE<=30; keep shares continuously; put expires/closed as specified.
+  PARAMS: DTE 60/90; delta .15/.25/.35
+  CAVEAT: None | FAIL: None
+S133 | Options directional / income | Collar 30DTE | STK+OPT | 1mo | OPT_COVERED
+  ENTRY: Long 100 shares, buy 25-35DTE put delta -0.25 and sell same expiry call delta +0.25; 1:1 contracts.
+  EXIT: Close/roll pair at 5DTE; assignment handling throughout; keep stock.
+  PARAMS: deltas .15/.25/.35; roll 5/7DTE
+  CAVEAT: None | FAIL: None
+S134 | Options directional / income | Bull call debit vertical | OPT | 1d | OPT_DEBIT
+  ENTRY: Upon underlying 20d bullish breakout, buy call delta +0.60 and sell same expiry call delta +0.30, target DTE 25-45.
+  EXIT: Close at 50% maximum theoretical payoff gain or -50% paid debit, or <=7 DTE.
+  PARAMS: long delta .55/.6; short .2/.3; DTE 30/45
+  CAVEAT: None | FAIL: None
+S135 | Options directional / income | Bear put debit vertical | OPT | 1d | OPT_DEBIT
+  ENTRY: Upon 20d bearish breakdown, buy put delta -0.60 and sell put delta -0.30 same 30DTE expiry.
+  EXIT: Close 50% max-payoff gain or -50% debit, or 7DTE.
+  PARAMS: long abs delta .55/.60; short .2/.3; DTE 30/45
+  CAVEAT: None | FAIL: None
+S136 | Options directional / income | Bull put credit vertical | OPT | 1d | OPT_CREDIT
+  ENTRY: If underlying>SMA200 and VIX 20d percentile>60, sell put abs delta .30, buy lower strike abs delta .10, same expiry 30-45DTE.
+  EXIT: Close at 50% credit captured, 2x received credit debit to close, or 7DTE.
+  PARAMS: short delta .2/.3; wing 5/10 points or .1 delta
+  CAVEAT: None | FAIL: None
+S137 | Options directional / income | Bear call credit vertical | OPT | 1d | OPT_CREDIT
+  ENTRY: If underlying<SMA200 and its 20d return<0, sell 30-45DTE call delta .30, buy further OTM call delta .10.
+  EXIT: Close at 50% credit captured, 2x initial credit to close, or 7DTE.
+  PARAMS: short .2/.3 delta; long .05/.1 delta
+  CAVEAT: None | FAIL: None
+S138 | Options directional / income | Monthly short 20-delta iron condor | OPT | 1mo | OPT_CREDIT
+  ENTRY: Sell -0.20delta put and +0.20delta call; buy -0.05delta put/+0.05delta call with same monthly SPX expiration; buy wings; no net naked legs.
+  EXIT: Roll at 5DTE or close at 50% net credit captured; stress hold-to-settlement separately.
+  PARAMS: short abs .15/.20/.25; wing .03/.05/.10; DTE 30/45
+  CAVEAT: None | FAIL: None
+S139 | Options directional / income | Short iron butterfly | OPT | 1mo | OPT_CREDIT
+  ENTRY: Sell nearest ATM call and put same expiry 25-45DTE; buy OTM protective call +10 point and put -10 point wing (actual listed strikes and symmetric width).
+  EXIT: Close 25/50% credit captured, stop debit 2x original credit, or 7DTE.
+  PARAMS: width 5/10/20pts subject to underlying; DTE 21/30/45
+  CAVEAT: None | FAIL: None
+S140 | Options directional / income | Long iron butterfly | OPT | 1mo | OPT_DEBIT
+  ENTRY: Buy nearest ATM put and call same expiry; sell OTM call/put wings at symmetric 10 point width, require net debit >0 and defined loss.
+  EXIT: Close at 30% of theoretical maximum spread payoff or at 7DTE.
+  PARAMS: wing 5/10/20; DTE 14/30/45
+  CAVEAT: None | FAIL: None
+S141 | Options directional / income | Long call butterfly | OPT | 1mo | OPT_DEBIT
+  ENTRY: Buy 1 call at K1, sell 2 at K2=nearest ATM strike, buy 1 call at K3 with K2-K1=K3-K2 and DTE 25-45.
+  EXIT: Close when market value >=50% of max terminal payoff, or DTE<=5; risk=debit.
+  PARAMS: width 5/10/20; 30/45 DTE
+  CAVEAT: None | FAIL: None
+S142 | Options directional / income | Long put butterfly | OPT | 1mo | OPT_DEBIT
+  ENTRY: Buy put at upper K3, sell 2 puts at ATM K2, buy put at lower K1 equidistant; expiry 25-45DTE.
+  EXIT: Close at 50% max terminal payoff or 5DTE; debit risk.
+  PARAMS: width 5/10/20; 30/45 DTE
+  CAVEAT: None | FAIL: None
+S143 | Options directional / income | Long ATM straddle | OPT | 1d | OPT_DEBIT
+  ENTRY: Buy one ATM call plus one ATM put same 25-35DTE expiry if forward implied ATM volatility percentile <20 versus prior 252 sessions.
+  EXIT: Exit after 10d, if IV percentile>60, or DTE<=7; close BOTH legs simultaneously.
+  PARAMS: IV pct 10/20/30; DTE 21/30/45
+  CAVEAT: None | FAIL: None
+S144 | Options directional / income | Long 25-delta strangle | OPT | 1d | OPT_DEBIT
+  ENTRY: Buy same-expiration call +0.25 delta and put -0.25 delta, 30-45DTE, if 20d realized vol forecast exceeds ATM implied by at least 3 vol points (predeclared model).
+  EXIT: Exit DTE<=7 or after 10 trading days; no TP default.
+  PARAMS: delta .15/.25/.35; edge 1/3/5 vol pts
+  CAVEAT: None | FAIL: None
+S145 | Options directional / income | Short 25-delta strangle | OPT | 1mo | OPT_NAKED
+  ENTRY: Sell 30-45DTE put abs delta .25 and call delta .25 when ATM IV30/realized20 forecast ratio>=1.3.
+  EXIT: Close at 50% credit captured, 2x initial credit loss, or DTE<=7; stress unlimited call loss and margin.
+  PARAMS: delta .16/.25/.3; IV/RV 1.2/1.3/1.5
+  CAVEAT: None | FAIL: Unbounded short call risk; margin calls; jump gaps
+S146 | Options directional / income | Short ATM straddle delta-hedged | OPT+STK | 1d | OPT_NAKED
+  ENTRY: Sell ATM call+put same 30DTE expiry when quoted ATM IV > trailing 20d realized vol by >=3 annualized vol points; concurrently trade shares to net delta=0.
+  EXIT: Rehedge at daily close to |net delta|<0.05 per option-equivalent; close both options at 7DTE; account stock dividends/borrow.
+  PARAMS: IV-RV 2/3/5 vol pts; hedge 1d/1h; DTE 21/30
+  CAVEAT: None | FAIL: Short gamma / jumps; daily hedge incompleteness
+S147 | Options directional / income | Long ATM straddle gamma scalp | OPT+STK | 1d | OPT_DEBIT
+  ENTRY: Buy ATM call+put 30DTE when realized vol forecast exceeds implied by 3 vol pts; delta hedge with stock at entry.
+  EXIT: Rehedge stock at delta drift >0.1 or daily close; exit at 7DTE or after 10d.
+  PARAMS: Hedge threshold .05/.10/.20 delta; DTE 21/30
+  CAVEAT: None | FAIL: Hedge costs can overwhelm gamma gains
+S148 | Options directional / income | Long call calendar | OPT | 1mo | OPT_DEBIT
+  ENTRY: Sell ATM call expiring in 25-35DTE and buy same-strike ATM call expiring 55-75DTE; two-leg limit spread.
+  EXIT: Close near short expiration <=7DTE to avoid exercise, or upon +30% of initial debit gain.
+  PARAMS: near 21/30; far 60/90; TP 20/30/50%
+  CAVEAT: None | FAIL: None
+S149 | Options directional / income | Long put calendar | OPT | 1mo | OPT_DEBIT
+  ENTRY: Sell ATM put near 30DTE and buy same strike put far 60DTE; require far IV <=near IV +5 volatility points.
+  EXIT: Close both <=7DTE on near leg; or +30% debit.
+  PARAMS: near 21/30; far 60/90; relative IV -5/0/+5
+  CAVEAT: None | FAIL: None
+S150 | Options directional / income | Diagonal covered call replacement | OPT | 1mo | OPT_DEBIT
+  ENTRY: Buy long call ~0.80 delta expiring 180-365DTE; sell short call delta ~0.30 expiring 25-45DTE, underlying bullish trend filter.
+  EXIT: At near <=7DTE roll short; sell back LEAP when DTE<=90 or trend reversal; do not assume synthetic share equivalence.
+  PARAMS: long delta .75/.85; far DTE 180/365; short delta .2/.3
+  CAVEAT: None | FAIL: None
+S151 | Options directional / income | Call debit backspread | OPT | 1mo | OPT_DEBIT
+  ENTRY: Sell 1 call delta .50 and buy 2 calls delta .25 same expiry 30-60DTE, verify resulting net debit/credit and wing unbounded gain.
+  EXIT: Close <=7DTE, or when max drawdown reaches defined portfolio budget.
+  PARAMS: ratio 1:2; short .45/.5; long .2/.25
+  CAVEAT: None | FAIL: Profit valley between strikes
+S152 | Options directional / income | Put ratio backspread | OPT | 1mo | OPT_DEBIT
+  ENTRY: Sell 1 ATM-ish put abs delta .50, buy 2 OTM puts abs delta .25, same 30-60DTE expiry.
+  EXIT: Exit at 7DTE; carry debit/credit explicitly.
+  PARAMS: 1:2; long abs .20/.25; short .45/.5
+  CAVEAT: None | FAIL: None
+S153 | Options directional / income | Bullish risk reversal | OPT | 1mo | OPT_NAKED
+  ENTRY: Sell put delta -.25, buy call delta +.25 same 30-45DTE expiry when underlying price>SMA200 and predicted upside positive.
+  EXIT: Exit <=7DTE or signal crosses bearish; cash secure put side or model margin.
+  PARAMS: abs delta .2/.25/.3; DTE 30/45
+  CAVEAT: None | FAIL: None
+S154 | Options directional / income | Bearish risk reversal | OPT | 1mo | OPT_NAKED
+  ENTRY: Buy put delta -.25, sell call delta +.25 same 30-45DTE expiry if underlying<SMA200.
+  EXIT: Exit <=7DTE or bearish trend ends; naked short call margin modeled.
+  PARAMS: abs delta .2/.25/.3
+  CAVEAT: None | FAIL: Unbounded short call upside loss
+S155 | Options directional / income | Broken-wing call butterfly | OPT | 1mo | OPT_CREDIT
+  ENTRY: Buy 1 call K1, sell 2 calls K2>K1, buy 1 call K3>K2, with far wing K3-K2=1.5*(K2-K1), 30DTE.
+  EXIT: Exit near DTE<=7 or when credit/debit reaches 50% of terminal max payout; no symmetric-risk assumption.
+  PARAMS: near width 5/10; far multiple 1.5/2
+  CAVEAT: None | FAIL: None
+S156 | Options directional / income | Jade lizard (put + call credit spread) | OPT | 1mo | OPT_NAKED
+  ENTRY: Sell 30DTE put abs delta .30, sell call delta .30, buy call delta .15 same expiration; require total credit >= call vertical width if targeting zero upside loss.
+  EXIT: Close for 50% credit, 7DTE; downside naked-put-equivalent margin and assignment.
+  PARAMS: put .2/.3; call .2/.3; wing .1/.15
+  CAVEAT: None | FAIL: None
+S157 | Options directional / income | Covered strangle | STK+OPT | 1mo | OPT_CASHSEC
+  ENTRY: Hold 100 shares per call; sell call +0.20delta and sell put -0.20delta, same 30DTE; cash collateral for potential put assignment.
+  EXIT: Close/roll 7DTE; account additional shares if put assigned.
+  PARAMS: deltas .15/.2/.3; DTE 30/45
+  CAVEAT: None | FAIL: None
+S158 | Options events / skew / short-dated | Earnings long straddle pre-release | OPT | event | OPT_DEBIT
+  ENTRY: At 15:30 ET day before an after-close earnings release buy ATM straddle nearest post-release expiry at 3-10DTE; for before-open release buy at 15:30 prior calendar session.
+  EXIT: Exit both legs first next RTH 09:45 via quotes after actual release; no theoretical fills at earnings gap.
+  PARAMS: DTE 3/7/10; entry 15:00/15:30; exit 09:35/09:45
+  CAVEAT: Earnings releases and chain quotes exact timestamp, IV crush | FAIL: None
+S159 | Options events / skew / short-dated | Earnings short iron condor pre-release | OPT | event | OPT_CREDIT
+  ENTRY: Before scheduled earnings choose same nearest post-release expiry: short put -0.20, short call +0.20, buy wings -.05/+.05, only if credit>0 and protected wings.
+  EXIT: Exit next day 09:45 or at expiry; simulate assignment after extreme gap.
+  PARAMS: short .15/.2/.25; wing .05/.1; DTE 3-10
+  CAVEAT: None | FAIL: None
+S160 | Options events / skew / short-dated | Post-event volatility crush short spread | OPT | event | OPT_CREDIT
+  ENTRY: At first next trading-day 10:00 after earnings release, if current 30DTE ATM IV percentile >70, sell 30DTE 0.20delta put vertical ONLY when stock closes above opening range.
+  EXIT: Exit at 50% credit, 7DTE, or underlying below 5d low.
+  PARAMS: IV pct 60/70/80; delta .2/.3
+  CAVEAT: None | FAIL: None
+S161 | Options events / skew / short-dated | SPX 0DTE 20delta iron condor | OPT | 1m | OPT_CREDIT
+  ENTRY: At 10:00 ET on confirmed PM-settled SPX 0DTE expiry, sell 0.20delta call/put, buy 0.05delta protective call/put at same expiry; enter complex order with executable quotes.
+  EXIT: Close both verticals before 15:30 ET, or at 50% credit captured / 2x credit debit stop; account PM settlement if held.
+  PARAMS: Entry 09:45/10:00/11:00; delta .1/.2/.25; TP 25/50%
+  CAVEAT: None | FAIL: Extreme gamma and rapidly changing option bid/ask
+S162 | Options events / skew / short-dated | SPX 0DTE put credit spread | OPT | 1m | OPT_CREDIT
+  ENTRY: At 10:00 ET if SPX above VWAP and open>prior close, sell 0.20delta put and buy 0.05delta put same PM-settled 0DTE expiry.
+  EXIT: Close at 50% original credit, 2x credit to close or 15:30, whichever first.
+  PARAMS: Entry 10/11am; short delta .1/.2/.3; wing .05/.1
+  CAVEAT: None | FAIL: None
+S163 | Options events / skew / short-dated | SPX 0DTE call debit breakout | OPT | 1m | OPT_DEBIT
+  ENTRY: At 10:00-12:00 ET SPX 5m close above first 30m high; buy call delta .55 and sell call delta .25 same 0DTE PM-settled expiry.
+  EXIT: Exit when underlying below 5m VWAP, option debit loss 50%, or 15:30.
+  PARAMS: OR15/30m; Deltas .5/.55 and .2/.25
+  CAVEAT: None | FAIL: None
+S164 | Options events / skew / short-dated | SPX 0DTE long straddle at macro release | OPT | event | OPT_DEBIT
+  ENTRY: 5 minutes BEFORE timestamped FOMC statement (not press conference), buy nearest ATM call and put expiring same PM-settled day at recorded NBBO.
+  EXIT: Exit exactly 30 minutes after statement using first available nonlocked NBBO; no hindsight of direction.
+  PARAMS: entry -5/-10m; exit +15/+30/+60m
+  CAVEAT: Clock synchronization, Fed release schedule, quote snapshots | FAIL: None
+S165 | Options events / skew / short-dated | Options IV percentile mean reversion | OPT | 1d | OPT_CREDIT
+  ENTRY: If current 30DTE interpolated ATM IV at 90th percentile of its own trailing 252 trading days, open defined-risk 30DTE iron condor (20/5 deltas); only if spread filters pass.
+  EXIT: Exit when IV pct <=50, or 50% credit captured or 7DTE.
+  PARAMS: IV pct 80/90/95; exit 40/50/60
+  CAVEAT: None | FAIL: None
+S166 | Options events / skew / short-dated | Skew steepening put spread | OPT | 1d | OPT_DEBIT
+  ENTRY: Define skew=IV30DTE(put delta -.25)-IV30DTE(call +.25); if skew zscore previous 252d <-2, buy 30DTE 0.25delta put and sell lower 0.10delta put for debit.
+  EXIT: Close if skew z>=0 or at 7DTE; directional delta not neutral; report separately.
+  PARAMS: skew z -1.5/-2/-2.5; DTE 30/45
+  CAVEAT: None | FAIL: None
+S167 | Options events / skew / short-dated | Call-put IV skew risk reversal spread | OPT | 1d | OPT_NAKED
+  ENTRY: If put-minus-call 25delta IV skew zscore>+2, sell 25delta put, buy 25delta call same expiry and hedge net option delta with shares.
+  EXIT: Close when skew zscore<0.5 or DTE<=7; fund naked leg margin.
+  PARAMS: skew z 1.5/2/2.5; hedge daily/weekly
+  CAVEAT: None | FAIL: None
+S168 | Options events / skew / short-dated | IV term-structure call calendar | OPT | 1d | OPT_DEBIT
+  ENTRY: If 30DTE ATM IV exceeds 60DTE ATM IV by >=5 vol points, sell near 30DTE ATM call, buy 60DTE same-strike call.
+  EXIT: Exit when term spread <=0 or near DTE<=7.
+  PARAMS: term spread 2/5/8vol pts; legs 30/60 vs 21/45
+  CAVEAT: None | FAIL: None
+S169 | Options events / skew / short-dated | Volatility forecast vs implied short put spread | OPT | 1d | OPT_CREDIT
+  ENTRY: If model (specified ex ante) predicts next 30d realized sigma < quoted 30DTE ATM IV -5 vol pts, sell -0.25delta/ buy -.1 put, 30DTE.
+  EXIT: Exit 50% credit, 7DTE or forecast edge<1vol pt.
+  PARAMS: Edge 3/5/7 vol pts; forecast HAR-RV/20d realized
+  CAVEAT: Walk-forward realized-vol model training only | FAIL: None
+S170 | Options events / skew / short-dated | Dispersion proxy sector options | OPT | 1mo | OPT_NAKED
+  ENTRY: Sell 30DTE ATM SPY straddle and buy dollar-vega matched ATM straddles across fixed 5 highest-weight sector ETFs, net initial delta hedged.
+  EXIT: Rehedge delta daily and close at DTE<=7; model each ETF option quotes and cross-correlation.
+  PARAMS: Vega ratio .75/1/1.25; 5/11 sectors
+  CAVEAT: None | FAIL: Short index variance, long constituent variance imperfect hedge; tail correlations
+S171 | Options events / skew / short-dated | Put-call parity violation screen | OPT+STK | 1m | OPT_ARBITRAGE
+  ENTRY: For same strike/expiry quote synchronized bid/ask, compute executable conversion/reversal inequalities using discounted strike, dividends, borrow, American exercise; ENTER only if arbitrage after all costs.
+  EXIT: Hold until parity converges or expiration; enforce stock/option locates and early assignment.
+  PARAMS: Min edge 10/25/50bp of underlying notional; borrow 0/5/20%
+  CAVEAT: None | FAIL: Most apparent signals are stale quotes or unmodeled borrow/dividends
+S172 | Options events / skew / short-dated | Box spread financing carry | OPT | 1mo | OPT_ARBITRAGE
+  ENTRY: Construct fully cash-settled European SPX four-leg box using same expiry and strikes K1<K2: buy call K1/sell call K2 + buy put K2/sell put K1; use simultaneous executable quote.
+  EXIT: Hold to correct cash settlement; compare discounted guaranteed terminal width*100 against net debit, funding rate, fees and margin.
+  PARAMS: DTE 30/90/180; width 25/50/100points
+  CAVEAT: None | FAIL: Execution and funding dominate; option-style mix can break arbitrage
