@@ -222,7 +222,10 @@ def time_of_day_profile(bars: pd.DataFrame, lookback: int = 20, cumulative: bool
     cumulative=False: per-bar volume in that slot.
     cumulative=True : session-to-date cumulative volume up to the end of that
                       slot (S016 "cumulative volume vs same-time median").
-    stat: 'median' (default) or 'mean'. min_sessions defaults to lookback.
+    stat: 'median' (default) or 'mean', taken over the sessions in the window
+    that actually have the slot. min_sessions defaults to ceil(0.75*lookback).
+    A missing bar inside a session counts as 0 volume; slots after a session's
+    last bar (early closes) are excluded rather than counted.
     """
     _check(bars)
     sel = session_mask(bars, sessions)
@@ -232,11 +235,16 @@ def time_of_day_profile(bars: pd.DataFrame, lookback: int = 20, cumulative: bool
     v = b["volume"].to_numpy(float)
     df = pd.DataFrame({"k": key, "s": slot, "v": v})
     piv = df.pivot_table(index="k", columns="s", values="v", aggfunc="sum").sort_index()
+    # A slot with no bar is a no-trade interval (0 volume) when the session has
+    # LATER bars; slots after a session's last bar (early close / halt to the
+    # close) do not exist for that session and are left NaN so they are simply
+    # excluded from the median, never blanking later sessions.
+    raw_valid = piv.notna()
+    later_valid = piv.bfill(axis=1).notna()
+    piv = piv.fillna(0.0).where(raw_valid | later_valid)
     if cumulative:
-        raw_valid = piv.notna()
-        later_valid = piv.bfill(axis=1).notna()
         piv = piv.fillna(0.0).cumsum(axis=1).where(raw_valid | later_valid)
-    mp = lookback if min_sessions is None else min_sessions
+    mp = int(np.ceil(0.75 * lookback)) if min_sessions is None else int(min_sessions)
     roll = piv.rolling(lookback, min_periods=mp)
     prof = (roll.median() if stat == "median" else roll.mean()).shift(1)
     st = prof.stack()

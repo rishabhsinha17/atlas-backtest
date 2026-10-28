@@ -180,21 +180,22 @@ def normalize_positions(positions) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-# ledger reason classification for cost-drag decomposition
+# ledger reason classification for cost-drag decomposition, by EXACT codes
+# from atlasbt.core.schemas.LEDGER_REASONS. Fill-level cash flows (TRADE and the
+# per-fill fees COMMISSION / EXCHANGE_FEE / REGULATORY_FEE, which the engine also
+# posts to the ledger) are taken from the fills and excluded here ('fill_level')
+# so they are never double counted.
 LEDGER_BUCKETS = {
-    "borrow": ("BORROW", "LOCATE", "SHORT_FEE"),
-    "financing_debit": ("MARGIN_INTEREST", "DEBIT_INTEREST", "MARGIN", "LOAN_INTEREST"),
-    "financing_credit": ("CASH_INTEREST", "CREDIT_INTEREST", "INTEREST_INCOME", "REBATE"),
-    "dividends": ("DIVIDEND", "IN_LIEU", "DISTRIBUTION"),
-    "fees_other": ("FEE",),
+    "borrow": ("BORROW_FEE",),
+    "financing_debit": ("MARGIN_INTEREST",),
+    "financing_credit": ("CASH_INTEREST", "SHORT_REBATE"),
+    "dividends": ("DIVIDEND", "DIVIDEND_IN_LIEU", "WITHHOLDING_TAX"),
+    "fill_level": ("TRADE", "COMMISSION", "EXCHANGE_FEE", "REGULATORY_FEE"),
 }
+_REASON_TO_BUCKET = {code: b for b, codes in LEDGER_BUCKETS.items() for code in codes}
 
 
 def classify_reason(reason: str) -> str:
-    r = str(reason).upper()
-    for bucket, keys in LEDGER_BUCKETS.items():
-        if any(k in r for k in keys):
-            return bucket
-    if "INTEREST" in r:
-        return "financing_debit"
-    return "other"
+    """Exact-code mapping; anything else (SPLIT_CASH_IN_LIEU, DELIST_CASHOUT,
+    OPTION_*, DEPOSIT, WITHDRAWAL, unknown codes) -> 'other'."""
+    return _REASON_TO_BUCKET.get(str(reason).strip().upper(), "other")

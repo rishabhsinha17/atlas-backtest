@@ -111,17 +111,27 @@ def wilder(x, n: int, name: str | None = None):
 @njit
 def _wilder_sum(a, n, start):
     """Wilder's *running-sum* form used in the ADX worksheet:
-    S_first = sum(a[start:start+n]) at index start+n-1;
-    S_t = S_{t-1} - S_{t-1}/n + a_t.  (S = n * RMA.)"""
+    S_first = sum of the first n CONSECUTIVE valid values at/after `start`
+    (the seed window restarts after a NaN gap, as in ``_ewm_seeded``), placed
+    at the last of them; then S_t = S_{t-1} - S_{t-1}/n + a_t. After seeding a
+    NaN bar emits NaN and the state is carried unchanged. (S = n * RMA.)"""
     m = a.shape[0]
     out = np.full(m, np.nan)
-    if start + n > m:
-        return out
     s = 0.0
-    for i in range(start, start + n):
-        s += a[i]
-    out[start + n - 1] = s
-    for t in range(start + n, m):
+    cnt = 0
+    i = start
+    while i < m and cnt < n:
+        if np.isnan(a[i]):
+            s = 0.0
+            cnt = 0
+        else:
+            s += a[i]
+            cnt += 1
+        i += 1
+    if cnt < n:
+        return out
+    out[i - 1] = s
+    for t in range(i, m):
         if np.isnan(a[t]):
             continue
         s = s - s / n + a[t]

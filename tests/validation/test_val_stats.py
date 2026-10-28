@@ -190,3 +190,23 @@ def test_bh_and_by_match_statsmodels():
     r2, q2, *_ = multipletests(p, 0.05, method="fdr_by")
     np.testing.assert_allclose(q, q2)
     np.testing.assert_array_equal(rej, r2)
+
+
+def test_dsr_variance_shared_rule():
+    # no trial Sharpes -> own sampling variance (1 - g3 SR + (g4-1)/4 SR^2)/(T-1)
+    v = st.dsr_variance(0.05, 1001, -1.0, 6.0)
+    assert v["var_sr_source"] == "estimation_noise"
+    assert v["var_sr_period"] == pytest.approx((1 + 0.05 + 1.25 * 0.0025) / 1000)
+    big = st.dsr_variance(0.05, 1001, 0.0, 3.0, trial_sharpes=[0.0, 0.2, -0.2, np.nan])
+    assert big["var_sr_source"] == "trial_sharpes" and big["var_sr_period"] == pytest.approx(np.var([0, .2, -.2], ddof=1))
+    small = st.dsr_variance(0.05, 1001, 0.0, 3.0, trial_sharpes=[0.01, 0.0101])
+    assert small["var_sr_source"] == "estimation_noise"
+    assert st.dsr_variance(0.05, 1001, var_trials=1.0)["var_sr_source"] == "argument"
+    a = st.dsr_adjusted(0.05, 1001, 0.0, 3.0, 1450)
+    assert a["dsr"] == pytest.approx(st.dsr(0.05, 1001, 0.0, 3.0, 1450, a["var_sr_period"]))
+
+
+def test_bh_ignores_nan_pvalues():
+    rej, q = mt.benjamini_hochberg([0.01, np.nan, 0.04])
+    assert np.isnan(q[1]) and not rej[1]
+    np.testing.assert_allclose(q[[0, 2]], [0.02, 0.04])

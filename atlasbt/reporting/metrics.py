@@ -129,23 +129,60 @@ def tail_stats(r: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------- rf
-def risk_free_returns(result, rf=None) -> tuple[pd.Series, str]:
+def risk_free_returns(result, rf=None, with_coverage: bool = False):
+    """Per-period simple rf returns aligned to ``result.returns``.
+
+    Returns (series, source) or, with ``with_coverage=True``, (series, source,
+    coverage) where coverage is the share of periods with an rf value. Sources:
+    'argument', 'meta.rf_daily', 'meta.risk_free_rate' (Series or float,
+    annualised simple, accrued act/360 using the rate known at the PREVIOUS
+    stamp; the first stamp uses its own rate - bfill(limit=1) for that stamp
+    only), 'none'. Periods before the first available rate get 0 and are
+    reported through coverage < 1 (never back-filled from later data).
+    """
     idx = result.returns.index
+    cov = 1.0
     if rf is not None:
         s = rf if isinstance(rf, pd.Series) else pd.Series(rf, index=idx)
-        return s.reindex(idx).fillna(0.0), "argument"
-    meta = getattr(result, "meta", None) or {}
-    if isinstance(meta.get("rf_daily"), pd.Series):
-        return meta["rf_daily"].reindex(idx).fillna(0.0), "meta.rf_daily"
-    if isinstance(meta.get("risk_free_rate"), pd.Series):
-        rate = meta["risk_free_rate"].reindex(idx, method="ffill") if isinstance(idx, pd.DatetimeIndex) else meta["risk_free_rate"]
-        if isinstance(idx, pd.DatetimeIndex):
-            days = pd.Series(idx, index=idx).diff().dt.days.fillna(1).to_numpy()
+        s = s.reindex(idx)
+        cov, out, src = float(s.notna().mean()) if len(s) else 1.0, s.fillna(0.0), "argument"
+    else:
+        meta = getattr(result, "meta", None) or {}
+        rate_obj = meta.get("risk_free_rate")
+        if isinstance(meta.get("rf_daily"), pd.Series):
+            s = meta["rf_daily"].reindex(idx)
+            cov, out, src = float(s.notna().mean()) if len(s) else 1.0, s.fillna(0.0), "meta.rf_daily"
+        elif isinstance(rate_obj, (pd.Series, int, float)) and not isinstance(rate_obj, bool):
+            if isinstance(rate_obj, pd.Series):
+                rate = rate_obj.reindex(idx, method="ffill") if isinstance(idx, pd.DatetimeIndex) else rate_obj.reindex(idx)
+            else:
+                rate = pd.Series(float(rate_obj), index=idx)
+            if isinstance(idx, pd.DatetimeIndex):
+                days = pd.Series(idx, index=idx).diff().dt.days.fillna(1).to_numpy()
+            else:
+                days = np.ones(len(idx))
+            known = rate.shift(1)
+            if len(known):
+                known.iloc[0] = rate.iloc[0]  # first stamp only: its own rate (no earlier stamp exists)
+            cov = float(known.notna().mean()) if len(known) else 1.0
+            out = pd.Series(known.to_numpy() * days / 360.0, index=idx).fillna(0.0)
+            src = "meta.risk_free_rate"
         else:
-            days = np.ones(len(idx))
-        # rate known at the previous stamp accrues over the period (act/360)
-        return pd.Series(rate.shift(1).bfill().to_numpy() * days / 360.0, index=idx).fillna(0.0), "meta.risk_free_rate"
-    return pd.Series(0.0, index=idx), "none"
+            out, src = pd.Series(0.0, index=idx), "none"
+    return (out, src, cov) if with_coverage else (out, src)
+
+
+def nav_path(result) -> dict:
+    """Shared NAV conventions: returns {'eq', 'r', 'nav0', 'full_eq'} where
+    full_eq prepends NAV0 (meta['initial_capital'], else equity[0]/(1+r[0]))
+    one day before the first stamp. Used by compute_metrics and the leaderboard."""
+    eq = result.equity.astype(float).dropna()
+    r = (result.returns.astype(float).reindex(eq.index).fillna(0.0) if result.returns is not None
+         and len(result.returns) else eq.pct_change().fillna(0.0))
+    nav0 = float((getattr(result, "meta", None) or {}).get("initial_capital", eq.iloc[0] / (1 + r.iloc[0])))
+    first = [eq.index[0] - pd.Timedelta(days=1)] if isinstance(eq.index, pd.DatetimeIndex) else [-1]
+    full_eq = pd.concat([pd.Series([nav0], index=first), eq])
+    return {"eq": eq, "r": r, "nav0": nav0, "full_eq": full_eq}
 
 
 # ---------------------------------------------------------------- regression vs benchmark / factors
@@ -263,6 +300,8 @@ def cost_drag(fills, ledger, equity: pd.Series) -> dict:
     comps = {}
     for c in ("commission", "exchange_fees", "regulatory_fees", "spread_cost", "impact_cost"):
         comps[c] = float(f[c].sum()) if not f.empty else 0.0
+    # fees_other is kept for a stable output schema; no LEDGER_REASONS code maps to it
+    # today (per-fill fees come from the fills, never from the ledger)
     for b in ("borrow", "financing_debit", "financing_credit", "dividends", "fees_other"):
         comps[b] = 0.0
     if not led.empty:
@@ -304,13 +343,13 @@ def compute_metrics(result, benchmark: pd.Series | None = None, factors: pd.Data
     if out["status"] != "OK" or result.equity is None or len(result.equity) < 2:
         out["not_testable_reason"] = getattr(result, "not_testable_reason", "")
         return out
-    eq = result.equity.astype(float).dropna()
-    r = result.returns.astype(float).reindex(eq.index).fillna(0.0) if len(result.returns) else eq.pct_change().fillna(0.0)
-    rfs, src = risk_free_returns(result, rf)
+    nv = nav_path(result)
+    eq, r, nav0, full_eq = nv["eq"], nv["r"], nv["nav0"], nv["full_eq"]
+    rfs, src, cov = risk_free_returns(result, rf, with_coverage=True)
+    if src != "none" and cov < 1.0:
+        src = f"{src} (partial coverage {cov:.0%}; rf=0 where missing)"
     rfs = rfs.reindex(r.index).fillna(0.0)
     ex = (r - rfs).to_numpy()
-    nav0 = float((getattr(result, "meta", None) or {}).get("initial_capital", eq.iloc[0] / (1 + r.iloc[0])))
-    full_eq = pd.concat([pd.Series([nav0], index=[eq.index[0] - pd.Timedelta(days=1)] if isinstance(eq.index, pd.DatetimeIndex) else [-1]), eq])
     dd = max_drawdown_info(full_eq)
     cg = cagr_from_equity(eq, nav0)
     perf = {"start": str(eq.index[0]), "end": str(eq.index[-1]), "n_days": int(len(r)), "nav0": nav0,

@@ -71,6 +71,44 @@ def dsr(sr: float, n: int, skew: float, kurt: float, n_trials: float, var_sr: fl
     return psr(sr, expected_max_sharpe(n_trials, var_sr), n, skew, kurt)
 
 
+def dsr_variance(sr: float, n: int, skew: float = 0.0, kurt: float = 3.0, trial_sharpes=None,
+                 var_trials: float | None = None) -> dict:
+    """V[SR_n] used to deflate a Sharpe ratio (shared by the report and the leaderboard).
+
+    V = max(var_trials, sigma2_SR), where
+      var_trials = np.var(trial Sharpes, ddof=1) when >= 2 comparable (finite, per-period)
+                   trial Sharpes are given (or ``var_trials`` passed explicitly), else 0;
+      sigma2_SR  = (1 - g3 SR + (g4 - 1)/4 SR^2)/(T - 1), the sampling variance of the
+                   strategy's own per-period Sharpe estimate (Mertens 2002 / Bailey &
+                   Lopez de Prado 2012; g4 non-excess kurtosis).
+    Using sigma2_SR as a floor means that even with no information about the other
+    trials, SR0 is at least the expected maximum of N pure-noise Sharpe estimates.
+    Returns {'var_sr_period', 'var_sr_source', 'var_trials', 'var_noise'}.
+    """
+    noise = (1.0 - skew * sr + (kurt - 1.0) / 4.0 * sr * sr) / (n - 1) if n > 1 else float("nan")
+    vt, src = 0.0, None
+    if var_trials is not None and np.isfinite(var_trials):
+        vt, src = float(var_trials), "argument"
+    elif trial_sharpes is not None:
+        ts = np.asarray(trial_sharpes, float)
+        ts = ts[np.isfinite(ts)]
+        if ts.size >= 2:
+            vt, src = float(np.var(ts, ddof=1)), "trial_sharpes"
+    if src is not None and vt > noise:
+        return {"var_sr_period": vt, "var_sr_source": src, "var_trials": vt, "var_noise": noise}
+    return {"var_sr_period": noise, "var_sr_source": "estimation_noise", "var_trials": vt, "var_noise": noise}
+
+
+def dsr_adjusted(sr: float, n: int, skew: float, kurt: float, n_trials: float, trial_sharpes=None,
+                 var_trials: float | None = None) -> dict:
+    """DSR with V[SR_n] from ``dsr_variance``. Returns the variance dict plus 'dsr' and 'sr0'."""
+    v = dsr_variance(sr, n, skew, kurt, trial_sharpes, var_trials)
+    out = dict(v)
+    out["sr0"] = expected_max_sharpe(n_trials, v["var_sr_period"])
+    out["dsr"] = dsr(sr, n, skew, kurt, n_trials, v["var_sr_period"])
+    return out
+
+
 def dsr_from_returns(returns, n_trials: float, var_sr: float) -> float:
     m = moments(returns)
     return dsr(m["sr"], m["n"], m["skew"], m["kurt"], n_trials, var_sr)

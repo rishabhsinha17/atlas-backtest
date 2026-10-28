@@ -76,7 +76,9 @@ def walk_forward_splits(index, train, test, step=None, anchored: bool = False, h
     """Build rolling (or anchored/expanding) train/test folds on pre-holdout data.
 
     train/test/step: number of bars (int), a fraction (<1) of the sample, or an
-    offset string ('3Y', '6M'). holdout: fraction (<1), number of bars, or a
+    offset string ('3Y', '6M'). If step < test, every fold's test segment is
+    truncated to `step` bars (OOS segments tile without overlap; used by both
+    ``walk_forward_matrix`` and ``walk_forward_run``). holdout: fraction (<1), number of bars, or a
     timestamp (holdout = index >= timestamp)."""
     idx = pd.DatetimeIndex(index)
     if isinstance(holdout, (pd.Timestamp, str)):
@@ -97,7 +99,9 @@ def walk_forward_splits(index, train, test, step=None, anchored: bool = False, h
     s = ntr
     while s + 1 <= len(pre):
         tr = pre[:s] if anchored else pre[s - ntr:s]
-        te = pre[s:min(s + nte, len(pre))]
+        # with step < test, consecutive test windows would overlap; truncate each
+        # test segment to `step` bars so the stitched OOS dates tile exactly
+        te = pre[s:min(s + min(nte, nst), len(pre))]
         if len(te) == 0:
             break
         folds.append(Fold(tr, te))

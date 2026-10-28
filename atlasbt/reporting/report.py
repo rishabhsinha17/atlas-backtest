@@ -61,11 +61,11 @@ def _fmt(v, kind="f2"):
 
 
 def strategy_validation(result, n_trials: int | None = None, var_sr: float | None = None, bootstrap_reps: int = 1000,
-                        seed: int = 0, cost_stress: bool = True) -> dict:
+                        seed: int = 0, cost_stress: bool = True, trial_sharpes=None) -> dict:
     """Statistical adjustments for one result (DSR, PSR, bootstrap CIs, cost stress, break-even)."""
     from atlasbt.validation.bootstrap import bootstrap_metrics
     from atlasbt.validation.cost_stress import break_even_cost, cost_stress_table
-    from atlasbt.validation.sharpe_tests import dsr, moments, psr, total_atlas_trials
+    from atlasbt.validation.sharpe_tests import dsr_adjusted, moments, psr, total_atlas_trials
 
     out: dict = {}
     r = result.returns.astype(float).dropna()
@@ -75,13 +75,14 @@ def strategy_validation(result, n_trials: int | None = None, var_sr: float | Non
         return {"note": "fewer than 30 return observations; statistics skipped"}
     m = moments(ex)
     N = n_trials if n_trials is not None else total_atlas_trials()
-    v = var_sr if var_sr is not None else (0.5 / 252)  # documented fallback: annualised SR variance 0.5
+    adj = dsr_adjusted(m["sr"], m["n"], m["skew"], m["kurt"], N, trial_sharpes, var_sr)
     out["moments"] = m
     out["psr_0"] = psr(m["sr"], 0.0, m["n"], m["skew"], m["kurt"])
-    out["dsr"] = dsr(m["sr"], m["n"], m["skew"], m["kurt"], N, v)
+    out["dsr"] = adj["dsr"]
+    out["sr0_period"] = adj["sr0"]
     out["n_trials"] = N
-    out["var_sr_per_period"] = v
-    out["var_sr_source"] = "argument" if var_sr is not None else "fallback(0.5 annualised)"
+    out["var_sr_period"] = adj["var_sr_period"]
+    out["var_sr_source"] = adj["var_sr_source"]
     try:
         out["bootstrap"] = bootstrap_metrics(ex, reps=bootstrap_reps, seed=seed)
     except Exception as e:  # pragma: no cover

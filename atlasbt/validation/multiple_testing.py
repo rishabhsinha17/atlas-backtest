@@ -103,15 +103,20 @@ def white_reality_check(d, reps: int = 2000, block: float | None = None, seed: i
 def benjamini_hochberg(pvalues, q: float = 0.05, method: str = "bh"):
     """FDR control. Returns (reject: ndarray[bool], qvalues: ndarray) in input order.
 
-    method='bh' (independent/PRDS) or 'by' (arbitrary dependence)."""
+    method='bh' (independent/PRDS) or 'by' (arbitrary dependence). NaN p-values
+    are excluded from the number of tests m and get q = NaN, reject = False."""
     p = np.asarray(pvalues, float)
-    m = p.size
-    order = np.argsort(p, kind="mergesort")
+    qv = np.full(p.size, np.nan)
+    rej = np.zeros(p.size, bool)
+    ok = np.flatnonzero(np.isfinite(p))
+    m = ok.size
+    if m == 0:
+        return rej, qv
+    order = ok[np.argsort(p[ok], kind="mergesort")]
     ranked = p[order]
     c = np.sum(1.0 / np.arange(1, m + 1)) if method == "by" else 1.0
     adj = ranked * m * c / np.arange(1, m + 1)
     adj = np.minimum.accumulate(adj[::-1])[::-1]
-    adj = np.clip(adj, 0, 1)
-    qv = np.empty(m)
-    qv[order] = adj
-    return qv <= q, qv
+    qv[order] = np.clip(adj, 0, 1)
+    rej[ok] = qv[ok] <= q
+    return rej, qv

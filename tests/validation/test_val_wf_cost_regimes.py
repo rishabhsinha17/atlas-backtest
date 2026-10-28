@@ -166,3 +166,11 @@ def test_regime_table_numbers():
     assert t.loc["B", "max_drawdown"] == pytest.approx(-0.02) and t.loc["A", "hit_rate"] == 1.0
     allr = regimes.all_regimes(r)
     assert "decade" in allr and allr["decade"].index[0] == "2000s"
+
+
+def test_walk_forward_step_lt_test_tiles_oos():
+    idx = pd.bdate_range("2010-01-01", periods=700, tz="UTC")
+    s = wf.walk_forward_splits(idx, 200, 63, step=21, holdout=0.1)
+    assert all(len(f.test) <= 21 for f in s.folds)
+    tests = np.concatenate([f.test.asi8 for f in s.folds])
+    assert len(np.unique(tests)) == len(tests)

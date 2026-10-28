@@ -13,14 +13,21 @@ Tests: `tests/indicators`, `tests/validation`, `tests/reporting` (`python -m pyt
 * **No negative shifts.** `_util.shift` refuses negative lags.
 * **Warm-up.** NaN until enough data exists. Nothing is back-filled or seeded from future data.
 * **Internal NaNs.** Rolling-window functions return NaN for any window containing a NaN. Recursive
-  smoothers (EMA, Wilder) skip a NaN observation: they emit NaN on that bar and carry the state forward.
-  Nothing is imputed.
+  smoothers (EMA, Wilder, Wilder running sums in ADX) seed on the first n *consecutive* valid values
+  (the seed restarts after a gap). After seeding they skip a NaN observation: NaN is emitted on that bar
+  and the state is carried forward. Parabolic SAR skips bars with a NaN high or low entirely (NaN
+  output, state and prior-bar extremes unchanged), so its output equals the series with those bars
+  deleted. It is initialised on the first two valid bars. Nothing is imputed.
+  Leading NaNs (e.g. a symbol listing after the panel start) give the same values as the trimmed series.
 * **Types.** Every function accepts a numpy array or a pandas Series. A Series input returns a Series or
   DataFrame on the same index; an array input returns arrays or a dict of arrays.
 * **Batch and streaming.** `indicators.streaming` provides O(1)-per-bar state machines (`StreamingSMA`,
   `StreamingEMA`, `StreamingWilder`, `StreamingRSI`, `StreamingATR`, `RollingExtreme`,
   `StreamingSessionVWAP`, `StreamingOpeningRange`). Tests check that they match the batch versions to
-  1e-10. Intraday strategies running in `on_bar` should use them.
+  1e-10, including on inputs with NaNs: `StreamingRSI` returns NaN when the change is NaN, and
+  `RollingExtreme` returns NaN while a NaN is in the window. `StreamingOpeningRange(minutes, bar_minutes)`
+  includes a bar only if its start ≥ 0 and its end ≤ minutes from the open, so premarket bars are excluded,
+  matching the batch window [open, open+minutes). Intraday strategies running in `on_bar` should use them.
 * **Numba.** Recursive kernels use `numba.njit` when it is installed and plain Python otherwise.
 
 ## 2. Indicator definitions
@@ -40,7 +47,7 @@ machine-readable form (see Limitations).
 | `rsi(c,n,method)` | Wilder: avg gain/loss seeded with the mean of the first n changes (first RSI at index n), then Wilder smoothing. `method='cutler'`: SMA of gains/losses. Edge cases: loss=0 → 100, gain=0 → 0, both 0 → 50 | Wilder 1978 ch. VI; cs-rsi |
 | `true_range` | max(H,C_{t−1})−min(L,C_{t−1}); TR_0 = H_0−L_0 | Wilder 1978 |
 | `atr(h,l,c,n,method)` | Wilder: seed = mean(TR_0..TR_{n−1}) at n−1 (matches cs-atr); `'sma'` = n-bar mean of TR (S061); `'ema'` | cs-atr |
-| `dmi/adx` | +DM/−DM/TR from bar 1; Wilder running-sum smoothing (S−S/n+x); DI = 100·DM_n/TR_n; DX = 100·\|DI+−DI−\|/(DI++DI−); ADX = mean of the first n DX values (index 2n−1), then Wilder | Wilder 1978 ch. IV; cs-adx (504 bars) |
+| `dmi/adx` | +DM/−DM/TR defined when the bar and its prior bar both have H, L, C; Wilder running-sum smoothing seeded on the first n consecutive valid values (S−S/n+x); DI = 100·DM_n/TR_n; DX = 100·\|DI+−DI−\|/(DI++DI−); ADX = mean of the first n DX values (index 2n−1), then Wilder | Wilder 1978 ch. IV; cs-adx (504 bars) |
 | `macd(12,26,9)` | EMA_fast − EMA_slow (SMA-seeded); signal = SMA-seeded EMA of MACD; hist = MACD − signal | Appel |
 | `bollinger(c,20,2,ddof=0)` | **population** σ (ddof=0) as specified by Bollinger and used by StockCharts (the test fails with ddof=1). bandwidth = (U−L)/mid as a fraction (StockCharts shows ×100); %b | Bollinger 2001; cs-bbands |
 | `bandwidth_percentile(c,20,2,252)` | mid-rank percentile of today's bandwidth among the **previous** 252 values (S056) | — |
@@ -93,11 +100,14 @@ The input is a canonical bars frame (UTC index of bar starts, a `session` column
   plus `known_at` = the end of the last bar in the window (S005–S007).
 * `opening_range(minutes)` is defined on a row only once bar end ≥ open+minutes. Earlier rows are NaN.
 * `session_extremes` returns hod/lod and `hod_prior`/`lod_prior` through the previous bar (S016).
-* `time_of_day_profile` / `relative_volume(lookback=20, cumulative, stat='median')`: the expected value for a
-  slot is the median of the same ET minute-slot over the **previous** `lookback` sessions. The current
-  session is excluded (`shift(1)` over sessions). `cumulative=True` compares session-to-date volume
-  (S001 "09:35 RVOL(5m)", S016 "cumulative volume vs same-time median"). Early-close sessions simply have
-  no late slots.
+* `time_of_day_profile` / `relative_volume(lookback=20, cumulative, stat='median', min_sessions)`: the expected
+  value for a slot is the median of the same ET minute-slot over the sessions **within the previous `lookback`
+  sessions that have that slot**. The current session is excluded (`shift(1)` over sessions). `min_sessions`
+  defaults to ⌈0.75·lookback⌉. A missing bar inside a session (a no-trade minute omitted by the feed) counts as
+  0 volume when the session has later bars, in both per-bar and cumulative modes. Slots after a session's last
+  bar (early closes) are excluded from the median, so a half day never blanks later sessions' afternoon RVOL.
+  `cumulative=True` compares session-to-date volume (S001 "09:35 RVOL(5m)", S016 "cumulative volume vs
+  same-time median").
 * `adv(volume,20,lag)` and `dollar_volume(close,volume,20,lag)`: use `lag=1` intraday (today is incomplete).
 
 ### 2.3 Stat-arb: `indicators.statarb`
@@ -134,7 +144,8 @@ Panel functions work row by row, so each date uses only its own cross-section.
   `walk_forward_matrix` (one return column per grid combination; each full-sample run is causal) or
   `walk_forward_run(run(params,start,end))` (fresh runs per window) picks the best train-window combination
   (objective: Sharpe, total return, mean or a callable; ties go to the earliest column) and stitches the OOS test
-  segments together. The holdout is evaluated **once**, with the combination selected on the train window just before it.
+  segments together. If `step < test`, each fold's test segment is truncated to `step` bars so the OOS dates
+  tile exactly (no duplicated days). This applies to both modes. The holdout is evaluated **once**, with the combination selected on the train window just before it.
   A test checks that absurd holdout returns do not change any fold's choice. Reported: OOS Sharpe, WF efficiency
   (mean test / mean train metric) and parameter stability.
   Caveat for matrix mode: positions and warm-up state carried into a test window come from the full-sample run.
@@ -155,7 +166,13 @@ Panel functions work row by row, so each date uses only its own cross-section.
   **Trial count for the WHOLE atlas:** `atlas_trials()` gives every strategy's grid size, from the strategy
   registry's `grid` when supplied and otherwise parsed from `docs/strategies.json` "Parameters to test" (product of the
   '/'-separated options per ';'-parameter). The parsed total is **1450** configurations over 172 strategies. Every DSR in the
-  leaderboard is deflated with this total N. V[SR_n] defaults to the cross-strategy variance of per-period Sharpes.
+  leaderboard is deflated with this total N.
+  **V[SR_n]** comes from one shared function, `sharpe_tests.dsr_variance`, used by both the per-strategy report and the
+  leaderboard: V = max(var_trials, σ²_SR). var_trials = `np.var(trial_sharpes, ddof=1)` when ≥ 2 comparable per-period
+  trial Sharpes are passed (or an explicit `var_sr`), else 0. σ²_SR = (1 − γ₃SR + (γ₄−1)/4·SR²)/(T−1) is the sampling
+  variance of the strategy's own Sharpe estimate (γ₄ non-excess). With no trial information, SR₀ is therefore the expected
+  maximum of N noise-only Sharpe estimates. There is no fixed default or floor. `var_sr_period` and `var_sr_source`
+  ('trial_sharpes' | 'argument' | 'estimation_noise') are reported.
   `effective_trials(N, ρ̄)` = ρ̄ + (1−ρ̄)N is available for correlated trials.
 * **PBO via CSCV** (`pbo.pbo_cscv`), Bailey, Borwein, López de Prado & Zhu (2017). There are S (even, default 16) equal
   contiguous blocks. The first T mod S rows are dropped so the most recent data are kept. All C(S,S/2) train/test
@@ -168,7 +185,7 @@ Panel functions work row by row, so each date uses only its own cross-section.
   lower / consistent / upper p-values (re-centring max(d̄,0); d̄·1{d̄ ≥ −ω√(2 log log n/n)}; d̄).
   RC = non-studentised upper. Tested against `arch.bootstrap.SPA` (within Monte Carlo error).
 * **FDR** (`benjamini_hochberg`, BH 1995; `method='by'` for Benjamini–Yekutieli 2001). q-values match
-  statsmodels. Leaderboard p-values are p = 1 − PSR(0).
+  statsmodels. NaN p-values are excluded from m and get q = NaN, reject = False. Leaderboard p-values are p = 1 − PSR(0).
 * **Regimes** (`regimes`). All labels are **ex ante** (lag 1): BULL/BEAR = SPY close vs SMA200; VIX terciles from
   expanding-window cut points (`causal=True`, or full-sample for description only); rate level buckets (<1%, 1–3%,
   ≥3%, optional rising/falling); decades. `regime_table` gives days, share, annualised mean/vol, Sharpe, compounded return,
@@ -207,12 +224,19 @@ The canonical columns are:
   a list of `core.types.Fill`, an `instrument` column, a `costs` column of `CostBreakdown`.
 * trades: `symbol, entry_ts, exit_ts, quantity, entry_price, exit_price, pnl (net), r_multiple, mae, mfe, bars_held,
   multiplier`.
-* ledger: `ts, amount (+ inflow), reason`. Reasons are bucketed by keyword: BORROW/LOCATE → borrow;
-  MARGIN/DEBIT_INTEREST → financing_debit; CASH/CREDIT_INTEREST/REBATE → financing_credit; DIVIDEND/IN_LIEU → dividends.
+* ledger: `ts, amount (+ inflow), reason`. Reasons are mapped by **exact** codes from `core.schemas.LEDGER_REASONS`:
+  BORROW_FEE → borrow; MARGIN_INTEREST → financing_debit; CASH_INTEREST, SHORT_REBATE → financing_credit; DIVIDEND,
+  DIVIDEND_IN_LIEU, WITHHOLDING_TAX → dividends (signed). TRADE, COMMISSION, EXCHANGE_FEE and REGULATORY_FEE are
+  fill-level: they are taken from the fills and excluded from the ledger buckets, so they are not double counted.
+  SPLIT_CASH_IN_LIEU, DELIST_CASHOUT, OPTION_*, DEPOSIT, WITHDRAWAL and unknown codes go to "other". `fees_other` is kept
+  in the output for a stable schema; no current code maps to it.
 * positions: `ts, symbol, quantity, market_value`.
 * risk-free: `meta['rf_daily']` (per-period simple return series) or `meta['risk_free_rate']` (annualised simple rate,
-  accrued act/360 between NAV stamps using the rate known at the previous stamp). If neither is present, rf = 0 and this
-  is reported as `rf_source='none'`. `meta['initial_capital']` is used as NAV₀ when present.
+  as a Series or a float, accrued act/360 between NAV stamps using the rate known at the previous stamp). Only the first
+  stamp uses its own rate (bfill limited to that stamp). Periods before the first available rate get 0 and are **never**
+  back-filled. The report's `rf_source` is then flagged "partial coverage x%". If no rf is present, rf = 0 and
+  `rf_source='none'`. `meta['initial_capital']` is used as NAV₀ when present. One helper, `metrics.nav_path`, prepends NAV₀
+  to the NAV path for both `compute_metrics` and the leaderboard's MaxDD/CAGR.
 
 ### 4.2 Metrics (`metrics.compute_metrics`)
 * CAGR uses calendar time from NAV₀. Annualised vol uses 252 periods and ddof 1. Sharpe and Sortino use returns in excess
@@ -246,8 +270,9 @@ raw metrics. Sections follow for bootstrap CIs, cost stress A–E with break-eve
 regressions, tails, regimes and fidelity. NOT_TESTABLE runs produce a short report with the reason.
 
 ### 4.5 Leaderboard (`leaderboard.build_leaderboard / write_leaderboard`)
-Rows come from `summarize_result` (optionally with PBO, walk-forward OOS Sharpe and break-even bp). DSR is computed with the
-**total atlas trial count** (max of the summed registry grids and the parsed 1450). q-values are BH over all tested strategies.
+Rows come from `summarize_result` (optionally with PBO, walk-forward OOS Sharpe and break-even bp). MaxDD and CAGR include
+NAV₀ (shared `nav_path`). DSR is computed with the **total atlas trial count** (max of the summed registry grids and the
+parsed 1450) and the shared `dsr_variance` rule (optional `trial_sharpes` / `var_sr`). q-values are BH over all tested strategies.
 **Sort: DSR ↓, then PBO ↑, then q ↑, then PSR ↓.** Raw Sharpe is shown for reference only and never sets the rank. NOT_TESTABLE
 and FAILED strategies are listed separately with their reasons (`not_testable.csv`, plus a markdown section). The test builds a
 case where the strategy with the highest raw Sharpe (short sample, crash skew) ranks below a long, well-behaved one.

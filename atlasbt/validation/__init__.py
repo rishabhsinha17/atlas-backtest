@@ -10,7 +10,7 @@ from .cv import PurgedKFold
 from .multiple_testing import benjamini_hochberg, hansen_spa, white_reality_check
 from .pbo import PBOResult, pbo_cscv
 from .regimes import all_regimes, decade, rate_regime, regime_table, trend_regime, vix_terciles
-from .sharpe_tests import (atlas_trials, dsr, dsr_from_returns, effective_trials, expected_max_sharpe,
+from .sharpe_tests import (atlas_trials, dsr, dsr_adjusted, dsr_from_returns, dsr_variance, effective_trials, expected_max_sharpe,
                            min_track_record_length, parse_grid_size, psr, psr_from_returns, total_atlas_trials)
 from .walkforward import (WalkForwardResult, expand_grid, param_key, walk_forward_matrix, walk_forward_run,
                           walk_forward_splits)

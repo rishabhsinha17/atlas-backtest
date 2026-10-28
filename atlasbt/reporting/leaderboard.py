@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .fidelity import grade, normalize_scorecard
-from .metrics import risk_free_returns
+from .metrics import cagr_from_equity, max_drawdown_info, nav_path, risk_free_returns
 
 
 def summarize_result(result, pbo: float | None = None, oos_sharpe: float | None = None,
@@ -40,26 +40,25 @@ def summarize_result(result, pbo: float | None = None, oos_sharpe: float | None 
         m = moments(ex)
         row.update({"n_obs": m["n"], "sr_period": m["sr"], "skew": m["skew"], "kurt": m["kurt"],
                     "sharpe": m["sr"] * np.sqrt(252)})
-        eq = result.equity.astype(float)
-        row["max_drawdown"] = float((eq / eq.cummax() - 1).min())
-        years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1e-9) if isinstance(eq.index, pd.DatetimeIndex) else len(eq) / 252
-        g = float(np.prod(1 + r.to_numpy()))
-        row["cagr"] = g ** (1 / years) - 1 if g > 0 else -1.0
+        nv = nav_path(result)  # same NAV0 convention as compute_metrics
+        row["max_drawdown"] = float(max_drawdown_info(nv["full_eq"])["max_drawdown"])
+        row["cagr"] = cagr_from_equity(nv["eq"], nv["nav0"])
     row.update({"pbo": pbo, "oos_sharpe": oos_sharpe, "break_even_bp": break_even_bp, "grid_trials": n_trials})
     return row
 
 
 def build_leaderboard(rows: list[dict], n_trials_total: int | None = None, var_sr: float | None = None,
-                      fdr_q: float = 0.10) -> tuple[pd.DataFrame, pd.DataFrame]:
+                      fdr_q: float = 0.10, trial_sharpes=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Returns (tested_leaderboard, not_testable_and_failed).
 
     n_trials_total: total configurations tried across the atlas (default:
     sum of ``grid_trials`` in rows, or the atlas-wide parsed count, whichever
-    is larger). var_sr: cross-trial variance of per-period Sharpe; default =
-    sample variance of the tested strategies' per-period Sharpes (floored at
-    1e-6)."""
+    is larger). V[SR_n] per strategy comes from
+    ``validation.sharpe_tests.dsr_variance`` (the same function the per-strategy
+    report uses): max(var of ``trial_sharpes`` (or explicit ``var_sr``),
+    the strategy's own Sharpe sampling variance)."""
     from atlasbt.validation.multiple_testing import benjamini_hochberg
-    from atlasbt.validation.sharpe_tests import dsr, psr, total_atlas_trials
+    from atlasbt.validation.sharpe_tests import dsr_adjusted, psr, total_atlas_trials
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -70,21 +69,23 @@ def build_leaderboard(rows: list[dict], n_trials_total: int | None = None, var_s
         return ok, other
     grid_sum = int(pd.to_numeric(ok.get("grid_trials"), errors="coerce").fillna(1).sum()) if "grid_trials" in ok else len(ok)
     N = n_trials_total or max(grid_sum, total_atlas_trials())
-    v = var_sr if var_sr is not None else max(float(np.var(ok["sr_period"], ddof=1)) if len(ok) > 1 else 0.0, 1e-6)
     ok["psr_0"] = [psr(r.sr_period, 0.0, int(r.n_obs), r.skew, r.kurt) for r in ok.itertuples()]
-    ok["dsr"] = [dsr(r.sr_period, int(r.n_obs), r.skew, r.kurt, N, v) for r in ok.itertuples()]
+    adj = [dsr_adjusted(r.sr_period, int(r.n_obs), r.skew, r.kurt, N, trial_sharpes, var_sr) for r in ok.itertuples()]
+    ok["dsr"] = [a["dsr"] for a in adj]
+    ok["var_sr_period"] = [a["var_sr_period"] for a in adj]
+    ok["var_sr_source"] = [a["var_sr_source"] for a in adj]
     ok["p_value"] = 1.0 - ok["psr_0"]
     rej, qv = benjamini_hochberg(ok["p_value"].fillna(1.0).to_numpy(), fdr_q)
     ok["q_value"] = qv
     ok["fdr_pass"] = rej
     ok["n_trials_total"] = N
-    ok["var_sr_period"] = v
     ok["_pbo_sort"] = pd.to_numeric(ok["pbo"], errors="coerce").fillna(2.0)
     ok = ok.sort_values(["dsr", "_pbo_sort", "q_value", "psr_0"], ascending=[False, True, True, False],
                         na_position="last", kind="mergesort").drop(columns="_pbo_sort")
     ok.insert(0, "rank", np.arange(1, len(ok) + 1))
     cols = ["rank", "strategy_id", "dsr", "psr_0", "q_value", "fdr_pass", "pbo", "oos_sharpe", "sharpe", "cagr",
-            "max_drawdown", "break_even_bp", "fidelity_grade", "n_obs", "n_trials_total"]
+            "max_drawdown", "break_even_bp", "fidelity_grade", "n_obs", "n_trials_total", "var_sr_period",
+            "var_sr_source"]
     return ok[[c for c in cols if c in ok.columns]].reset_index(drop=True), other.reset_index(drop=True)
 
 

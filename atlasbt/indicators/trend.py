@@ -46,14 +46,17 @@ def dmi(high, low, close, n: int = 14):
     mdm = np.full(m, np.nan)
     if m > 1:
         pc = c[:-1]
-        tr[1:] = np.maximum(h[1:], pc) - np.minimum(l[1:], pc)
+        # a bar's TR/DM is defined only when this bar's H, L, C and the prior bar's H, L, C exist
+        ok = np.isfinite(h[1:]) & np.isfinite(l[1:]) & np.isfinite(c[1:]) & np.isfinite(h[:-1]) \
+            & np.isfinite(l[:-1]) & np.isfinite(pc)
+        tr[1:] = np.where(ok, np.maximum(h[1:], pc) - np.minimum(l[1:], pc), np.nan)
         up = h[1:] - h[:-1]
         dn = l[:-1] - l[1:]
-        pdm[1:] = np.where((up > dn) & (up > 0), up, 0.0)
-        mdm[1:] = np.where((dn > up) & (dn > 0), dn, 0.0)
-    trn = _wilder_sum(tr, n, 1)
-    pdmn = _wilder_sum(pdm, n, 1)
-    mdmn = _wilder_sum(mdm, n, 1)
+        pdm[1:] = np.where(ok, np.where((up > dn) & (up > 0), up, 0.0), np.nan)
+        mdm[1:] = np.where(ok, np.where((dn > up) & (dn > 0), dn, 0.0), np.nan)
+    trn = _wilder_sum(tr, n, 0)
+    pdmn = _wilder_sum(pdm, n, 0)
+    mdmn = _wilder_sum(mdm, n, 0)
     with np.errstate(divide="ignore", invalid="ignore"):
         pdi = np.where(trn > 0, 100.0 * pdmn / trn, np.nan)
         mdi = np.where(trn > 0, 100.0 * mdmn / trn, np.nan)
@@ -177,14 +180,24 @@ def parabolic_sar(high, low, af0: float = 0.02, step: float | None = None, af_ma
       next_sar - the stop level for bar t+1, fully determined at t's close
                  (use this to place a gap-aware stop order for the next bar);
       af, ep   - acceleration factor and extreme point after bar t.
+    Bars with NaN high/low get NaN in every column and do not advance the state.
     """
     step = af0 if step is None else step
     h, l = as_float_array(high), as_float_array(low)
-    s, tr, nx, af, ep = _psar(h, l, float(af0), float(step), float(af_max))
-    prev = np.concatenate([[0.0], tr[:-1]])
-    flip = np.where((tr != 0) & (prev != 0) & (tr != prev), tr, 0.0)
-    return wrap_frame({"sar": s, "trend": tr, "flip": flip, "next_sar": nx, "af": af, "ep": ep},
-                      index_of(high, low))
+    m = h.shape[0]
+    # Bars with a missing high or low are skipped entirely (NaN output, state
+    # and prior-bar extremes unchanged): the recursion runs on the valid bars
+    # only, so the result equals the series with those bars deleted. It is
+    # initialised on the first two valid bars; earlier outputs are NaN.
+    valid = np.flatnonzero(np.isfinite(h) & np.isfinite(l))
+    cols = {k: np.full(m, np.nan) for k in ("sar", "trend", "flip", "next_sar", "af", "ep")}
+    if valid.size:
+        s, tr, nx, af, ep = _psar(h[valid], l[valid], float(af0), float(step), float(af_max))
+        prev = np.concatenate([[0.0], tr[:-1]])
+        flip = np.where((tr != 0) & (prev != 0) & (tr != prev), tr, 0.0)
+        for k, v in (("sar", s), ("trend", tr), ("flip", flip), ("next_sar", nx), ("af", af), ("ep", ep)):
+            cols[k][valid] = v
+    return wrap_frame(cols, index_of(high, low))
 
 
 # ---------------------------------------------------------------- Supertrend

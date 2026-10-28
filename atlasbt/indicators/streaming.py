@@ -79,25 +79,38 @@ class StreamingWilder(StreamingEMA):
 
 
 class StreamingRSI:
-    """Wilder RSI (same seeding as ``oscillators.rsi``)."""
+    """Wilder RSI (same seeding as ``oscillators.rsi``). A NaN close makes the
+    change at that bar and the next one NaN: output NaN, Wilder state carried
+    (and the seed window restarted if not yet seeded), exactly as the batch form."""
 
     def __init__(self, n: int = 14):
         self._g = StreamingWilder(n)
         self._l = StreamingWilder(n)
         self._prev = math.nan
+        self._started = False
         self.value = math.nan
 
     def update(self, close: float) -> float:
-        if not math.isnan(self._prev):
-            d = close - self._prev
-            ag = self._g.update(max(d, 0.0))
-            al = self._l.update(max(-d, 0.0))
-            if not math.isnan(ag):
-                if al == 0:
-                    self.value = 100.0 if ag > 0 else 50.0
-                else:
-                    self.value = 100.0 - 100.0 / (1.0 + ag / al)
+        if not self._started:
+            self._started = True
+            self._prev = close
+            self.value = math.nan
+            return self.value
+        d = close - self._prev
         self._prev = close
+        if math.isnan(d):
+            self._g.update(math.nan)
+            self._l.update(math.nan)
+            self.value = math.nan
+            return self.value
+        ag = self._g.update(max(d, 0.0))
+        al = self._l.update(max(-d, 0.0))
+        if math.isnan(ag):
+            self.value = math.nan
+        elif al == 0:
+            self.value = 100.0 if ag > 0 else 50.0
+        else:
+            self.value = 100.0 - 100.0 / (1.0 + ag / al)
         return self.value
 
 
@@ -120,24 +133,30 @@ class StreamingATR:
 
 
 class RollingExtreme:
-    """O(1) amortised rolling max/min over the last n values (monotonic deque)."""
+    """O(1) amortised rolling max/min over the last n values (monotonic deque).
+    NaN while a NaN is inside the window (same as pandas rolling with min_periods=n)."""
 
     def __init__(self, n: int, kind: str = "max"):
         self.n = int(n)
         self.kind = kind
         self._dq: deque[tuple[int, float]] = deque()
         self._i = -1
+        self._last_nan = -(10 ** 18)
         self.value = math.nan
 
     def update(self, x: float) -> float:
         self._i += 1
-        better = (lambda a, b: a >= b) if self.kind == "max" else (lambda a, b: a <= b)
-        while self._dq and better(x, self._dq[-1][1]):
-            self._dq.pop()
-        self._dq.append((self._i, x))
-        while self._dq[0][0] <= self._i - self.n:
+        if x is None or math.isnan(x):
+            self._last_nan = self._i
+        else:
+            better = (lambda a, b: a >= b) if self.kind == "max" else (lambda a, b: a <= b)
+            while self._dq and better(x, self._dq[-1][1]):
+                self._dq.pop()
+            self._dq.append((self._i, x))
+        while self._dq and self._dq[0][0] <= self._i - self.n:
             self._dq.popleft()
-        self.value = self._dq[0][1] if self._i >= self.n - 1 else math.nan
+        ok = self._i >= self.n - 1 and self._last_nan <= self._i - self.n and self._dq
+        self.value = self._dq[0][1] if ok else math.nan
         return self.value
 
 
@@ -182,13 +201,16 @@ class StreamingSessionVWAP:
 
 
 class StreamingOpeningRange:
-    """Opening range over the first ``minutes`` of the session.
+    """Opening range over [open, open+minutes), identical to ``intraday.opening_range``.
 
-    update(key, minutes_since_open_at_bar_end, high, low) -> (or_high, or_low)
-    returns NaNs until the range is complete (bar end >= minutes)."""
+    update(key, end_minute, high, low) where end_minute = minutes from the
+    session open to the bar's END. A bar is included only if its start >= 0 and
+    its end <= minutes (premarket bars and the 09:29 bar are excluded). Returns
+    NaNs until the range is complete (bar end >= minutes)."""
 
-    def __init__(self, minutes: int = 5):
+    def __init__(self, minutes: int = 5, bar_minutes: float = 1.0):
         self.minutes = minutes
+        self.bar_minutes = float(bar_minutes)
         self._key = None
         self._h = -math.inf
         self._l = math.inf
@@ -197,7 +219,8 @@ class StreamingOpeningRange:
         if key != self._key:
             self._key = key
             self._h, self._l = -math.inf, math.inf
-        if end_minute <= self.minutes:
+        start_minute = end_minute - self.bar_minutes
+        if start_minute >= 0 and end_minute <= self.minutes:
             self._h = max(self._h, high)
             self._l = min(self._l, low)
         if end_minute >= self.minutes and self._h > -math.inf:
