@@ -63,6 +63,13 @@ class DataPortal(Protocol):
 
     def option_quote(self, instrument: Instrument, as_of: pd.Timestamp) -> Optional[OptionQuote]: ...
 
+    def option_quotes(self, instrument: Instrument, start: pd.Timestamp, end: pd.Timestamp,
+                      as_of: pd.Timestamp) -> pd.DataFrame:
+        """All snapshots with ts in (start, end] and ts <= as_of, ascending; columns as
+        option_chain (bid, ask, iv, delta, underlying_price, fidelity...), index ts.
+        Used by fill models to take the FIRST snapshot after eligible_at."""
+        ...
+
     # ---- rates, borrow, fundamentals
     def risk_free_rate(self, as_of: pd.Timestamp, tenor: str = "3M") -> float:
         """Annualized simple rate (decimal) known at as_of."""

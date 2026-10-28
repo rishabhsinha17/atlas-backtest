@@ -35,7 +35,7 @@ owner that does not exist yet, write against the documented interface below and 
 
 * **bars**: index `start` (UTC, tz-aware, named `start`), columns `open, high, low, close, volume` (float64), optional `vwap, trades`, `session` ('PRE','RTH','POST' for intraday; 'DAY' for daily), `known_at` (UTC). Daily bars: `start` = session open UTC, `known_at` = session close UTC. Monthly frequency is NOT stored; strategies resample daily bars causally.
 * **quotes**: index `ts` (UTC), columns `bid, ask, bid_size, ask_size`.
-* **option_chain**: columns `ts, underlying, symbol, expiry (naive date), strike, right ('C'/'P'), bid, ask, mid, iv, delta, gamma, vega, theta, underlying_price, volume, open_interest, exercise, settlement, multiplier, fidelity`.
+* **option_chain**: columns `ts, underlying, symbol, expiry (naive date), strike, right ('C'/'P'), bid, ask, mid, iv, delta, gamma, vega, theta, underlying_price, volume, open_interest, exercise, settlement, multiplier, fidelity`; optional `root` (e.g. SPX vs SPXW), `settlement_date`, `kind`. Expiry = LAST TRADING DAY (vendor SPX AM monthlies listed on Friday must be converted to the Thursday).
 * **corporate actions / events**: `core.types.CorporateAction`, `core.types.MarketEvent`.
   Event payloads: `EARNINGS{timing:'BMO'|'AMC'|'DURING'|'UNKNOWN', eps_actual, eps_estimate, estimate_known_at, fiscal_period}`,
   `INDEX_ADD/INDEX_DEL{index, effective_date}`, `FOMC{type:'STATEMENT'}`, `BUYBACK{amount_usd, pct_mcap, with_earnings:bool}`, `HALT{reason, resume_at}`.
