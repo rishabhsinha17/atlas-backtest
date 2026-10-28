@@ -27,8 +27,8 @@ owner that does not exist yet, write against the documented interface below and 
 
 ## 2. Time & calendar (`atlasbt.core.clock`)
 
-* Internal timestamps: tz-aware UTC `pd.Timestamp`. Session dates: naive `pd.Timestamp` at midnight representing the ET date.
-* `clock.NYSE` implements `TradingCalendar` (exchange_calendars XNYS: holidays, early closes 13:00 ET, historical closures like 2001-09-11, 2012-10-29/30, national days of mourning).
+* Internal timestamps: tz-aware UTC `pd.Timestamp`. Session dates (incl. `CorporateAction.ex_date`/`pay_date`): naive `pd.Timestamp` at midnight representing the ET date.
+* `clock.nyse()` returns the singleton that implements `TradingCalendar` (exchange_calendars XNYS: holidays, early closes 13:00 ET, historical closures like 2001-09-11, 2012-10-29/30, national days of mourning).
 * Helpers: `to_et(ts)`, `et(date, "HH:MM") -> UTC ts`, `session_open_close(date)`.
 
 ## 3. Canonical frames (what the DataPortal returns)

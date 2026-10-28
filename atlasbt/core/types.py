@@ -191,6 +191,8 @@ class OptionQuote:
     theta: float = float("nan")
     volume: float = float("nan")
     open_interest: float = float("nan")
+    bid_size: float = float("nan")
+    ask_size: float = float("nan")
     fidelity: Fidelity = Fidelity.T0_QUOTE
 
     @property
@@ -211,7 +213,7 @@ class ActionType(str, enum.Enum):
 class CorporateAction:
     symbol: str
     type: ActionType
-    ex_date: pd.Timestamp              # session date (UTC midnight of ET date) action takes effect
+    ex_date: pd.Timestamp              # session date: NAIVE midnight of the ET date the action takes effect
     known_at: pd.Timestamp             # declaration/announcement time (PIT)
     ratio: float = 1.0
     amount: float = 0.0
@@ -286,6 +288,8 @@ class Order:
     tag: str = ""                      # free text: 'entry', 'stop', 'target', 'time_exit'...
     oco_group: Optional[str] = None    # orders sharing a group cancel each other on fill
     is_short_sale: bool = False        # set by engine: sell that opens/increases a short
+    outside_rth: bool = False          # may fill in PRE/POST sessions (needs extended-hours data)
+    meta: dict = field(default_factory=dict)   # e.g. initial_stop, activate_at, sizing info
     # engine-managed
     id: int = -1
     strategy_id: str = ""
