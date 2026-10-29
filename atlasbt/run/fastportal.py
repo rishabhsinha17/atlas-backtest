@@ -164,3 +164,47 @@ def _universe_memo(self, name: str, as_of, require_bars: bool = False):
 
 
 FastPortal.universe = _universe_memo
+
+
+# ---------------------------------------------------------------------------------------------------
+# borrow(): membership test without building security keys (performance only, identical results).
+# Portal.borrow decides "S&P 500 member" with
+#     uk = set(self.universe("SP500", as_of))
+#     member = orig.upper() in uk or symbol.upper() in {k.split("~")[0] for k in uk}
+# where symbol = ticker part of orig. Every element of uk is either a member's BASE ticker or
+# "<base ticker>~CIK.." (Portal._member_key returns the ticker itself or a key prefixed by it), so the
+# condition equals: ticker(orig) in {base tickers of the PIT members on the session of as_of}. During
+# borrow() FastPortal therefore answers universe("SP500") with those base tickers (membership table +
+# the same interval test as Portal._universe, memoized per session) instead of ~500 _member_key
+# resolutions (~4 s per call at f9702e1/4ea9ad1). Any other universe() call is unaffected.
+def _sp500_base_tickers(self, as_of) -> list:
+    memo = self.__dict__.setdefault("_base_memo", {})
+    d = _session_date(_utc(as_of))
+    hit = memo.get(d)
+    if hit is None:
+        m = self._read("reference", "sp500", "membership")
+        cur = m[(m["start"] <= d) & (m["end"].isna() | (m["end"] > d))]
+        hit = sorted({str(b).upper().replace(".", "-") for b in cur["base"]})
+        memo[d] = hit
+    return list(hit)
+
+
+def _borrow_fast(self, symbol: str, as_of):
+    self.__dict__["_in_borrow"] = True
+    try:
+        return Portal.borrow(self, symbol, as_of)
+    finally:
+        self.__dict__["_in_borrow"] = False
+
+
+_universe_session = FastPortal.universe
+
+
+def _universe_dispatch(self, name: str, as_of, require_bars: bool = False):
+    if self.__dict__.get("_in_borrow") and not require_bars and str(name).upper() in _SESSION_KEYED:
+        return _sp500_base_tickers(self, as_of)
+    return _universe_session(self, name, as_of, require_bars)
+
+
+FastPortal.borrow = _borrow_fast
+FastPortal.universe = _universe_dispatch

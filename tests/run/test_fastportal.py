@@ -38,3 +38,18 @@ def test_fastportal_universe_memo_identical_to_portal(portal):
         assert portal.universe("SECTOR_SPDR", a) == p.universe("SECTOR_SPDR", a)
     a = pd.Timestamp("2020-01-02 21:00", tz="UTC")
     assert portal.borrow("SPY", a) == p.borrow("SPY", a)
+
+
+@needs_cache
+@pytest.mark.slow
+def test_fastportal_borrow_identical_to_portal(portal):
+    """borrow() fast path (base-ticker membership) == Portal.borrow on symbols, ETFs, keys, delisted names."""
+    p = Portal()
+    dates = [pd.Timestamp(d, tz="UTC") for d in ("2009-06-01 20:00", "2015-03-02 21:00", "2019-01-02 15:00",
+                                                  "2020-03-16 20:00", "2024-06-03 20:00")]
+    for a in dates:
+        members = p.universe("SP500", a)
+        keys = [m for m in members if "~CIK" in m][:5]
+        syms = ["SPY", "QQQ", "AAPL", "XOM", "GE", "TSLA", "LEH", "ENRN", "BBT", "XLK", "ZZZZ"] + members[:15] + keys
+        for s in syms:
+            assert portal.borrow(s, a) == p.borrow(s, a), (s, a)
