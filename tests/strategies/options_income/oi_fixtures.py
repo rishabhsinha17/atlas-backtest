@@ -240,7 +240,9 @@ def make_portal(closes, ss, *, und: str = UND, chain_from: int = 0, vol=0.20, st
     bars = {(und, "1d"): bars_frame(closes, ss)}
     insts = {und: Instrument(und, AssetClass.ETF)}
     for sym, cl in (extra_bars or {}).items():
-        bars[(sym, "1d")] = bars_frame(list(cl)[:n], ss, rng=0.0)
+        vb = bars_frame(list(cl)[:n], ss, rng=0.0)
+        vb["known_at"] = vb["known_at"] + pd.Timedelta(minutes=15)    # Cboe vol indices close at 16:15 ET
+        bars[(sym, "1d")] = vb
         insts[sym] = Instrument(sym, AssetClass.INDEX)
     return FastOptionPortal(bars=bars, instruments=insts, chain=chain, events=events or [], actions=actions or [])
 

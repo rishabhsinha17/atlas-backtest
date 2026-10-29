@@ -49,6 +49,7 @@ class _StockBase(OptionBase):
     bar_freq = "1mo"
     asset = "STK+OPT"
     DTE_OFFSETS = (-5, 5)
+    HOLDS_STOCK = True
 
     def pending_stock(self, ctx, und: str) -> float:
         return sum(o.remaining for o in ctx.open_orders(und) if o.instrument is not None and not o.instrument.is_option)
@@ -143,6 +144,8 @@ class S129(_StockBase):
               "close_dte": 1, "roll_window": 4}
     grid = {"strike_rule": ["atm", "delta"]}
     spec = SPECS["S129"]
+    activity_note = ("SPX options exist only as the synthetic T3 chain; the data portal's option_quotes serves real "
+                     "snapshots only, so SPX combos cannot fill until synthetic quotes are fillable (engine/data item)")
     deviations = COMMON_DEVIATIONS + [
         "SPX options exist only as the SYNTHETIC T3 chain (no free SPX quotes; replication of the Cboe PUT index: TE "
         "2.6%/yr, ~1.5%/yr rich, docs/OPTIONS.md §7.4). Every fill/mark/settlement is T3/T2.",
@@ -154,7 +157,8 @@ class S129(_StockBase):
         "-0.35). 'roll monthly' is fixed (not a free parameter).",
         "T-bill collateral: the full strike x 100 per contract is kept as cash (CollateralBook), which earns the "
         "engine's cash rate (3M T-bill minus the broker spread), not the full 1m/3m T-bill yield: understates PUT-"
-        "index collateral income by <= 0.5%/yr. Index putwrite collateral cap 100% NAV (not the 10% single-name cap).",
+        "index collateral income by <= 0.5%/yr. Putwrite collateral cap 100% NAV (fully collateralized like the PUT "
+        "index; explicit name_cap=1.0 also for the declared underlying='SPY' variant), not the 10% single-name cap.",
         "Settlement per the actual contract: AM-settled monthlies settle at the SOQ (proxied by the SPX opening "
         "print, engine lifecycle, T2). 'close near expiration before settlement as separate test' = param "
         "close_before_settlement=True (closing combo at DTE <= close_dte); not in the sheet grid.",
@@ -187,7 +191,8 @@ class S129(_StockBase):
         else:
             pkg = st.cash_secured_put(xe, -abs(self.params["put_delta"]), usable=us)
         leg = pkg.legs[0]
-        n = self.size_cashsec(ctx, leg.strike, und, cv.spot, leg.multiplier)
+        n = self.size_cashsec(ctx, leg.strike, und, cv.spot, leg.multiplier,
+                              deliverable=leg.instrument().deliverable_shares, name_cap=1.0)
         if self.open_package(ctx, und, pkg, n, cv, collateral=n * leg.strike * leg.multiplier,
                              meta={"cycle": cycle}) is not None:
             done.add(cycle)
@@ -261,12 +266,13 @@ class S130(_StockBase):
             return
         exp = self.pick_expiry(cv, float(self.params["dte"]), *self.window())
         if self.earnings_block(ctx, und, exp):
-            ctx.log(f"S130 {und}: earnings before {exp.date()} -> no trade")
+            self.activity(ctx, f"{und}: earnings before expiry -> no trade", "no_signal")
             return
         xe, us = self.slice(cv, exp)
         pkg = st.cash_secured_put(xe, -abs(self.params["delta"]), usable=us)
         leg = pkg.legs[0]
-        n = self.size_cashsec(ctx, leg.strike, und, cv.spot, leg.multiplier)
+        n = self.size_cashsec(ctx, leg.strike, und, cv.spot, leg.multiplier,
+                                  deliverable=leg.instrument().deliverable_shares)
         self.open_package(ctx, und, pkg, n, cv, collateral=n * leg.strike * leg.multiplier)
 
 
@@ -319,7 +325,8 @@ class S131(_StockBase):
         else:
             pkg = st.cash_secured_put(xe, -abs(self.params["delta"]), usable=us)
             leg = pkg.legs[0]
-            n = self.size_cashsec(ctx, leg.strike, und, cv.spot, leg.multiplier)
+            n = self.size_cashsec(ctx, leg.strike, und, cv.spot, leg.multiplier,
+                                  deliverable=leg.instrument().deliverable_shares)
             self.store.setdefault("state", {})[und] = "CASH"
             self.open_package(ctx, und, pkg, n, cv, collateral=n * leg.strike * leg.multiplier,
                               meta={"state": "CASH"})
@@ -455,7 +462,8 @@ class S157(_StockBase):
         base = st.covered_strangle(xe, d, -d, usable=us)
         calls = int(math.floor(ctx.position(und) / 100 + 1e-9))
         put_leg = base.legs[1]
-        puts = self.size_cashsec(ctx, put_leg.strike, und, cv.spot, put_leg.multiplier)
+        puts = self.size_cashsec(ctx, put_leg.strike, und, cv.spot, put_leg.multiplier,
+                                 deliverable=put_leg.instrument().deliverable_shares)
         pkg = _replace_ratio(base, [-calls, -puts])
         if not pkg.legs:
             return

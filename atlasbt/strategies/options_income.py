@@ -97,7 +97,7 @@ class SinglePackage(OptionBase):
             return
         cv = self.chain(ctx, und)
         if cv is None:
-            ctx.log(f"{self.id} {und}: signal but no option chain")
+            self.activity(ctx, f"{und}: signal but no option chain", "data_missing")
             return
         pkg = self.select(ctx, und, cv)
         if pkg is None or not self.accept(ctx, und, pkg, cv):
@@ -340,8 +340,9 @@ class S136(_CreditVertical):
     spec = _spec("S136")
     deviations = COMMON_DEVIATIONS + [
         CREDIT_DEV, CREDIT_EXITS_DEV,
-        "'VIX 20d percentile > 60' = mid-rank percentile of today's VIX close within the 20 sessions ending today "
-        "(indicators.percentile_rank, include_current=True) > 0.60; VIX from portal daily bars (Cboe).",
+        "'VIX 20d percentile > 60' = mid-rank percentile of the latest KNOWN VIX close within the 20 VIX closes ending "
+        "there (indicators.percentile_rank, include_current=True) > 0.60. The VIX close is published at 16:15 ET, after "
+        "the 16:00 decision, so the signal uses the PREVIOUS session's VIX (portal daily bars, PIT).",
         "Wing grid '5/10 points or .1 delta' -> wing in {pts5, pts10, delta10}; point wings use the ACTUAL listed "
         "strike at or beyond short-5/10 (wing_by_points 'outward': defined risk never understated).",
         "DTE window 30-45 (target 30).",
@@ -401,6 +402,8 @@ class S138(SinglePackage):
     STANDARD_ONLY = True
     ROOT = "SPX"
     DTE_OFFSETS = (-7, 14)
+    activity_note = ("SPX options exist only as the synthetic T3 chain; the data portal's option_quotes serves real "
+                     "snapshots only, so SPX combos cannot fill until synthetic quotes are fillable (engine/data item)")
     deviations = COMMON_DEVIATIONS + [
         CREDIT_DEV,
         "SPX options exist only as the SYNTHETIC T3 chain (no free SPX quotes, docs/OPTIONS.md §13); every fill/mark "
@@ -513,6 +516,12 @@ class _LongFly(SinglePackage):
     def build(self, ctx, und, cv, xe, us):
         return st.butterfly(xe[us], self.RIGHT, float(self.params["width"]), ref_price=cv.spot)
 
+    def accept(self, ctx, und, pkg, cv):
+        if pkg.natural_open() >= 0.5 * float(self.params["width"]):
+            self.activity(ctx, f"{und}: fly debit >= 50% of width (exit level already met) -> no entry")
+            return False
+        return True
+
     def value_exit(self, ctx, pos, v):
         if v >= 0.5 * float(self.params["width"]):
             return "value_ge_50pct_max_payoff"
@@ -521,7 +530,8 @@ class _LongFly(SinglePackage):
 
 _FLY_DEV = ("K2 = nearest listed ATM strike with usable quotes, wings at exactly +/-width (listed, usable) else no "
             "trade; 'market value >= 50% of max terminal payoff' = package mid value >= 0.5 x width. DTE 25-45 around "
-            "30 (grid 45 -> 40-60). Entry whenever flat (monthly cycle).")
+            "30 (grid 45 -> 40-60). Entry whenever flat (monthly cycle). Entry skipped when the natural debit is already >= 50% "
+            "of the width (the take-profit level would be met at the fill -> open/close churn).")
 
 
 @register
@@ -696,6 +706,7 @@ class _HedgedStraddle(SinglePackage):
 
     asset = "OPT+STK"
     HEDGE_BAND_PARAM = "band"
+    HOLDS_STOCK = True
 
     def needs_trend(self):
         return False
@@ -752,6 +763,8 @@ class S146(_HedgedStraddle):
     spec = _spec("S146")
     RISK = "naked"
     HEDGE_BAND_PARAM = "band"
+    activity_note = ("OPT_NAKED stress (+-20% move, extrinsic x2) of one SPY short straddle exceeds 1% of a $1M NAV, so "
+                     "the sheet's sizing gives 0 contracts at that capital (faithful, not a bug)")
     deviations = COMMON_DEVIATIONS + [
         NAKED_DEV,
         "'quoted ATM IV' = mean IV of the two straddle legs from the REAL snapshot quotes (quoted IV, else IV from the "
@@ -798,15 +811,19 @@ class S147(_HedgedStraddle):
         DEBIT_DEV,
         "'realized vol forecast exceeds implied by 3 vol pts' = HAR-RV 20-session forecast - mean IV of the two "
         "straddle legs (real snapshot; vol-index fallback flagged) >= 3 vol points.",
-        "Entry hedge in the opening COMBO (stock leg, see S146). 'Rehedge at delta drift >0.1 or daily close': no "
-        "intraday option quotes exist, so the drift test is evaluated at each daily close only (|net delta| > threshold "
-        "x 100 shares per straddle) and the rehedge fills at the next open.",
+        "Entry hedge in the opening COMBO (stock leg, see S146). 'Rehedge ... or daily close': at EVERY daily close "
+        "the shares are traded back to net delta 0 (whole shares; fills at the next open). The intraday 'delta drift "
+        "> threshold' trigger needs intraday option quotes (none in the free data): the threshold grid (.05/.10/.20) "
+        "is NOT TESTABLE on daily data -- its grid points are identical runs (declared; not approximated).",
         "Exit at DTE <= 7 or 10 sessions after the fill session; options in one combo, hedge flattened by a market "
         "order at the same close.",
     ]
 
     def extra_requires(self):
         return [Requirement("bars", "1d", symbols=("VIX",), critical=False, note="IV fallback (synthetic dates)")]
+
+    def band_shares(self, pos):
+        return 0.0          # 'or daily close': the daily-close rehedge always restores delta-neutrality
 
     def build(self, ctx, und, cv, xe, us):
         return st.straddle(xe, 1, ref_price=cv.spot, usable=us)
@@ -925,6 +942,8 @@ class S150(SinglePackage):
     grid = {"long_delta": [0.75, 0.85], "far_dte": [180, 365], "short_delta": [0.20, 0.30]}
     spec = _spec("S150")
     NEAR_OFFSETS = (-5, 15)
+    activity_note = ("needs a 180-365 DTE call: real DoltHub snapshots list <= ~65 DTE (2020+), so the strategy can "
+                     "only trade on synthetic (T3) chains, i.e. pre-2020; zero trades on real-chain dates are expected")
     deviations = COMMON_DEVIATIONS + [
         DEBIT_DEV,
         "LEAP window [far_dte, far_dte+185] (baseline 180-365; grid 365 -> 365-550); short call 25-45 DTE. Real "
@@ -982,7 +1001,7 @@ class S150(SinglePackage):
                 row = select_by_delta(xn, abs(self.params["short_delta"]), "C", un)
                 new = st.OptLeg.from_row(row, -1).instrument()
             except SelectionError as e:
-                ctx.log(f"S150 {und}: no new short ({e})")
+                self.activity(ctx, f"{und}: no new short ({e})", "selection_failure")
         if old is None and new is None:
             return
         legs = []
@@ -1153,7 +1172,8 @@ class S156(SinglePackage):
         NAKED_DEV,
         "'require total credit >= call vertical width if targeting zero upside loss': baseline targets zero upside "
         "loss (require_no_upside=True) using the NATURAL credit of the decision snapshot (structures.jade_lizard "
-        "meta); otherwise no trade.",
+        "meta); otherwise no trade. The opening combo carries a net-credit LIMIT = call-vertical width, so it can only "
+        "fill at a snapshot where the natural credit still covers the width (GTC, cancelled after 5 sessions).",
         "'Close for 50% credit' = debit to close <= 50% of the credit received; DTE window 25-35 ('30DTE'). Entry "
         "whenever flat (monthly cycle). Put assignment handled by the engine lifecycle (reconciled: remaining legs "
         "closed).",
@@ -1167,7 +1187,17 @@ class S156(SinglePackage):
                               abs(self.params["wing_delta"]), usable=us)
 
     def accept(self, ctx, und, pkg, cv):
-        return (not self.params["require_no_upside"]) or bool(pkg.meta.get("no_upside_risk"))
+        ok = (not self.params["require_no_upside"]) or bool(pkg.meta.get("no_upside_risk"))
+        if not ok:
+            self.activity(ctx, f"{und}: jade lizard credit < call width -> no entry")
+        return ok
+
+    def submit_entry(self, ctx, und, pkg, n, cv, coll):
+        lim = None
+        if self.params["require_no_upside"]:
+            calls = sorted(l.strike for l in pkg.legs if l.right == "C")
+            lim = -(calls[-1] - calls[0])          # net price per unit <= -width  <=>  credit >= call width
+        return self.open_package(ctx, und, pkg, n, cv, limit=lim, meta=self.entry_meta(pkg))
 
     def value_exit(self, ctx, pos, v):
         if self.close_cost(v) <= (1 - self.params["tp"]) * pos.credit:

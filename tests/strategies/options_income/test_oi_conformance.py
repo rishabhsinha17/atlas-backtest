@@ -129,3 +129,46 @@ def test_metrics_rows_brackets_30d():
     above = min(d for d in all_dte if d >= 30)
     assert dte == sorted({below, above})
     assert rows["strike"].between(80, 120).all()
+
+
+# ------------------------------------------------------------------ delivered shares (option-only strategies)
+def test_delivered_shares_closed_next_open_and_booked_to_package():
+    """S141 call fly whose closing combo cannot fill (snapshots stop 8 days before expiry): at expiry the long
+    K1 call is exercised (+100/fly) and the short K2 calls are assigned (-200/fly) -> -100 shares/fly delivered.
+    The strategy (holds no stock by design) buys them back at the NEXT session open and books the stock P&L to
+    the package."""
+    n = 40
+    ss = fx.sessions(n)
+    closes = np.r_[np.full(10, 100.0), np.full(n - 10, 103.0)]
+    exp = [pd.Timestamp("2021-02-05")]
+    stop = next(i for i, d in enumerate(ss) if (exp[0] - d).days <= 8)
+    p = fx.make_portal(closes, ss, chain_from=0, chain_to=stop, expiries=exp, band=0.2)
+    s = registry.get("S141")(width=5.0)
+    r = fx.run(s, p, ss)
+    f = r.fills
+    deliv = f[(f["symbol"] == fx.UND) & (f["liquidity"].isin(["ASSIGNMENT", "EXERCISE"]))]
+    assert len(deliv) >= 2
+    exp_i = ss.index(exp[0])
+    close = f[(f["symbol"] == fx.UND) & (f["tag"] == "close_delivered")]
+    assert len(close) == 1
+    assert pd.Timestamp(close["ts"].iloc[0]) == fx.open_ts(ss[exp_i + 1])
+    assert float(close["quantity"].iloc[0]) == pytest.approx(-float(deliv["quantity"].sum()))
+    last = r.positions[r.positions["ts"] == r.equity.index[-1]]          # snapshots list nonzero positions only
+    assert float(last[last["symbol"] == fx.UND]["quantity"].sum()) == 0.0
+    pos = s.positions[fx.UND][0]
+    assert pos.meta["delivered"] == pytest.approx(float(deliv["quantity"].sum()))
+    assert np.isfinite(pos.meta["delivery_pnl"])
+
+
+def test_activity_diagnostics_surface_skips():
+    """Selection failures / skips are surfaced as 'activity <SID>: ...' fidelity notes (runner diagnose)."""
+    ss = fx.sessions(20)
+    p = fx.make_portal(np.full(20, 100.0), ss, chain_from=0, max_dte=20)       # no expiry in 25-45
+    r = fx.run(registry.get("S139")(), p, ss)
+    reasons = [x["reason"] for x in r.fidelity["reasons"]]
+    assert any(x.startswith("activity S139:") and "selection" in x for x in reasons)
+    assert any(l.get("activity") == "selection_failure" for l in r.diagnostics["logs"])
+
+
+def test_s150_declares_activity_note():
+    assert registry.get("S150").activity_note

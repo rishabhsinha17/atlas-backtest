@@ -29,6 +29,8 @@ Mechanics shared by every strategy of the family
 from __future__ import annotations
 
 import math
+import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -210,6 +212,9 @@ class OptionBase(Strategy):
     #: underlying param name holding the traded underlyings
     HIST_N = 400
     OPEN_TIMEOUT_SESSIONS = 5
+    #: True for strategies that hold the underlying by design (covered / cash-secured / hedged). Others flatten
+    #: any shares delivered by exercise/assignment at the next session open.
+    HOLDS_STOCK = False
 
     def __init__(self, **params: Any):
         super().__init__(**params)
@@ -241,7 +246,7 @@ class OptionBase(Strategy):
 
     # ------------------------------------------------------------ state
     def reset_state(self) -> None:
-        self.positions: dict[str, list[OptPos]] = {}
+        self.positions: dict[str, list[OptPos]] = defaultdict(list)
         self.oid_map: dict[int, tuple[OptPos, str]] = {}
         self.collateral = sz.CollateralBook()
         self.seq = 0
@@ -266,7 +271,54 @@ class OptionBase(Strategy):
             try:
                 self.step(ctx, und)
             except SelectionError as e:
-                ctx.log(f"{self.id} {und}: no trade ({e})")
+                self.activity(ctx, f"{und}: no trade (selection: {e})", "selection_failure")
+
+    ACTIVITY_CATEGORIES = ("selection_failure", "combo_cancelled", "order_rejected", "no_signal", "data_missing",
+                           "skip")
+
+    def activity(self, ctx, msg: str, category: str = "skip") -> None:
+        """Surface why a strategy did not trade: ctx.log(msg, activity=<category>) (runner activity interface)
+        plus an aggregated T1 fidelity note 'activity <SID>: ...' (numbers stripped so counts aggregate)."""
+        if category not in self.ACTIVITY_CATEGORIES:
+            category = "skip"
+        ctx.log(f"{self.id} {msg}", activity=category)
+        generic = re.sub(r"\d+(\.\d+)?", "#", msg)
+        generic = re.sub(r"\b[A-Z]{1,6}\s+#[CP]#", "<contract>", generic)
+        ctx.flag_fidelity(Fidelity.T1_BAR, f"activity {self.id}: {generic[:160]}")
+
+    # ------------------------------------------------------------ delivered shares (option-only strategies)
+    def on_session_start(self, ctx) -> None:
+        if self.HOLDS_STOCK:
+            return
+        for und in self.universe:
+            self.reconcile(ctx, und)
+            for pos in self.live(und):
+                if pos.status == "OPEN" and pos.meta.get("partial"):
+                    self.close_package(ctx, pos, "leg_settled")
+            self.close_delivered(ctx, und)
+
+    def pending_stock(self, ctx, und: str) -> float:
+        return sum(o.remaining for o in ctx.open_orders(und) if o.instrument is not None and not o.instrument.is_option)
+
+    def close_delivered(self, ctx, und: str) -> None:
+        """Option-only strategies never hold the underlying: shares delivered by an (early) assignment or an
+        exercise are sold/bought back with a market order at the session open; the stock P&L is booked to the
+        package that delivered them (meta['delivered'], ['delivery_cost'], ['delivery_proceeds'])."""
+        q = ctx.position(und)
+        pend = self.pending_stock(ctx, und)
+        if abs(q + pend) < 1e-9:
+            return
+        o = ctx.order(und, -(q + pend), tag="close_delivered")
+        if o.status == OrderStatus.REJECTED:
+            self.activity(ctx, f"{und}: close of delivered shares rejected ({o.reject_reason})", "order_rejected")
+            return
+        pos = self.delivery_owner(und)
+        if pos is not None:
+            self.oid_map[o.id] = (pos, "deliv")
+
+    def delivery_owner(self, und: str) -> Optional["OptPos"]:
+        lst = [p for p in self.positions.get(und, []) if p.meta.get("delivered")] or self.positions.get(und, [])
+        return lst[-1] if lst else None
 
     def step(self, ctx, und: str) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -275,6 +327,16 @@ class OptionBase(Strategy):
         liq = fill.liquidity
         if liq in ("ASSIGNMENT", "EXERCISE", "SETTLEMENT"):
             self.events_seen.append((fill.ts, liq, fill.instrument.symbol, fill.quantity))
+            if not fill.instrument.is_option:
+                und = fill.instrument.symbol
+                owner = None
+                for p in reversed(self.positions.get(und, [])):
+                    if p.status != "OPENING":
+                        owner = p
+                        break
+                if owner is not None:
+                    owner.meta["delivered"] = owner.meta.get("delivered", 0.0) + fill.quantity
+                    owner.meta["delivery_cost"] = owner.meta.get("delivery_cost", 0.0) + fill.quantity * fill.price
             self.on_lifecycle_fill(ctx, fill)
             return
         hit = self.oid_map.get(fill.order_id)
@@ -291,6 +353,9 @@ class OptionBase(Strategy):
                 pos.entry_net = pos.cost / pos.units
                 pos.entry_session = ctx.session_date()
                 self.on_opened(ctx, pos)
+        elif side == "deliv":
+            pos.meta["delivery_proceeds"] = pos.meta.get("delivery_proceeds", 0.0) - fill.quantity * fill.price
+            pos.meta["delivery_pnl"] = pos.meta["delivery_proceeds"] - pos.meta.get("delivery_cost", 0.0)
         else:
             pos.meta["close_filled"] = pos.meta.get("close_filled", 0.0) + abs(fill.quantity)
 
@@ -320,6 +385,9 @@ class OptionBase(Strategy):
                     if n >= self.OPEN_TIMEOUT_SESSIONS:
                         ctx.cancel(pos.open_oid)
                         if all(abs(q) < 1e-9 for q in held.values()):
+                            self.activity(ctx, f"{und}: opening combo cancelled unfilled after "
+                                               f"{self.OPEN_TIMEOUT_SESSIONS} sessions (contract not quoted / limit)",
+                                          "combo_cancelled")
                             self.finish(ctx, pos, "open_timeout")
                 continue
             gone = [abs(q) < 1e-9 for q in held.values()]
@@ -375,7 +443,7 @@ class OptionBase(Strategy):
         try:
             ch = ctx.portal().option_chain(und, min_dte=0, max_dte=800)
         except Exception as e:  # data layer failure -> no trade, logged
-            ctx.log(f"{self.id} {und}: option_chain failed: {e!r}")
+            self.activity(ctx, f"{und}: option_chain failed: {e!r}", "data_missing")
             ch = None
         if ch is not None and len(ch):
             raw = ch.copy()
@@ -510,15 +578,20 @@ class OptionBase(Strategy):
                      collateral: float = 0.0) -> Optional[OptPos]:
         units = int(units)
         if units <= 0:
-            ctx.log(f"{self.id} {und}: size 0 for {pkg.describe()}")
+            self.activity(ctx, f"{und}: size 0 for {pkg.name} ({self.sizing})")
             return None
+        for leg in pkg.legs:
+            ok, why = sz.verify_contract(leg.instrument())
+            if not ok:
+                self.activity(ctx, f"{und}: contract check failed ({why}) -> no trade")
+                return None
         self.note_chain_use(ctx, cv, f"{self.id} entry")
         legs = list(pkg.core_legs()) + list(extra_legs)
         order = Order(None, float(units), OrderType.COMBO, limit_price=limit, tif=TimeInForce.GTC,
                       legs=tuple(legs), tag=tag or f"open_{pkg.name}")
         o = ctx.submit(order)
         if o.status == OrderStatus.REJECTED:
-            ctx.log(f"{self.id} {und}: open rejected: {o.reject_reason}")
+            self.activity(ctx, f"{und}: open rejected: {o.reject_reason}", "order_rejected")
             return None
         self.seq += 1
         pos = OptPos(key=f"{und}-{self.seq}", und=und, name=pkg.name,
@@ -548,7 +621,7 @@ class OptionBase(Strategy):
                       tag=f"exit_{reason}")
         o = ctx.submit(order)
         if o.status == OrderStatus.REJECTED:
-            ctx.log(f"{self.id} {pos.und}: close rejected: {o.reject_reason}")
+            self.activity(ctx, f"{pos.und}: close rejected: {o.reject_reason}", "order_rejected")
             return None
         pos.status = "CLOSING"
         pos.close_oid = o.id
@@ -601,17 +674,26 @@ class OptionBase(Strategy):
         try:
             return sz.size_opt_naked(ctx.nav, stress, margin)
         except ValueError as e:
-            ctx.log(f"{self.id} {und}: {e}")
+            self.activity(ctx, f"{und}: {e}", "skip")
             return 0
 
-    def size_cashsec(self, ctx, strike: float, und: str, spot: float, mult: float = 100.0) -> int:
+    def size_cashsec(self, ctx, strike: float, und: str, spot: float, mult: float = 100.0,
+                     deliverable: float = 100.0, name_cap: Optional[float] = None) -> int:
         """OPT_CASHSEC: strike x deliverable reserved per contract from unreserved cash; assignment notional +
-        existing shares <= 10% NAV for single names (broad indexes / index ETF putwrites: 100%)."""
-        cap = 1.0 if und in INDEX_UNDERLYINGS else 0.10
+        existing shares <= 10% NAV for single names / ETFs; broad indexes (and an explicit ``name_cap``, e.g. the
+        S129 index-ETF putwrite variant) 100%. A zero size caused by the name cap is surfaced as a diagnostic."""
+        cap = name_cap if name_cap is not None else (1.0 if und in INDEX_UNDERLYINGS else 0.10)
         shares = ctx.position(und) if und not in INDEX_UNDERLYINGS else 0.0
-        return sz.size_opt_cashsec(ctx.cash, strike, nav=ctx.nav, collateral=self.collateral, multiplier=mult,
-                                   deliverable=mult, name_cap=cap,
-                                   existing_underlying_notional=abs(shares) * spot if finite(spot) else 0.0)
+        existing = abs(shares) * spot if finite(spot) else 0.0
+        n = sz.size_opt_cashsec(ctx.cash, strike, nav=ctx.nav, collateral=self.collateral, multiplier=mult,
+                                deliverable=deliverable, name_cap=cap, existing_underlying_notional=existing)
+        if n <= 0:
+            n_cash = sz.size_opt_cashsec(ctx.cash, strike, collateral=self.collateral, multiplier=mult,
+                                         deliverable=deliverable)
+            if n_cash > 0:
+                self.activity(ctx, f"{und}: name cap reached ({cap:.0%} NAV incl. {abs(shares):.0f} shares held) "
+                                   f"-> no new cash-secured put")
+        return n
 
 
     # ------------------------------------------------------------ implied-vol signals
@@ -627,7 +709,7 @@ class OptionBase(Strategy):
             try:
                 cache[key] = chain_metrics(self.metrics_rows(cv.raw, ctx.now, cv.spot), ctx.now, cv.r, spot=cv.spot)
             except Exception as e:      # degenerate snapshot -> no signal
-                ctx.log(f"{self.id} {cv.und}: chain_metrics failed: {e!r}")
+                self.activity(ctx, f"{cv.und}: chain_metrics failed: {e!r}", "data_missing")
                 cache[key] = {}
         return cache[key]
 

@@ -246,6 +246,7 @@ def _s136(sid):
     ss = sc.ss
     assert percentile_rank(vix, 20, include_current=True)[k] > 0.6
     assert percentile_rank(vix, 20, include_current=True)[k - 1] <= 0.6
+    k += 1                                   # VIX close known at 16:15 -> usable at the NEXT 16:00 decision
     snap = snapshot(p, ss, k)
     E = pick_expiry(snap, ss[k], 30, 30, 45)
     legs = [("P", by_delta(snap, E, "P", -0.10), 1), ("P", by_delta(snap, E, "P", -0.30), -1)]
@@ -337,7 +338,8 @@ def _ifly(sid):
 @builder("S141", "S142")
 def _fly(sid):
     closes = noisy_path(60, 0.004, seed=5)
-    sc = Scen(sid, closes, 60, dict(chain_from=5), start_i=0)
+    # width 5: a 10-wide ATM fly at 20% vol costs >= 50% of the width -> entry skipped (that is the near miss)
+    sc = Scen(sid, closes, 60, dict(chain_from=5), params={"width": 5.0}, start_i=0)
     p = base_portal(sc)
     ss = sc.ss
     k = 5
@@ -346,9 +348,11 @@ def _fly(sid):
     r = "C" if sid == "S141" else "P"
     K = atm(snap, E, both=False)
     sc.signal_i, sc.expiry = k, E
-    sc.legs = [(r, K - 10, 1), (r, K, -2), (r, K + 10, 1)]
+    sc.legs = [(r, K - 5, 1), (r, K, -2), (r, K + 5, 1)]
+    nat10 = natural_open(snap, E, [(r, K - 10, 1), (r, K, -2), (r, K + 10, 1)])
+    assert nat10 >= 5.0, "near miss needs the 10-wide fly to cost >= 50% of its width"
     sc.extra["check"] = "fly_value"
-    sc.near_portal_kw = dict(step=3.0)
+    sc.near_params = {"width": 10.0}
     return sc
 
 
@@ -417,13 +421,15 @@ def _s143(sid):
     ss = sc.ss
     pr = percentile_rank(vix, 252, include_current=False)
     assert pr[k] < 0.2 and pr[k - 1] >= 0.2
+    vix_k = k
+    k += 1                                   # VIX close known at 16:15 -> usable at the NEXT 16:00 decision
     snap = snapshot(p, ss, k)
     E = pick_expiry(snap, ss[k], 30, 25, 35)
     K = atm(snap, E)
     sc.signal_i, sc.expiry, sc.legs = k, E, [("C", K, 1), ("P", K, 1)]
     sc.exit_i, sc.exit_tag = k + 1 + 10, "exit_time_10d"
     vn = vix.copy()
-    vn[k:] = 30.0
+    vn[vix_k:] = 30.0
     sc.near_portal_kw = dict(extra_bars={"VIX": vn})
     return sc
 
@@ -586,7 +592,7 @@ def _s129(sid):
     E = pick_expiry(snap, ss[k], 30, 7, 45)
     sc.signal_i, sc.expiry = k, E
     sc.legs = [("P", atm(snap, E, both=False), -1)]
-    sc.units = sz.size_opt_cashsec(1e6, sc.legs[0][1], nav=1e6)
+    sc.units = sz.size_opt_cashsec(1e6, sc.legs[0][1], nav=1e6, name_cap=1.0)    # fully collateralized
     sc.extra["second_entry"] = ss.index(CAL_next(pd.Timestamp(E)))  # PM/physical: settled at E's close
     sc.extra["near_start"] = k + 6                                     # after the roll window, before next roll
     return sc
