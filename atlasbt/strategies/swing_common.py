@@ -30,7 +30,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-from ..core.types import ActionType, Fidelity, NotTestableError, OrderStatus, OrderType, TimeInForce
+from ..core.types import ActionType, DataUnavailableError, Fidelity, NotTestableError, OrderStatus, OrderType, TimeInForce
 from ..engine.strategy import Requirement, Strategy
 from ..indicators import atr as _atr
 from ..risk import sizing as _sz
@@ -62,10 +62,6 @@ COMMON_DEVIATIONS = [
     "Signals use split+dividend adjusted daily history as of the decision close; resting order prices are raw "
     "(current) prices. Resting stops/targets cancelled by the engine on a split are re-placed at the next session "
     "start with split-adjusted prices/quantities; cash dividends do not adjust resting stops.",
-    "Entry-day protection: the engine's bracket children have fixed prices, so stops/targets defined relative to "
-    "the actual fill (e.g. 'k*ATR from fill', 'nR') are placed with the bracket at levels computed from the planned "
-    "entry (signal close, or the entry-stop price) and replaced by the exact fill-based levels at the entry-day "
-    "close; from then on they are resting orders re-placed at every close.",
     "Close-based exits ('exit close<X', 'exit after N sessions') are market orders submitted at the signal close and "
     "filled at the next open; they share an OCO group with the resting protective stop so only one can fill.",
     "Holding period: the entry session counts as session 1; 'exit after N sessions'/'max hold N' submits the exit "
@@ -80,7 +76,14 @@ COMMON_DEVIATIONS = [
     "least 400 sessions (seed influence < 1e-6); path-dependent state is identical once a flip occurred inside "
     "the window.",
     "When several entries compete for the aggregate gross cap on the same close they are processed in alphabetical "
-    "symbol order; pending entry orders count toward the cap.",
+    "symbol order; the unfilled remainder of still-working entry orders counts toward the cap.",
+    "Protective stops and R targets of entry brackets are anchored to the ACTUAL entry fill (engine fill-relative "
+    "children, active for the rest of the entry bar): 'k*ATR from fill' = fill -/+ k*ATR(signal); 'nR' = fill "
+    "+/- n*|fill - stop|; no target when the fill is already through a fixed stop. Initial risk / R = from the "
+    "fill. From the entry-day close on, levels are resting orders re-placed at every close.",
+    "Sector data rule: sectors that feed a SIGNAL (S074 sector-neutral, S082 sector regressor) are a critical "
+    "input -> NOT_TESTABLE without them; sectors that only feed the CROSS_SECTION caps -> also NOT_TESTABLE by "
+    "default, unless the opt-in param no_sector_caps=True (caps then dropped and the run flagged T2).",
 ]
 
 SECTOR_CAVEAT = ("Sectors come from the portal security master (column 'sector'/'gics_sector'), re-read every 21 "
@@ -149,6 +152,20 @@ def sectors_from_master(ctx, symbols) -> dict[str, str]:
             if v2 is not None:
                 out[s] = v2
     return out
+
+
+def check_universe(strategy, ctx) -> None:
+    """A point-in-time portal universe the strategy trades must exist: missing or empty membership makes the
+    run NOT_TESTABLE (never a silent zero-trade OK run)."""
+    name = getattr(strategy, "universe_name", None)
+    if not name:
+        return
+    try:
+        members = ctx.portal().universe(name)
+    except (DataUnavailableError, KeyError, LookupError) as e:
+        raise NotTestableError(f"{strategy.id}: point-in-time universe {name!r} unavailable ({e})") from e
+    if not members:
+        raise NotTestableError(f"{strategy.id}: point-in-time universe {name!r} is empty at {ctx.now}")
 
 
 # ============================================================== bar cache
@@ -423,20 +440,42 @@ class SwingBase(Strategy):
             ps.stop = p.stop_level
         ps.init_stop = ps.stop
         if p.target_r and ps.init_stop is not None:
-            risk = abs(fill - ps.init_stop)
+            risk = (fill - ps.init_stop) * ps.side          # <= 0: filled through the stop -> no target
             ps.target = fill + ps.side * p.target_r * risk if risk > 0 else None
         ps.last_fill = fill
 
+    #: Turtle adds smaller than this fraction of the first unit (clipped by the 10% notional / 100% gross
+    #: caps) are not placed: a dust add is not a unit (counted in self._clipped_adds and logged)
+    min_add_frac: float = 0.25
+
     def add_order(self, ctx, sym: str, b: Bars, ps: PosState) -> Optional[tuple[float, float]]:
-        """Pyramiding: (stop price, signed qty) for the next add, or None."""
+        """Pyramiding: (stop price, signed qty) for the next add, or None.
+
+        Levels lie on the Turtle grid last_fill + k*add_atr*N. If the market already closed through the
+        next level (it was never triggered intraday - e.g. the add was clipped), the order is re-anchored
+        to the first grid level beyond the latest close. One add order rests at a time (at most one add
+        per session)."""
         p = ps.plan
-        if not p.max_adds or p.add_atr is None or ps.units > p.max_adds or not np.isfinite(ps.last_fill):
+        if not p.max_adds or p.add_atr is None or ps.units > p.max_adds or not finite(ps.last_fill, p.atr):
             return None
         n = p.atr
-        px = ps.last_fill + ps.side * p.add_atr * n
+        step = p.add_atr * n
+        if not step > 0:
+            return None
+        px = ps.last_fill + ps.side * step
+        c = float(b.c[-1])
+        if (c - px) * ps.side >= 0:
+            k = math.floor((c - ps.last_fill) * ps.side / step) + 1
+            px = ps.last_fill + ps.side * k * step
         stop = px - ps.side * p.stop_k * n
         q = self._size(ctx, sym, ps.side, px, stop, extra_gross=0.0, existing_qty=ctx.position(sym))
-        if q == 0:
+        unit = abs(ps.entry_qty)
+        if q == 0 or abs(q) < self.min_add_frac * unit:
+            lvl = round(px, 4)
+            if ps.data.get("clip_level") != lvl:
+                ps.data["clip_level"] = lvl
+                self._clipped_adds += 1
+                ctx.log(f"{self.id} add clipped by SWING_RISK caps", symbol=sym, add_qty=q, unit=unit, level=px)
             return None
         return px, q
 
@@ -460,6 +499,8 @@ class SwingBase(Strategy):
         self._oid_map: dict[int, Any] = {}
         self._nodata: dict[str, int] = {}
         self._gross = 0.0
+        self._clipped_adds = 0
+        check_universe(self, ctx)
 
     def universe_today(self, ctx) -> list[str]:
         return self.symbols(ctx)
@@ -536,7 +577,16 @@ class SwingBase(Strategy):
         self._cache.refresh_actions(ctx)
         univ = set(self.universe_today(ctx))
         syms = sorted(univ | set(self._pos) | set(self._pending) | {s for s, q in ctx.positions().items() if q})
-        self._gross = _sz.equity_gross(ctx) + sum(abs(p.qty) * p.plan.ref_price for p in self._pending.values())
+        # prune pending entries that are no longer working (filled / expired / rejected) BEFORE measuring
+        # gross, and count only the unfilled remainder of working ones (filled parts are in equity_gross)
+        live = 0.0
+        for sym_, pend_ in list(self._pending.items()):
+            o_ = self._order(ctx, pend_.order_id)
+            if o_ is None or o_.status not in (OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIAL):
+                self._pending.pop(sym_, None)
+                continue
+            live += abs(o_.remaining) * pend_.plan.ref_price
+        self._gross = _sz.equity_gross(ctx) + live
         self.on_day_start(ctx, syms)
         for sym in syms:
             self._process(ctx, sym, sym in univ)
@@ -568,7 +618,6 @@ class SwingBase(Strategy):
             o = self._order(ctx, pend.order_id)
             if o is None or o.status not in (OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIAL):
                 self._pending.pop(sym, None)
-                self._gross -= abs(pend.qty) * pend.plan.ref_price
                 pend = None
         ps = self._pos.get(sym)
         if q == 0 and ps is not None and (pend is None):
@@ -711,15 +760,27 @@ class SwingBase(Strategy):
         self._submit_entry(ctx, sym, plan, q)
 
     def _submit_entry(self, ctx, sym: str, plan: Plan, q: float) -> None:
-        stop = plan.planned_stop()
-        tgt = None
-        if plan.target_r and stop is not None:
-            risk = abs(plan.ref_price - stop)
-            tgt = plan.ref_price + plan.side * plan.target_r * risk if risk > 0 else None
+        """Entry bracket whose protective stop / R target are anchored to the ACTUAL entry fill
+        (engine fill-relative children): 'atr_fill' -> stop = fill -/+ k*ATR, target = fill +/- R*k*ATR;
+        'level' -> fixed stop, target = fill +/- R*|fill - stop| (no target if the fill is already
+        through the stop, where the stop exits immediately)."""
         et_ = OrderType.STOP if plan.entry_type == "STP" else OrderType.MARKET
-        if stop is not None or tgt is not None:
-            o = ctx.bracket(sym, q, entry_type=et_, entry_stop=plan.entry_stop, stop=stop, target=tgt,
-                            tif=TimeInForce.DAY, child_tif=TimeInForce.GTC, tag=plan.tag)
+        kw: dict = {}
+        R = plan.target_r
+        if plan.stop_mode == "atr_fill" and finite(plan.atr, plan.stop_k):
+            off = float(plan.stop_k * plan.atr)
+            kw["stop_offset"] = off
+            if R:
+                kw["target_offset"] = float(R * off)
+        elif plan.stop_mode == "level" and finite(plan.stop_level):
+            stop = float(plan.stop_level)
+            kw["stop"] = stop
+            if R:
+                kw["target_fn"] = (lambda px, sd, _s=stop, _r=float(R):
+                                   px + sd * _r * abs(px - _s) if (px - _s) * sd > 0 else float("nan"))
+        if kw:
+            o = ctx.bracket(sym, q, entry_type=et_, entry_stop=plan.entry_stop, tif=TimeInForce.DAY,
+                            child_tif=TimeInForce.GTC, tag=plan.tag, planned_entry=float(plan.ref_price), **kw)
         else:
             o = ctx.order(sym, q, et_, stop_price=plan.entry_stop, tif=TimeInForce.DAY, tag=plan.tag)
         if o.status == OrderStatus.REJECTED:
@@ -750,6 +811,7 @@ class CrossSectionBase(Strategy):
         self._queue: Optional[tuple[int, dict]] = None    # (sessions to wait, target weights)
         self._sector_flagged = False
         self._sec_cache = None
+        check_universe(self, ctx)
 
     # hooks
     def is_signal_day(self, ctx) -> bool:  # pragma: no cover - abstract
@@ -775,9 +837,12 @@ class CrossSectionBase(Strategy):
             self._sec_cache = cached = (i, allsec)
         sec = {s: cached[1][s] for s in syms if s in cached[1]}
         if not sec:
-            if self.need_sectors:
+            # module rule: sectors feeding the SIGNAL -> NOT_TESTABLE; sectors feeding only the CROSS_SECTION
+            # caps -> NOT_TESTABLE unless the explicit opt-in param no_sector_caps=True (then flagged T2)
+            if self.need_sectors or not self.params.get("no_sector_caps", False):
                 raise NotTestableError(f"{self.id}: security master has no sector column ({SECTOR_COLUMNS}); "
-                                       "sector-neutral construction cannot be done faithfully")
+                                       + ("sector-neutral construction" if self.need_sectors else
+                                          "CROSS_SECTION sector caps") + " cannot be done faithfully")
             if not self._sector_flagged:
                 ctx.flag_fidelity(Fidelity.T2_PROXY, f"{self.id}: no sector data in security master; "
                                                      "CROSS_SECTION sector caps not applied")

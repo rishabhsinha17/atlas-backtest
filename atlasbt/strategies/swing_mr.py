@@ -53,11 +53,12 @@ STK_REQ = [Requirement("bars", "1d", symbols=("SPY",), critical=False,
 class S068(SwingBase):
     id = "S068"; name = NAMES["S068"]; asset = "STK/ETF"; sizing = "SWING_NOTIONAL"; universe = SWING_ETF
     params = {"rsi_n": 2, "rsi_max": 5, "trend_n": 200, "exit_sma": 5, "max_hold": None}
-    grid = {"rsi_n": [2, 5, 10], "exit_sma": [3, 5, 10], "max_hold": [None, 10]}
+    grid = {"rsi_max": [2, 5, 10], "exit_sma": [3, 5, 10], "max_hold": [None, 10]}
     requires = [Requirement("bars", "1d")]
     spec = SPECS["S068"]
     deviations = COMMON_DEVIATIONS + [
-        "Grid 'RSI 2/5/10' = Wilder RSI period (entry threshold stays < 5).",
+        "Grid 'RSI 2/5/10' = the RSI2 entry threshold (RSI2 < 2/5/10; the strategy is defined on Wilder RSI(2), "
+        "rsi_n = 2 fixed).",
         "No protective stop (published baseline); notional capped by SWING_NOTIONAL (10% NAV); overnight gaps are "
         "modelled because every fill is at a real next-session open.",
     ]
@@ -221,7 +222,7 @@ class S073(SwingBase):
 @register
 class S074(CrossSectionBase):
     id = "S074"; name = NAMES["S074"]
-    params = {"formation": 5, "decile": 0.10, "sector_neutral": True}
+    params = {"formation": 5, "decile": 0.10, "sector_neutral": True, "no_sector_caps": False}
     grid = {"formation": [3, 5, 10], "decile": [0.10, 0.20], "sector_neutral": [True, False]}
     spec = SPECS["S074"]
     deviations = COMMON_DEVIATIONS[1:2] + [
@@ -232,7 +233,10 @@ class S074(CrossSectionBase):
         "sheet's 'next Mon open' proxy, applied uniformly).",
         "Sector-neutral: deciles (quintiles for 20%) formed within each security-master sector "
         "(indicators.cross_section.group_quantile_bucket): long the lowest bucket, short the highest bucket of every "
-        "sector. Without a sector column the run raises NotTestableError (no proxy).",
+        "sector. Without a sector column the run is NOT_TESTABLE (no proxy). Symmetric legs: in each sector with "
+        "n >= q names the lowest and highest floor(n/q) names are taken (ties by symbol), so both legs hold the "
+        "same number of names; sectors with fewer than q names are not traded (the non-neutral variant ranks the "
+        "whole universe the same way).",
         "CROSS_SECTION weights via risk.sizing.cross_section_weights (+50%/-50%, 2% name cap, 10% per-side sector cap).",
         SECTOR_CAVEAT,
     ]
@@ -265,10 +269,10 @@ class S074(CrossSectionBase):
             self.need_sectors = True
             sec = self.sectors(ctx, list(x.index))
             x = x[[s for s in x.index if s in sec]]
-            bk = xs.group_quantile_bucket(x, pd.Series(sec).reindex(x.index), q)
+            bk = xs.group_quantile_bucket(x, pd.Series(sec).reindex(x.index), q, min_group_size=q, symmetric=True)
         else:
             sec = self.sectors(ctx, list(x.index))
-            bk = xs.quantile_bucket(x, q)
+            bk = xs.group_quantile_bucket(x, pd.Series("ALL", index=x.index), q, symmetric=True)
         longs = sorted(s for s in x.index if bk[s] == 1)
         shorts = sorted(s for s in x.index if bk[s] == q)
         return _sz.cross_section_weights(longs, shorts, sec or None)
@@ -499,7 +503,7 @@ class S081(SwingBase):
 @register
 class S082(CrossSectionBase):
     id = "S082"; name = NAMES["S082"]
-    params = {"resid_n": 5, "beta_n": 252, "hold": 5, "q": 10, "market": "SPY"}
+    params = {"resid_n": 5, "beta_n": 252, "hold": 5, "q": 10, "market": "SPY", "no_sector_caps": False}
     grid = {"resid_n": [3, 5, 10], "beta_n": [126, 252]}
     requires = [Requirement("bars", "1d", symbols=("SPY",)),
                 Requirement("bars", "1d", symbols=tuple(e for e in SECTOR_SPDR if e not in ("XLRE", "XLC"))),
@@ -514,7 +518,7 @@ class S082(CrossSectionBase):
         "ending at t-resid_n (indicators.rolling_ols; betas formed before the residual window). Residual = "
         "sum over the last resid_n sessions of (r - b_mkt*r_SPY - b_sec*r_sector) (intercept excluded).",
         "Rebalance every 5 sessions (calendar session index divisible by 5): long the lowest residual decile, short "
-        "the highest; held to the next rebalance. CROSS_SECTION weights with 10% per-side sector caps; borrow and "
+        "the highest (symmetric: floor(n/10) names each side); held to the next rebalance. CROSS_SECTION weights with 10% per-side sector caps; borrow and "
         "locates by the engine.",
         SECTOR_CAVEAT,
     ]
@@ -570,7 +574,7 @@ class S082(CrossSectionBase):
             return None
         x = pd.Series(vals)
         q = int(p["q"])
-        bk = xs.quantile_bucket(x, q)
+        bk = xs.group_quantile_bucket(x, pd.Series("ALL", index=x.index), q, symmetric=True)
         longs = sorted(s for s in x.index if bk[s] == 1)
         shorts = sorted(s for s in x.index if bk[s] == q)
         return _sz.cross_section_weights(longs, shorts, sec)

@@ -105,13 +105,33 @@ def group_rank(x, groups, pct: bool = True) -> pd.Series:
     return s.groupby(g).rank(method="average", pct=pct)
 
 
-def group_quantile_bucket(x, groups, q: int = 10) -> pd.Series:
-    """Quantile buckets computed separately inside each group (sector-neutral sorts)."""
+def group_quantile_bucket(x, groups, q: int = 10, min_group_size: int | None = None,
+                          symmetric: bool = False) -> pd.Series:
+    """Quantile buckets computed separately inside each group (sector-neutral sorts).
+
+    Defaults reproduce the plain per-group ``quantile_bucket``. Opt-in:
+    * ``min_group_size``: groups with fewer valid names get NaN (no bucket).
+    * ``symmetric=True``: inside each group take k = floor(n_g / q) names from
+      each end -> bucket 1 (lowest k) and bucket q (highest k); every other name
+      is NaN. Ties are broken by symbol order (deterministic). Groups with
+      n_g < q therefore contribute nothing to either extreme.
+    Names whose group is NaN are never bucketed (pandas groupby drops them)."""
     s = _cs(x).astype(float)
     g = _cs(groups).reindex(s.index)
     out = pd.Series(np.nan, index=s.index)
     for _, idx in s.groupby(g).groups.items():
-        out.loc[idx] = quantile_bucket(s.loc[idx], q)
+        v = s.loc[idx].dropna()
+        if min_group_size is not None and len(v) < min_group_size:
+            continue
+        if not symmetric:
+            out.loc[idx] = quantile_bucket(s.loc[idx], q)
+            continue
+        k = len(v) // q
+        if k == 0:
+            continue
+        order = sorted(v.index, key=lambda i: (v[i], str(i)))
+        out.loc[order[:k]] = 1.0
+        out.loc[order[-k:]] = float(q)
     return out
 
 

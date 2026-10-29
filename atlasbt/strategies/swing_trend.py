@@ -22,6 +22,17 @@ from .swing_common import (COMMON_DEVIATIONS, SECTOR_CAVEAT, SP500_PIT, SWING_ET
 from .swing_specs import NAMES, SPECS
 
 
+PYRAMID_NOTE = (
+    "Pyramiding under SWING_RISK: every add is sized as one risk unit (0.5% NAV at its own 2N stop) but the "
+    "position's combined notional stays <= 10% NAV (and aggregate gross <= 100%). With typical ETF volatility "
+    "(N ~ 1-2% of price) the FIRST unit already reaches the 10% notional cap, so adds are clipped: an add smaller "
+    "than 25% of the first unit is not placed (logged, counted in _clipped_adds) and neither counts as a unit "
+    "nor raises the stop; the pyramid grid dimension is then inert - faithful to the sheet's sizing profile. "
+    "Add levels lie on the grid last fill + k*0.5N; a level the market closed through without triggering is "
+    "re-anchored to the next grid level beyond the close. One add order rests at a time, so at most one add "
+    "fills per session (a gap through several levels adds one unit).")
+
+
 def _last(x, k: int = 1) -> float:
     a = np.asarray(x, dtype=float)
     return float(a[-k]) if a.shape[0] >= k else float("nan")
@@ -94,6 +105,7 @@ class S047(SwingBase):
         "rule - a resting buy (sell) stop at last fill +/- 0.5*N (N = Wilder ATR20 at the entry signal), each add "
         "sized as one SWING_RISK unit (0.5% NAV at its own 2N stop) within the 10% notional / 100% gross caps; after "
         "an add the protective stop for all units is raised to max(trailing stop, add fill - 2N).",
+        PYRAMID_NOTE,
         "Trailing stop 2*ATR20: ratchet on closes, C_t - 2*ATR20_t (see common conventions).",
     ]
 
@@ -192,6 +204,7 @@ class S048(SwingBase):
         "fetched history window (>= 400 sessions before the first decision).",
         "Grid 'add threshold 0.5ATR' read as {None = baseline (sheet: 'no pyramids in baseline'), 0.5}: with 0.5, "
         "Turtle adds at +0.5N from the last fill up to max_units=4 units, stops for all units raised to last fill - 2N.",
+        PYRAMID_NOTE,
         "2*Wilder ATR20 stop is fixed from the fill (not trailing); 'first' = whichever of the resting stop or the "
         "channel exit happens first.",
         "Long only (sheet entry text has no short mirror).",
@@ -400,7 +413,7 @@ class S053(SwingBase):
 @register
 class S054(CrossSectionBase):
     id = "S054"; name = NAMES["S054"]
-    params = {"high_n": 252, "top": 0.10, "lag": 1, "exit_q": 5}
+    params = {"high_n": 252, "top": 0.10, "lag": 1, "exit_q": 5, "no_sector_caps": False}
     grid = {"high_n": [126, 252], "top": [0.10, 0.20], "lag": [1, 5]}
     spec = SPECS["S054"]
     deviations = COMMON_DEVIATIONS[1:2] + [
@@ -413,8 +426,8 @@ class S054(CrossSectionBase):
         "its side's extreme quintile (exit buffer 'close if moves out of quintile at rebalance'); all held names are "
         "re-weighted to equal weights at each rebalance.",
         "CROSS_SECTION weights via risk.sizing.cross_section_weights (+50%/-50%, 2% name cap, 10% per-side sector "
-        "cap when the security master has a sector column, else flagged T2 and not applied); names without a valid "
-        "price are dropped.",
+        "cap; without sector data the run is NOT_TESTABLE unless no_sector_caps=True, then caps are dropped and "
+        "the run flagged T2); names without a valid price are dropped.",
         SECTOR_CAVEAT,
     ]
 

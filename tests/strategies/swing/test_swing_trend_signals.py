@@ -643,3 +643,61 @@ def test_synthetic_s067_head_and_shoulders_short_neckline_and_3r():
     assert not np.asarray(head_and_shoulders(h2, l2, c2, 3, 14, 1.0, 1.0)["signal"])[262:].any()
     res2, _ = _run(sw.S067, rows2, len(rows2) - 4, extra_after=3)
     _no_entry(res2)
+
+
+# ===================================================================== fill-anchored brackets (adverse gaps)
+def test_synthetic_s046_adverse_gap_stop_anchored_to_fill_no_entry_bar_stop_and_r_from_fill():
+    """Entry opens 3*ATR20 BELOW the signal close (adverse for the long). The stop is fill - 2*ATR20 from the
+    first moment; the entry-day low (C - 4*ATR) is below the planned C - 2*ATR but above fill - 2*ATR, so no
+    stop fill on the entry bar; R is measured from the fill (initial risk = 2*ATR20 per share)."""
+    rows, p = _base_flat()
+    s = len(rows)
+    rows.append((p, p * 1.03, p * 0.995, p * 1.025, 1e6))
+    rows[:] = cent_rows(rows)
+    o, h, l, c, v = arrays(rows)
+    a20 = float(np.asarray(atr(h, l, c, 20))[-1])
+    C = c[s]
+    op = C - 3.0 * a20
+    rows.append((op, op + 0.3 * a20, C - 4.0 * a20, op + 0.2 * a20, 1e6))
+    rows += flat_rows(4, op + 0.2 * a20, 0.001)
+    res, ss = _run(sw.S046, rows, s, params={"short": False}, extra_after=3)
+    e = _first_entry(res)
+    f = fills_of(res, e["order_id"])
+    fill = float(f["price"].iloc[0])
+    assert f["ts"].iloc[0] == open_ts(ss[s + 1]) and fill == pytest.approx(rows[s + 1][0])
+    o_ = orders(res)
+    child = o_[(o_["tag"] == "stop") & (o_["submitted_at"] < close_ts(ss[s + 1]))]
+    assert len(child) == 1 and child["stop_price"].iloc[0] == pytest.approx(fill - 2 * a20, abs=0.011)
+    assert len(res.fills[res.fills["tag"] == "stop"]) == 0
+    tr = res.trades.iloc[0]
+    assert tr["initial_stop"] == pytest.approx(fill - 2 * a20, abs=0.011)
+    assert tr["initial_risk"] == pytest.approx(abs(tr["quantity"]) * (fill - tr["initial_stop"]), rel=1e-9)
+
+
+def test_synthetic_s066_gap_below_fixed_stop_no_target_and_immediate_stop():
+    """Market entry that opens BELOW the fixed stop (min of the two lows): no R target exists (fill already
+    through the stop) and the resting stop exits at the entry bar's open-side price."""
+    c0 = trend_closes(260, 40.0, 0.002, amp=0.002)
+    rows = rows_from_closes(c0, rng=0.003)
+    p = rows[-1][3]
+    rows += [(p * (1 - 0.02 * k), p * (1 - 0.02 * k) * 1.002, p * (0.98 - 0.02 * k) * 0.998, p * (0.98 - 0.02 * k),
+              1e6) for k in range(4)]
+    p = rows[-1][3] / 0.975
+    rows.append((p * 0.985, p * 0.99, p * 0.96, p * 0.965, 1e6))
+    s = len(rows)
+    rows.append((p * 0.96, p * 0.995, p * 0.955, p * 0.99, 1e6))
+    q = p * 0.94                                                     # below the stop min(0.955p, 0.96p)
+    rows.append((q, q * 1.005, q * 0.995, q, 1e6))
+    rows += flat_rows(3, q, 0.001)
+    res, ss = _run(sw.S066, rows, s, extra_after=3)
+    e = _first_entry(res)
+    assert len(fills_of(res, e["order_id"])) == 1
+    o_ = orders(res)
+    tg = o_[o_["tag"] == "target"]
+    # no priced target: the engine materialises the template with a NaN limit (never fillable); it must not
+    # fill and is retired with the stop (OCO)
+    assert tg["limit_price"].astype(float).isna().all()
+    assert (tg["status"] != "FILLED").all() and (tg["status"] != "WORKING").all()
+    assert len(res.fills[res.fills["tag"] == "target"]) == 0
+    st = res.fills[res.fills["tag"] == "stop"]
+    assert len(st) == 1 and open_ts(ss[s + 1]) <= st["ts"].iloc[0] < close_ts(ss[s + 1])

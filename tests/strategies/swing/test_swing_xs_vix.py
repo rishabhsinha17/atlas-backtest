@@ -191,8 +191,16 @@ def test_synthetic_s074_not_sector_neutral_uses_global_deciles():
 def test_synthetic_s074_sector_neutral_without_sector_data_is_not_faked():
     ss, fri, dfs, r5 = _weekly_fixture()
     portal = portal_for(dfs, universes={"SP500": list(STK)})               # security master without sectors
-    with pytest.raises(NotTestableError):
-        run_backtest(_xs_class(sw.S074)(), portal, ss[fri - 1], ss[fri + 1], zero_cost(), raise_errors=True)
+    res = run_backtest(_xs_class(sw.S074)(), portal, ss[fri - 1], ss[fri + 1], zero_cost(), raise_errors=False)
+    assert res.status == RunStatus.NOT_TESTABLE and "sector" in res.not_testable_reason
+    # sectors only feed the caps: still NOT_TESTABLE by default, opt-in no_sector_caps -> runs, flagged T2
+    res2 = run_backtest(_xs_class(sw.S074)(sector_neutral=False), portal, ss[fri - 1], ss[fri + 1], zero_cost(),
+                        raise_errors=False)
+    assert res2.status == RunStatus.NOT_TESTABLE and "sector" in res2.not_testable_reason
+    res3 = run_backtest(_xs_class(sw.S074)(sector_neutral=False, no_sector_caps=True), portal, ss[fri - 1],
+                        ss[fri + 1], zero_cost(), raise_errors=True)
+    assert res3.status == RunStatus.OK and len(res3.fills) > 0
+    assert any("sector caps not applied" in r["reason"] for r in res3.fidelity["reasons"])
 
 
 # ===================================================================== S082
