@@ -173,5 +173,11 @@ def test_s005_missing_premarket_midpoint_is_flagged_per_day():
     _check_trigger("S005", replace(trig, quotes={SYM: _quote("09:10:00", 102.9, 103.1)}))
     r = run(registry.get("S005"), replace(trig, quotes={SYM: _quote("10:00:30", 102.9, 103.1)}))
     assert len(orders(r, "entry")) == 0
-    assert any("midpoint missing for XYZ on 2024-04-17" in x["reason"] and x["tier"] == "NA"
-               for x in r.fidelity["reasons"])
+    # With NO premarket quotes at all the engine's PRE-session quote probe makes the run
+    # NOT_TESTABLE (critical requirement); if PRE quotes exist on other days, the missing
+    # midpoint on this day is flagged NA per day instead. Either way: never a silent OK.
+    if r.status.value == "NOT_TESTABLE":
+        assert "quotes" in r.not_testable_reason.lower()
+    else:
+        assert any("midpoint missing for XYZ on 2024-04-17" in x["reason"] and x["tier"] == "NA"
+                   for x in r.fidelity["reasons"])

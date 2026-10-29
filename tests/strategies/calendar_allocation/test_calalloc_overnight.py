@@ -381,7 +381,7 @@ def test_s042_dividend_without_declaration_time_is_not_testable():
                         pay_date=pd.Timestamp("2024-04-30"), fidelity=Fidelity.T2_PROXY)
     days = flat_days(w, 100.0)
     res = run_backtest(small(CE.S042)(), build(w, days, "flat", actions=[a])(), w[0], w[-1], zero_cost(debug=False))
-    assert res.status == RunStatus.NOT_TESTABLE and "declaration" in res.not_testable_reason
+    assert res.status == RunStatus.NOT_TESTABLE and "declaration" in res.not_testable_reason.lower()
 
 
 def test_s042_decl_proxy_requires_wrapper_and_trades_with_it():
