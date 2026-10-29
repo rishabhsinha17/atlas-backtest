@@ -81,7 +81,8 @@ class DailyStats:
     on session i)."""
 
     def __init__(self, symbol: str, bars: BarArrays, sessions_naive: np.ndarray,
-                 split_ratio_on: dict[int, float], spread_model: SpreadModel, window: int = 20):
+                 split_ratio_on: dict[int, float], spread_model: SpreadModel, window: int = 20,
+                 asset_class: str = "STK"):
         self.symbol = symbol
         self.bars = bars
         self.session_ns = sessions_naive        # naive ET date ns per row
@@ -112,7 +113,12 @@ class DailyStats:
         dv = c * bars.v
         self.adv_dollar = _shifted_rolling_mean(dv, window)
         self.sigma = _shifted_rolling_std(ret, window)
-        self.spread: SpreadSeries = spread_model.series(bars.h * cum, bars.l * cum, ac)
+        if getattr(spread_model, "method", None) == "calibrated":
+            self.spread: SpreadSeries = spread_model.series(
+                bars.h * cum, bars.l * cum, ac, raw_close=c, volume=bars.v, dates=sessions_naive,
+                asset_class=asset_class, adv_dollar=self.adv_dollar, sigma=self.sigma)
+        else:
+            self.spread = spread_model.series(bars.h * cum, bars.l * cum, ac)
 
     def idx(self, session_ns: int) -> int:
         return self.index.get(int(session_ns), -1)
@@ -188,6 +194,15 @@ class MarketData:
             self._splits[symbol] = sp
         return sp
 
+    def _asset_class(self, symbol: str) -> str:
+        """'ETF' or 'STK' from the instrument master (ETFs have their own spread curve)."""
+        try:
+            inst = self.portal.instrument(symbol)
+        except Exception:
+            inst = None
+        ac = getattr(inst, "asset_class", None)
+        return "ETF" if ac is not None and getattr(ac, "value", ac) == "ETF" else "STK"
+
     def daily(self, symbol: str) -> Optional[DailyStats]:
         if symbol in self._daily:
             return self._daily[symbol]
@@ -202,7 +217,8 @@ class MarketData:
             return None
         sess = (pd.DatetimeIndex(b.start, tz="UTC").tz_convert("America/New_York").tz_localize(None)
                 .normalize().as_unit("ns").asi8.astype(np.int64))
-        st = DailyStats(symbol, b, sess, self.splits(symbol), self.spread_model, self.stats_window)
+        st = DailyStats(symbol, b, sess, self.splits(symbol), self.spread_model, self.stats_window,
+                        asset_class=self._asset_class(symbol))
         self._daily[symbol] = st
         return st
 

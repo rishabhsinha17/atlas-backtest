@@ -39,6 +39,7 @@ from ..execution.fills import (
     QuoteView, SymbolMarket,
 )
 from ..execution.spread import SpreadModel
+from ..execution.spread_calibrated import CalibratedSpreadModel
 from ..portfolio.account import Account, AccountType
 from ..portfolio.corporate_actions import CorporateActionProcessor, as_session_date
 from ..portfolio.financing import accrue_financing
@@ -100,7 +101,9 @@ class Backtester:
         self.account = Account(cfg.initial_cash, cfg.account_type)
         self.om = OrderManager()
         self.fees = copy.deepcopy(cfg.make_fees())
-        self.spread_model = SpreadModel(cfg.spread)
+        self.spread_model_name = cfg.resolved_spread_model()
+        self.spread_model = (CalibratedSpreadModel(cfg.spread_calibrated) if self.spread_model_name == "calibrated"
+                             else SpreadModel(cfg.spread))
         self.bar_model = BarFillModel(cfg.bar_fill, self.spread_model, cfg.impact)
         self.quote_model = QuoteFillModel(cfg.impact, cfg.bar_fill.ssr_mode, cfg.bar_fill.allow_fractional)
         self.auction_model = AuctionFillModel(cfg.auction, cfg.impact, cfg.bar_fill.allow_fractional)
@@ -2071,6 +2074,7 @@ def _config_summary(cfg: BacktestConfig) -> dict:
         "latency_bars": str(cfg.latency_bars), "latency_quotes": str(cfg.latency_quotes),
         "participation_cap": cfg.bar_fill.participation_cap, "ssr_mode": cfg.bar_fill.ssr_mode,
         "impact_k": cfg.impact.k, "spread_method": cfg.spread.method,
+        "spread_model": cfg.resolved_spread_model(),
         "credit_spread": cfg.financing.credit_spread, "debit_spread": cfg.financing.debit_spread,
         "borrow_default_fee": cfg.borrow.default_fee, "resolve_intrabar_freq": cfg.resolve_intrabar_freq,
         "use_quotes": cfg.use_quotes,

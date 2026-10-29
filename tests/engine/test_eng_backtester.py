@@ -1143,3 +1143,31 @@ def test_universe_coverage_filters_members_without_data_and_min_coverage():
     late.universe = universe
     r3 = Backtester(S(script), late, zero_cost()).run(ss[0], ss[-1])
     assert r3.status == RunStatus.NOT_TESTABLE and "coverage 88.6%" in r3.not_testable_reason
+
+
+def test_spy_round_trip_2019_calibrated_spread_is_bp_not_tens_of_bp():
+    """Default spread model = calibrated (TAQ NBBO fit). A SPY coin-flip round trip in
+    2019 costs ~2 x half-spread + impact, well under 2 bp; the legacy Corwin-Schultz
+    estimate on the same bars is tens of bp."""
+    from atlasbt.core.types import AssetClass
+    df = synthetic_daily_bars("2018-10-01", "2019-12-31", 290.0, daily_vol=0.008, volume=7e7, seed=7)
+    spy = Instrument(symbol="SPY", asset_class=AssetClass.ETF)
+    portal = InMemoryPortal(bars={("SPY", "1d"): df}, instruments={"SPY": spy})
+    S = make(universe=["SPY"])
+
+    def script(ctx, st):
+        d = ctx.session_date()
+        if d.month == 6 and d.day <= 14:
+            ctx.order("SPY", 1000 if ctx.position("SPY") == 0 else -ctx.position("SPY"))
+    cfg = BacktestConfig(fees="NO_FEES")
+    assert cfg.resolved_spread_model() == "calibrated"
+    r = Backtester(S(script), portal, cfg).run("2019-06-03", "2019-06-28", raise_errors=True)
+    f = r.fills
+    assert len(f) >= 4 and r.meta["config"]["spread_model"] == "calibrated"
+    rt_bp = 2 * ((f.spread_cost + f.impact_cost) / f.notional.abs()).mean() * 1e4
+    assert 0.05 < rt_bp < 2.0
+    assert f.fidelity_reason.str.contains("spread modelled (calibrated)", regex=False).all() and (f.fidelity >= 2).all()
+    legacy = BacktestConfig(fees="NO_FEES", spread_model="corwin_schultz")
+    r2 = Backtester(S(script), portal, legacy).run("2019-06-03", "2019-06-28", raise_errors=True)
+    f2 = r2.fills
+    assert 2 * ((f2.spread_cost + f2.impact_cost) / f2.notional.abs()).mean() * 1e4 > 5 * rt_bp

@@ -192,8 +192,12 @@ def price_bucket_floor(price: float, buckets=DEFAULT_PRICE_BUCKET_FLOORS) -> flo
 #: open, narrowing through the morning, slightly wider into the close
 #: (McInish & Wood 1992 JF; Chung, Van Ness & Van Ness 1999 JFE). The
 #: multipliers are engineering defaults relative to the daily average.
-DEFAULT_TOD_OPEN = ((5.0, 2.5), (15.0, 1.75), (30.0, 1.3))
-DEFAULT_TOD_CLOSE = ((5.0, 1.3), (15.0, 1.1))
+# Measured NBBO time-of-day profile (5-minute buckets relative to the RTH time-weighted
+# average; docs/SPREADS.md, calibration json ``tod_profile``), coarsened for the legacy
+# model, which has no ADV split: the 'illiquid' curve (first 5 min x2.9; liquid names
+# x4.3 in the calibrated model). Spreads are NARROWER into the close, not wider.
+DEFAULT_TOD_OPEN = ((5.0, 2.9), (10.0, 2.0), (15.0, 1.7), (30.0, 1.5), (60.0, 1.15))
+DEFAULT_TOD_CLOSE = ((5.0, 0.8), (30.0, 0.83), (120.0, 0.87))
 
 
 def tod_multiplier(minutes_since_open: Optional[float], minutes_to_close: Optional[float],

@@ -83,15 +83,16 @@ def test_floors_and_ticks():
 
 
 def test_time_of_day_multiplier():
-    assert tod_multiplier(0, 389) == 2.5
-    assert tod_multiplier(10, 370) == 1.75
-    assert tod_multiplier(20, 360) == 1.3
-    assert tod_multiplier(120, 200) == 1.0
-    assert tod_multiplier(387, 2) == 1.3
+    # measured NBBO profile (illiquid curve): wide open, NARROWER into the close
+    assert tod_multiplier(0, 389) == 2.9
+    assert tod_multiplier(10, 370) == 1.7
+    assert tod_multiplier(20, 360) == 1.5
+    assert tod_multiplier(150, 240) == 1.0
+    assert tod_multiplier(387, 2) == 0.8 and tod_multiplier(370, 20) == 0.83
     assert tod_multiplier(-30, 420) == 3.0          # pre-market
     assert tod_multiplier(None, None) == 1.0        # daily bar
     m = SpreadModel()
-    assert m.full_spread(0.001, 100, minutes_since_open=0, minutes_to_close=389) == pytest.approx(0.0025)
+    assert m.full_spread(0.001, 100, minutes_since_open=0, minutes_to_close=389) == pytest.approx(0.0029)
 
 
 def test_spread_model_is_point_in_time():

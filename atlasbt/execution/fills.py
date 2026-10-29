@@ -192,7 +192,11 @@ class BarFillModel:
     # ---------------------------------------------------------------- pricing
     def half_spread(self, mkt: SymbolMarket, price: float, bar: BarView) -> float:
         tick = valid_tick(price, mkt.instrument)
-        full = self.spread.full_spread(mkt.spread_estimate, price, tick, bar.mso, bar.mtc)
+        if getattr(self.spread, "method", None) == "calibrated":
+            full = self.spread.full_spread(mkt.spread_estimate, price, tick, bar.mso, bar.mtc,
+                                           adv_dollars=mkt.adv_dollar)
+        else:
+            full = self.spread.full_spread(mkt.spread_estimate, price, tick, bar.mso, bar.mtc)
         if bar.mso is None:
             full *= mkt.daily_open_spread_mult
         return 0.5 * full
@@ -409,6 +413,11 @@ class BarFillModel:
                 if mkt.spread_source == "default" and tr.liquidity == "TAKER":
                     reasons.append("spread default (no estimate)")
                     fid = Fidelity.T2_PROXY
+                elif tr.liquidity == "TAKER" and str(mkt.spread_source).startswith("calibrated"):
+                    reasons.append("spread modelled (calibrated)")
+                    if mkt.spread_source != "calibrated":
+                        reasons.append(f"spread {mkt.spread_source[len('calibrated, '):]}")
+                    fid = max(fid, Fidelity.T2_PROXY)
                 elif tr.liquidity == "TAKER":
                     reasons.append(f"spread estimated ({mkt.spread_source})")
                 if bar.mso is None and tr.liquidity == "TAKER":

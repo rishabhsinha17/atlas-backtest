@@ -11,6 +11,7 @@ from ..execution.fees import FeeSchedule, make_fee_schedule
 from ..execution.fills import AuctionConfig, BarFillConfig, ComboConfig
 from ..execution.impact import SquareRootImpact
 from ..execution.spread import SpreadConfig
+from ..execution.spread_calibrated import CalibratedSpreadConfig
 from ..portfolio.account import AccountType
 from ..portfolio.corporate_actions import CorporateActionConfig
 from ..portfolio.financing import FinancingConfig
@@ -31,6 +32,11 @@ class BacktestConfig:
     bar_fill: BarFillConfig = field(default_factory=BarFillConfig)
     auction: AuctionConfig = field(default_factory=AuctionConfig)
     combo: ComboConfig = field(default_factory=ComboConfig)
+    #: 'calibrated' (default: TAQ-NBBO-fitted, era-aware model, docs/SPREADS.md) | 'corwin_schultz'
+    #: (legacy SpreadModel configured by ``spread``). A ``spread`` that differs from the default
+    #: SpreadConfig() is an explicit legacy configuration and selects 'corwin_schultz'.
+    spread_model: str = "calibrated"
+    spread_calibrated: CalibratedSpreadConfig = field(default_factory=CalibratedSpreadConfig)
     spread: SpreadConfig = field(default_factory=SpreadConfig)
     impact: SquareRootImpact = field(default_factory=SquareRootImpact)
     daily_open_spread_mult: float = 1.0
@@ -68,6 +74,13 @@ class BacktestConfig:
     #: NOT_TESTABLE if coverage at the start or at any session the universe is queried is
     #: below this (1.0 = every member must have data)
     min_universe_coverage: float = 0.95
+
+    def resolved_spread_model(self) -> str:
+        if self.spread_model == "calibrated" and self.spread != SpreadConfig():
+            return "corwin_schultz"
+        if self.spread_model not in ("calibrated", "corwin_schultz"):
+            raise ValueError(f"spread_model must be 'calibrated' or 'corwin_schultz', not {self.spread_model!r}")
+        return self.spread_model
 
     def make_fees(self) -> FeeSchedule:
         if isinstance(self.fees, FeeSchedule):

@@ -6,3 +6,4 @@ from .fees import (  # noqa: F401
 )
 from .impact import SquareRootImpact  # noqa: F401
 from .spread import SpreadConfig, SpreadModel, abdi_ranaldo_rolling, corwin_schultz, roll_spread  # noqa: F401
+from .spread_calibrated import CalibratedSpreadConfig, CalibratedSpreadModel  # noqa: F401
