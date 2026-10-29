@@ -21,6 +21,8 @@ Module-wide conventions (declared once, apply to every class here)
   of mourning) are NOT "exchange holidays" for S037 (they were not known in advance).
 * Universes (STRATEGY_GUIDE §3): "ETF" swing -> SWING_ETF; "STK" -> SP500 point-in-time
   (portal universe "SP500"); "ETF/STK" (S042) -> ETF_CORE + portal "SP500_TOP50_DV".
+* Holding periods "after N sessions": see HOLDING_CONVENTION (exit at the open of E+N for open
+  entries; S038 and S045 use it, S039's intraday entry exits MOC at the close of E+N).
 * Sizing via ``atlasbt.risk.sizing`` only. When several entries are sized at the
   same instant, the aggregate-gross cap is applied in universe order, counting the
   notional of entries already sized in that batch.
@@ -37,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 from ..core.clock import et, session_date_of, to_utc
-from ..core.types import ActionType, Fidelity, OrderType, TimeInForce
+from ..core.types import ActionType, CorporateAction, Fidelity, NotTestableError, OrderType, TimeInForce
 from ..engine.strategy import Requirement, Strategy
 from ..indicators import atr, realized_vol, relative_volume, rolling_beta, session_vwap, sma
 from ..indicators.cross_section import quantile_bucket
@@ -60,6 +62,12 @@ UNSCHEDULED_CLOSURES = frozenset(pd.Timestamp(d) for d in (
     "2018-12-05",                                           # G.H.W. Bush
     "2025-01-09",                                           # Carter
 ))
+
+HOLDING_CONVENTION = (
+    "Holding convention (module-wide): 'exit after N trading sessions' = N sessions held counting the entry "
+    "session as session 1 when the entry fills at its open: the exit fills at the open of session E+N (market "
+    "order submitted at the close of E+N-1). Entries filled intraday (S039 at 10:05) count the partial entry "
+    "day as session 0 and exit MOC at the close of E+N.")
 
 COMMON_DEVIATIONS = (
     "Action at HH:MM = market order submitted at the bar ending HH:MM, filled at the next bar's open "
@@ -246,6 +254,8 @@ class _TimedBase(Strategy):
                 continue
             try:
                 ok = self.signal(ctx, s, session)
+            except NotTestableError:
+                raise
             except Exception as e:             # data problems never become trades
                 ctx.log(f"{self.id} signal error {s}: {e}")
                 ok = False
@@ -671,22 +681,94 @@ class S037(_TimedBase):
 
 
 # ================================================================== S042
+DECL_LEAD_KIND = "dividend_declaration_lead"
+
+
+class DividendDeclarationLeadPortal:
+    """Opt-in DataPortal decorator for S042(decl_proxy=True).
+
+    The project's dividend actions carry no declaration date (known_at = close of the session
+    before the ex-date, docs/DATA.md). This wrapper re-stamps every CASH_DIVIDEND as known at the
+    close of the session ``lead_sessions`` before its ex-date (real declarations come 2-6 weeks
+    ahead), keeps ex-date and amount, and marks it T2_PROXY. Everything else is delegated
+    unchanged. It answers ``has('*', 'dividend_declaration_lead', str(lead_sessions))`` so S042 can
+    require it (without the wrapper decl_proxy=True runs are NOT_TESTABLE).
+
+        portal = DividendDeclarationLeadPortal(DataPortal(...), lead_sessions=10)
+        run_backtest(S042(decl_proxy=True, decl_lead=10), portal, ...)
+    """
+
+    def __init__(self, portal, lead_sessions: int = 10):
+        self._base = portal
+        self.lead_sessions = int(lead_sessions)
+        self.calendar = getattr(portal, "calendar", None)
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+    def _cal(self):
+        from ..core.clock import nyse
+        return self.calendar or nyse()
+
+    def has(self, symbol, kind, freq=None, *a, **kw):
+        if kind == DECL_LEAD_KIND:
+            return freq is None or str(freq) == str(self.lead_sessions)
+        return self._base.has(symbol, kind, freq, *a, **kw)
+
+    def fidelity_of(self, symbol, kind, freq=None, *a, **kw):
+        if kind == DECL_LEAD_KIND:
+            return Fidelity.T2_PROXY if self.has(symbol, kind, freq) else Fidelity.NA
+        return self._base.fidelity_of(symbol, kind, freq, *a, **kw)
+
+    def _restamp(self, a: CorporateAction) -> CorporateAction:
+        cal = self._cal()
+        exd = as_session_date(a.ex_date)
+        if not cal.is_session(exd):
+            exd = cal.next_session(exd)
+        lead = cal.open_close(cal.prev_session(exd, self.lead_sessions))[1]
+        k = min(to_utc(a.known_at), lead)
+        return CorporateAction(a.symbol, a.type, a.ex_date, k, a.ratio, a.amount, a.pay_date, a.new_symbol,
+                               max(Fidelity(int(a.fidelity)), Fidelity.T2_PROXY))
+
+    def corporate_actions(self, symbols, start, end, as_of):
+        a_utc = to_utc(as_of)
+        far = to_utc(pd.Timestamp(end)) + pd.Timedelta(days=60) if pd.Timestamp(end).tzinfo else \
+            pd.Timestamp(end).tz_localize("UTC") + pd.Timedelta(days=60)
+        out = []
+        for a in self._base.corporate_actions(symbols, start, end, max(a_utc, far)):
+            if a.type == ActionType.CASH_DIVIDEND:
+                a = self._restamp(a)
+            if to_utc(a.known_at) <= a_utc:
+                out.append(a)
+        return out
+
+
 @register
 class S042(_TimedBase):
     id = "S042"
     name = "Scheduled dividend ex-date gap test"
     asset = "ETF/STK"
     universe = ETF_CORE
-    params = {"window": 1, "yield_split": "all", "proxy": False}
+    params = {"window": 1, "yield_split": "all", "decl_proxy": False, "decl_lead": 10, "proxy": False}
     grid = {"yield_split": ["high", "low"], "window": [1, 2]}
-    requires = _INTRADAY_REQS + [Requirement("actions", symbols=("SPY",),
-                                             note="point-in-time dividend declarations (known_at); SPY probes "
-                                                  "that the portal serves corporate actions")]
+    requires = _INTRADAY_REQS + [Requirement("actions", symbols=("SPY",), min_fidelity=Fidelity.T1_BAR,
+                                             note="cash dividends with point-in-time DECLARATION timestamps "
+                                                  "(known_at); SPY probes the portal's corporate actions. "
+                                                  "Project data (Yahoo/DoltHub) has none -> NOT_TESTABLE "
+                                                  "unless decl_proxy=True")]
     deviations = COMMON_DEVIATIONS + (
         "Universe ETF_CORE + portal 'SP500_TOP50_DV' (STRATEGY_GUIDE 'STK/ETF'); requirements are checked on "
-        "ETF_CORE (static part); megacaps without intraday bars are skipped and logged.",
+        "ETF_CORE (static part). ETF-only results when no 1m stock bars: megacaps without intraday bars are "
+        "skipped, logged and flagged (T2 'partial universe coverage').",
         "Only regular CASH_DIVIDEND actions whose declaration known_at <= decision time and whose ex-date is "
         "exactly `window` sessions after the entry session; special dividends excluded.",
+        "Default needs declaration-timestamped dividends (critical requirement, min fidelity T1); a dividend "
+        "seen with fidelity >= T2 (known_at proxied, e.g. prior-session close) stops the run as NOT_TESTABLE "
+        "(the 15:50 decision could never see it).",
+        "decl_proxy=True (opt-in, T2_PROXY): ex-date and amount treated as known `decl_lead` (10) sessions "
+        "before the ex-date (docs/DATA.md: real declarations 2-6 weeks ahead); needs the portal wrapped in "
+        "calendar_events.DividendDeclarationLeadPortal(portal, lead_sessions=decl_lead) - the PIT guard "
+        "forbids the strategy itself from reading later-stamped data.",
         "Yield split: event yield = dividend / price at decision; high/low = above/at-or-below the median "
         "event yield of dividends with ex-date in the prior 365 days seen by the strategy (needs >= 8); "
         "baseline 'all' (no split) is not a grid value.",
@@ -697,11 +779,35 @@ class S042(_TimedBase):
             "recorded point-in-time. || Sell next 09:35 ex-date; include dividend entitlement and ex-price "
             "adjustment, tax and withholding if applicable.")
 
+    def __init__(self, **params):
+        super().__init__(**params)
+        if self.params["decl_proxy"]:
+            reqs = [r for r in self.requires if r.kind != "actions"]
+            reqs.append(Requirement("actions", symbols=("SPY",), min_fidelity=Fidelity.T2_PROXY))
+            reqs.append(Requirement(DECL_LEAD_KIND, str(int(self.params["decl_lead"])), symbols=("*",),
+                                    note="portal wrapped in DividendDeclarationLeadPortal(lead_sessions=decl_lead)"))
+            self.requires = reqs
+
     def init(self, ctx):
         super().init(ctx)
         self.st["divs"] = {}          # (sym, ex_date) -> amount
         self.st["yields"] = {}        # (sym, ex_date) -> yield at first sight
         self.st["today"] = None
+        self.st["no_intraday"] = set()
+        if self.params["decl_proxy"]:
+            _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                       f"S042: dividend ex-date/amount assumed known {int(self.params['decl_lead'])} sessions "
+                       f"before the ex-date (declaration timestamps unavailable)")
+
+    def _buy(self, ctx, syms, session, order_type, gross):
+        if order_type == OrderType.MARKET:
+            missing = [s for s in syms if s not in self.universe and _last_intraday_bar(ctx, s, ctx.session_date()) is None]
+            if missing:
+                self.st["no_intraday"].update(missing)
+                _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                           "S042: partial universe coverage - stock (SP500_TOP50_DV) entries skipped for lack of "
+                           "1m bars; results may be ETF-only")
+        return super()._buy(ctx, syms, session, order_type, gross)
 
     def symbols_today(self, ctx):
         syms = list(self.universe)
@@ -726,6 +832,12 @@ class S042(_TimedBase):
             for a in acts:
                 if a.type != ActionType.CASH_DIVIDEND or not (a.amount > 0):
                     continue
+                if not self.params["decl_proxy"] and int(a.fidelity) >= Fidelity.T2_PROXY:
+                    raise NotTestableError(
+                        f"S042: dividend {a.symbol} ex {as_session_date(a.ex_date).date()} has no declaration "
+                        f"timestamp (known_at proxied, fidelity {Fidelity(int(a.fidelity)).name}); the 15:50 "
+                        f"decision cannot see it point-in-time. Use decl_proxy=True with "
+                        f"DividendDeclarationLeadPortal for a T2 proxy run.")
                 exd = as_session_date(a.ex_date)
                 key = (a.symbol, exd)
                 if key not in self.st["yields"]:
@@ -767,7 +879,8 @@ class S038(Strategy):
     sizing = "CROSS_SECTION"
     asset = "STK"
     universe_name = "SP500"
-    params = {"pct": 0.10, "hold": 20, "sigma_window": 63, "min_pool": 20}
+    params = {"pct": 0.10, "hold": 20, "sigma_window": 63, "min_pool": 20, "posthoc_consensus": False,
+              "gaap_fallback": False}
     grid = {"pct": [0.05, 0.10, 0.20], "hold": [5, 20, 60]}
     requires = [Requirement("bars", "1d"),
                 Requirement("events", "EARNINGS", symbols=("*",), min_fidelity=Fidelity.T2_PROXY,
@@ -777,15 +890,25 @@ class S038(Strategy):
         "Releases arrive staggered, so the cross-section is the pool of releases known in the trailing "
         "`sigma_window` (63) sessions incl. the new one: sigma = stdev of raw surprises in the pool, decile "
         "breakpoints = pool quantiles of SUE (top/bottom `pct`); needs >= min_pool releases.",
-        "Surprise = eps_actual - eps_estimate (per share, not price-scaled, as in the sheet); events whose "
+        "Surprise = actual - consensus (per share, not price-scaled, as in the sheet); events whose "
         "estimate_known_at is missing or not strictly before known_at are ignored (no PIT consensus).",
+        "Consensus PIT: payload estimate_fidelity >= 2 (DoltHub eps_history 'consensus recorded post hoc') is "
+        "skipped by default; posthoc_consensus=True uses it with a T2 flag citing estimate_reason.",
+        "Actual EPS on the consensus (street) basis, QUARTERLY: payload eps_actual_street (DoltHub "
+        "eps_history.reported matched on period_end +-7d, attached by the data layer) when present. Without "
+        "it a project payload carries only GAAP (ZipLime, FY releases ANNUAL): skipped by default; "
+        "gaap_fallback=True uses GAAP only for quarterly figures (fiscal_period Q1-Q4, figure_quarters 1) with "
+        "a T2 flag. Generic payloads without basis fields are taken as same-basis but FY/multi-quarter "
+        "figures are always skipped. Skips are counted and logged.",
         "Entry: market order at the first RTH open >= 15 min after known_at (BMO releases known by 09:15 trade "
         "the same open; others the next open). Release clock times are bucketed (BMO/AMC) in the data -> T2.",
         "Exit after `hold` sessions (sold at the open of entry+hold) or at the first open after the next "
         "release of the same stock if its surprise has the opposite sign; no overlapping positions.",
-        "CROSS_SECTION sizing per entry: weight from cross_section_weights over the active basket incl. the "
-        "new name (+50%/-50%, <=2% per name, sector caps when the security master has 'sector'); existing "
-        "names are not re-weighted when the basket changes (avoids daily churn).",
+        HOLDING_CONVENTION,
+        "CROSS_SECTION sizing per batch: the releases processed together are weighted at once with "
+        "cross_section_weights over the active basket incl. the new names (+50%/-50%, <=2% per name, sector "
+        "caps when the security master has 'sector'); each side is capped at 50% NAV counting filled AND "
+        "pending entry notional; existing names are not re-weighted when the basket changes (avoids churn).",
     )
     spec = ("After public earnings timestamp, compute surprise=(reported quarterly EPS - consensus EPS frozen "
             "before release)/cross-sectional surprise σ; go long top decile surprise, short bottom decile; enter "
@@ -793,24 +916,60 @@ class S038(Strategy):
             "earnings release; no overlapping same stock.")
 
     def init(self, ctx):
-        self.st = {"pool": [], "pos": {}, "last": None, "sectors": None, "_flags": set()}
+        self.st = {"pool": [], "pos": {}, "last": None, "sectors": None, "_flags": set(), "skips": {}}
 
     def _sectors(self, ctx):
         return _sector_map(self.st, ctx)
 
+    def _skip(self, ctx, e, why: str) -> float:
+        n = self.st["skips"].get(why, 0) + 1
+        self.st["skips"][why] = n
+        ctx.log(f"S038 skip {e.symbol}: {why}", count=n)
+        return float("nan")
+
     @staticmethod
-    def _surprise(e) -> float:
-        p = e.payload or {}
-        a, est = p.get("eps_actual"), p.get("eps_estimate")
-        ek = p.get("estimate_known_at")
+    def _num(x) -> float:
         try:
-            a, est = float(a), float(est)
+            v = float(x)
         except (TypeError, ValueError):
             return float("nan")
-        if not (a == a and est == est) or ek is None or pd.isna(ek):
-            return float("nan")
-        if to_utc(ek) >= to_utc(e.known_at):
-            return float("nan")
+        return v
+
+    def _surprise(self, ctx, e) -> float:
+        p = e.payload or {}
+        est = self._num(p.get("eps_estimate"))
+        ek = p.get("estimate_known_at")
+        if est != est or ek is None or pd.isna(ek) or to_utc(ek) >= to_utc(e.known_at):
+            return self._skip(ctx, e, "no consensus frozen before the release")
+        ef = p.get("estimate_fidelity")
+        if ef is not None and not pd.isna(ef) and int(ef) >= Fidelity.T2_PROXY:
+            if not self.params["posthoc_consensus"]:
+                return self._skip(ctx, e, "consensus not point-in-time (estimate_fidelity >= 2)")
+            _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                       f"S038: post-hoc consensus used (estimate_reason: {p.get('estimate_reason') or 'n/a'})")
+        fp = str(p.get("fiscal_period") or "").upper()
+        fq = self._num(p.get("figure_quarters"))
+        quarterly = fp != "FY" and not (fq == fq and fq > 1)
+        street = self._num(p.get("eps_actual_street"))
+        project_payload = any(k in p for k in ("eps_actual_street", "eps_actual_basis", "eps_actual_gaap")) \
+            or p.get("source") == "ziplime"
+        if street == street:
+            a = street                                  # consensus basis, quarterly period end
+        elif project_payload:
+            gaap = self._num(p.get("eps_actual_gaap", p.get("eps_actual")))
+            if not (quarterly and fp in ("Q1", "Q2", "Q3", "Q4")) or gaap != gaap:
+                return self._skip(ctx, e, "no street-basis actual and GAAP figure not quarterly")
+            if not self.params["gaap_fallback"]:
+                return self._skip(ctx, e, "no street-basis actual (GAAP vs street consensus)")
+            _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                       "S038: GAAP quarterly EPS compared with a street-basis consensus (basis mismatch)")
+            a = gaap
+        else:
+            if not quarterly:
+                return self._skip(ctx, e, "non-quarterly actual EPS")
+            a = self._num(p.get("eps_actual"))
+            if a != a:
+                return self._skip(ctx, e, "no actual EPS")
         return a - est
 
     def _process(self, ctx, until: pd.Timestamp, at_open: bool) -> None:
@@ -826,7 +985,7 @@ class S038(Strategy):
         pool = self.st["pool"]
         new = []
         for e in evs:
-            s = self._surprise(e)
+            s = self._surprise(ctx, e)
             if s != s:
                 continue
             if int(getattr(e, "fidelity", Fidelity.T1_BAR)) >= Fidelity.T2_PROXY:
@@ -847,6 +1006,7 @@ class S038(Strategy):
         sue_pool = arr / sig
         q = float(self.params["pct"])
         hi_bp, lo_bp = np.quantile(sue_pool, 1 - q), np.quantile(sue_pool, q)
+        batch = []
         for e, s in new:
             sym = e.symbol
             sue = s / sig
@@ -858,27 +1018,42 @@ class S038(Strategy):
             if sym not in members:
                 continue
             side = 1 if sue >= hi_bp else (-1 if sue <= lo_bp else 0)
-            if side:
-                self._enter(ctx, sym, side, at_open)
+            if side and all(b[0] != sym for b in batch):
+                batch.append((sym, side))
+        if batch:
+            self._enter_batch(ctx, batch, at_open)
 
-    def _enter(self, ctx, sym, side, at_open: bool):
-        px = ctx.mark(sym)
-        if not (px == px and px > 0):
-            return
-        longs = [s for s, p in self.st["pos"].items() if p["side"] > 0]
-        shorts = [s for s, p in self.st["pos"].items() if p["side"] < 0]
-        (longs if side > 0 else shorts).append(sym)
-        w = SZ.cross_section_weights(longs, shorts, self._sectors(ctx) or None).get(sym, 0.0)
-        side_gross = sum(abs(ctx.position(s)) * ctx.mark(s) for s in (longs if side > 0 else shorts) if s != sym)
-        room = max(0.5 * ctx.nav - side_gross, 0.0)
-        notional = min(abs(w) * ctx.nav, room)
-        q = side * math.floor(notional / px)
-        if q == 0:
-            return
-        ctx.order(sym, q, tag="entry")
+    def _committed(self, ctx, syms) -> float:
+        """Filled + pending (working entry orders) notional of ``syms``."""
+        tot = 0.0
+        for s in syms:
+            px = ctx.mark(s)
+            if not (px == px):
+                continue
+            pend = sum(abs(o.remaining) for o in ctx.open_orders(s) if o.tag == "entry")
+            tot += (abs(ctx.position(s)) + pend) * px
+        return tot
+
+    def _enter_batch(self, ctx, batch, at_open: bool):
+        longs = [s for s, p in self.st["pos"].items() if p["side"] > 0] + [s for s, sd in batch if sd > 0]
+        shorts = [s for s, p in self.st["pos"].items() if p["side"] < 0] + [s for s, sd in batch if sd < 0]
+        w = SZ.cross_section_weights(longs, shorts, self._sectors(ctx) or None)
+        nav = ctx.nav
+        room = {1: max(0.5 * nav - self._committed(ctx, [s for s, p in self.st["pos"].items() if p["side"] > 0]), 0.0),
+                -1: max(0.5 * nav - self._committed(ctx, [s for s, p in self.st["pos"].items() if p["side"] < 0]), 0.0)}
         d = ctx.session_date()
         entry = d if at_open else ctx.calendar().next_session(d)     # session whose open fills the order
-        self.st["pos"][sym] = {"side": side, "entry": entry, "exit_now": False}
+        for sym, side in batch:
+            px = ctx.mark(sym)
+            if not (px == px and px > 0):
+                continue
+            notional = min(abs(w.get(sym, 0.0)) * nav, room[side])
+            q = side * math.floor(notional / px)
+            if q == 0:
+                continue
+            ctx.order(sym, q, tag="entry")
+            room[side] -= abs(q) * px
+            self.st["pos"][sym] = {"side": side, "entry": entry, "exit_now": False}
 
     def _exits(self, ctx, at_close: bool):
         cal = ctx.calendar()
@@ -992,6 +1167,7 @@ class S039(_EarningsGapBase):
         "-> market sell at the next open. Initial stop for SWING_RISK sizing / R = entry price - 2 x ATR14 "
         "(daily, through the prior session).",
         "Time exit: MOC at the close of the `hold`-th session after the entry session.",
+        HOLDING_CONVENTION,
     )
     spec = ("First RTH day after report: open gap>=+3% and first 30m close above open; buy 10:05 next bar with "
             "RVOL >=2. || Exit after 3 sessions or 2 ATR14 trailing close stop.")
@@ -1103,13 +1279,44 @@ class S040(_EarningsGapBase):
 
 
 # ================================================================== S043 / S044
+INDEX_TIMESTAMP_DEVIATION = (
+    "Only events with payload announce_source == 'sp_press_release_citation' (announcement date parsed from "
+    "the S&P press release) are traded; 'fallback_prev_session' events (known_at = 17:15 ET of the session "
+    "before the effective date, i.e. no real announcement time) are skipped, counted and logged. A run "
+    "that saw index events but none with a real announcement time ends NOT_TESTABLE via on_run_end (needs "
+    "the engine's run-end hook; without it the skips are logged and the run has no trades).")
+
+
 class _IndexEventBase(Strategy):
     bar_freq = "5m"
     asset = "STK"
     universe = ()
+    EVENT_KIND = ""
 
     def init(self, ctx):
-        self.st = {"last": None, "queue": [], "pos": {}, "_flags": set()}
+        self.st = {"last": None, "queue": [], "pos": {}, "_flags": set(), "seen": 0, "skipped_fallback": 0}
+
+    def _timestamped(self, ctx, events) -> list:
+        """Keep events whose announcement time is real (S&P press-release citation)."""
+        out = []
+        for e in events:
+            self.st["seen"] += 1
+            src = (e.payload or {}).get("announce_source")
+            if src == "sp_press_release_citation":
+                out.append(e)
+            else:
+                self.st["skipped_fallback"] += 1
+                ctx.log(f"{self.id}: skipped {e.kind} {e.symbol} (announce_source={src!r}: no real announcement "
+                        f"timestamp)", skipped=self.st["skipped_fallback"])
+        return out
+
+    def on_run_end(self, ctx):
+        """Called by the engine after the last session (hook requested from the ENGINE owner; the
+        Context exposes no run range, so without the hook skips are only logged)."""
+        if self.st["seen"] > 0 and self.st["seen"] == self.st["skipped_fallback"]:
+            raise NotTestableError(
+                f"{self.id}: all {self.st['seen']} {self.EVENT_KIND} events lack a real announcement timestamp "
+                f"(announce_source != 'sp_press_release_citation'); announcement drift cannot be tested")
 
     def _exit_ns(self, ctx, e, entry_session) -> Optional[int]:
         cal = ctx.calendar()
@@ -1149,6 +1356,7 @@ class _IndexEventBase(Strategy):
 
 @register
 class S043(_IndexEventBase):
+    EVENT_KIND = "INDEX_ADD"
     id = "S043"
     name = "Index addition announcement drift"
     sizing = "SWING_NOTIONAL"
@@ -1159,14 +1367,17 @@ class S043(_IndexEventBase):
                             note="timestamped S&P 500 addition announcements (historical archive)")]
     deviations = COMMON_DEVIATIONS + (
         "Traded names come from INDEX_ADD events (any index in the archive; S&P 500 in practice); 5m bars.",
+        INDEX_TIMESTAMP_DEVIATION,
         "entry='ann+1min': first 5m bar opening >= known_at + 1 min during RTH; after-hours announcements -> "
         "next RTH open (no extended-hours fills). entry='next_day': open of the first session after the "
         "announcement's session. Announcement clock times are approximate in the data (T2_PROXY).",
         "Effective date = payload effective_date (first session as an index member); exit 15:50 on it "
         "(+effective_offset sessions). Events whose exit precedes the entry are skipped.",
         "Beta hedge: short SPY beta x stock notional at entry, covered at exit; beta = 252d OLS beta of daily "
-        "returns vs SPY through the prior session (min 60 obs, else 1.0). Gross (stock + hedge) <= 100% NAV; "
-        "stock leg 10% NAV (SWING_NOTIONAL); the hedge is not limited by the 5% short-notional rule.",
+        "returns vs SPY through the prior session (min 60 obs, else 1.0; beta <= 0 -> no hedge). Stock leg "
+        "sized with size_swing_notional_ctx (10% NAV) inside a 100% gross cap that counts filled positions plus "
+        "pending entry and hedge orders plus this name's own hedge; the hedge is not limited by the 5% "
+        "short-notional rule.",
     )
     spec = ("Following timestamped public index addition announcement, buy first next RTH open if announcement "
             "is after-hours, or next 5m open if during RTH. || Exit at index effective date 15:50; net return vs "
@@ -1199,15 +1410,22 @@ class S043(_IndexEventBase):
             return
         _flag_once(self.st, ctx, Fidelity.T2_PROXY, "S043: index announcement time approximate")
         beta = self._beta(ctx, sym) if self.params["hedge"] else 0.0
-        gross = SZ.equity_gross(ctx)
-        notional = min(0.10 * ctx.nav, max(ctx.nav - gross, 0.0) / (1.0 + abs(beta)))
-        q = math.floor(notional / px)
+        nav = ctx.nav
+        filled = SZ.equity_gross(ctx)
+        pending = 0.0                                   # entries/hedges submitted but not yet filled
+        for o in ctx.open_orders():
+            if o.tag in ("entry", "hedge") and o.instrument is not None:
+                m = ctx.mark(o.instrument.symbol)
+                if m == m:
+                    pending += abs(o.remaining) * m
+        room = max(nav - filled - pending, 0.0) / (1.0 + abs(beta))   # stock + beta hedge must fit in 100%
+        q = SZ.size_swing_notional_ctx(ctx, sym, px, 1, gross_cap=(filled + room) / nav if nav > 0 else 0.0)
         if q <= 0:
             return
         ctx.order(sym, q, tag="entry")
         h = 0.0
         if self.params["hedge"] and spy == spy and spy > 0:
-            h = -float(round(beta * q * px / spy))
+            h = -float(math.floor(beta * q * px / spy)) if beta > 0 else 0.0
             if h:
                 ctx.order("SPY", h, tag="hedge")
         self.st["pos"][sym] = {"exit_ns": exit_ns, "hedge": h}
@@ -1222,7 +1440,7 @@ class S043(_IndexEventBase):
     def on_session_start(self, ctx):
         now = ctx.now
         last = self.st["last"] if self.st["last"] is not None else _prev_session_time(ctx, "close")
-        for e in _events_known(ctx, "INDEX_ADD", last, now):
+        for e in self._timestamped(ctx, _events_known(ctx, "INDEX_ADD", last, now)):
             self._enter(ctx, e)                         # after-hours announcement -> this open
         q = self.st["queue"]
         due = [x for x in q if x[0] <= now.value]
@@ -1238,7 +1456,7 @@ class S043(_IndexEventBase):
         self._manage_exits(ctx)
         last = self.st["last"] if self.st["last"] is not None else _prev_session_time(ctx, "close")
         _, c = cal.open_close(d)
-        for e in _events_known(ctx, "INDEX_ADD", last, now):
+        for e in self._timestamped(ctx, _events_known(ctx, "INDEX_ADD", last, now)):
             k = to_utc(e.known_at)
             if self.params["entry"] == "next_day":
                 nxt = cal.next_session(session_date_of(k))
@@ -1255,6 +1473,7 @@ class S043(_IndexEventBase):
 
 @register
 class S044(_IndexEventBase):
+    EVENT_KIND = "INDEX_DEL"
     id = "S044"
     name = "Index deletion event short"
     sizing = "SWING_RISK"
@@ -1266,6 +1485,7 @@ class S044(_IndexEventBase):
                 Requirement("borrow", symbols=("SPY",), critical=False,
                             note="historical borrow availability/fees; default easy-to-borrow is T2")]
     deviations = COMMON_DEVIATIONS + (
+        INDEX_TIMESTAMP_DEVIATION,
         "Traded names come from INDEX_DEL events; 5m bars. Short at the open of the first session after the "
         "announcement (RTH announcements also wait for the next open, as the sheet says).",
         "Borrow: portal.borrow shortable required; borrow_cap (grid) skips names whose annual fee exceeds it; "
@@ -1290,7 +1510,7 @@ class S044(_IndexEventBase):
         d = ctx.session_date()
         last = self.st["last"] if self.st["last"] is not None else _prev_session_time(ctx, "open")
         self.st["last"] = now
-        for e in _events_known(ctx, "INDEX_DEL", last, now):
+        for e in self._timestamped(ctx, _events_known(ctx, "INDEX_DEL", last, now)):
             sym = e.symbol
             if sym in self.st["pos"] or ctx.position(sym) != 0:
                 continue
@@ -1430,7 +1650,9 @@ class S045(Strategy):
         "that open; RTH announcements the next open).",
         "Trailing stop: resting stop at (highest daily high since entry) - 2 x ATR14 (Wilder, daily), "
         "ratcheted up at each close; initial stop/R = expected entry (last close) - 2 x ATR14.",
-        "Time exit: MOC at the close of the `hold`-th session after the entry session.",
+        "Time exit: market order at the close of session E+hold-1, filled at the open of E+hold (E = entry "
+        "session), in one OCO group with the trailing stop.",
+        HOLDING_CONVENTION,
     )
     spec = ("Publicly announced repurchase authorization >=5% of market cap, exclude releases bundled with "
             "earnings, buy first next RTH open. || Exit after 10 trading sessions or 2ATR trailing stop.")
@@ -1489,14 +1711,6 @@ class S045(Strategy):
         p["stop_id"], p["stop"] = o.id, level
 
     def on_session_start(self, ctx):
-        cal = ctx.calendar()
-        d = ctx.session_date()
-        for sym, p in list(self.st["pos"].items()):
-            if p["entry"] is not None and d == cal.next_session(p["entry"], int(self.params["hold"])):
-                q = ctx.position(sym)
-                if q > 0:
-                    self._set_stop(ctx, sym, p, p["stop"])     # stop and MOC share one OCO group
-                    ctx.order(sym, -q, type=OrderType.MOC, tag="time_exit", oco_group=f"S045-{sym}")
         self._process(ctx, ctx.now)
 
     def on_bar(self, ctx):
@@ -1518,6 +1732,10 @@ class S045(Strategy):
             p["hh"] = max(p["hh"], float(dd["high"][sess >= p["entry"]].max()))
             a = _atr14(dd)
             lvl = max(p["hh"] - float(self.params["atr_mult"]) * (a if a == a else p["atr"]), p["stop"])
-            if p["stop_id"] is None or lvl > p["stop"]:
+            cal = ctx.calendar()
+            if cal.next_session(d) == cal.next_session(p["entry"], int(self.params["hold"])):
+                self._set_stop(ctx, sym, p, lvl)        # stop + time exit share one OCO group
+                ctx.order(sym, -q, tag="time_exit", oco_group=f"S045-{sym}")
+            elif p["stop_id"] is None or lvl > p["stop"]:
                 self._set_stop(ctx, sym, p, lvl)        # ratchet up only
         self._process(ctx, ctx.now)

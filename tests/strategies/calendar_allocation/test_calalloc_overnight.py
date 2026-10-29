@@ -370,3 +370,38 @@ def test_proxy_smoke_auction_orders_only(sid):
     assert len(o) > 0 and set(o["type"]) <= {"MOC", "MOO", "MKT"}
     assert not res.diagnostics["rejected_orders"]
     assert any(f["tier"] == "T2_PROXY" for f in res.fidelity.get("flags", [])) or res.fidelity["grade"] >= "C"
+
+
+# ====================================================================== S042 declaration timestamps
+def test_s042_dividend_without_declaration_time_is_not_testable():
+    from atlasbt.core.types import Fidelity
+    w = sess("2024-03-13", "2024-03-15")
+    known = CAL.open_close(pd.Timestamp("2024-03-14"))[1]          # project convention: prior-session close
+    a = CorporateAction(SYM, ActionType.CASH_DIVIDEND, pd.Timestamp("2024-03-15"), known, amount=1.5,
+                        pay_date=pd.Timestamp("2024-04-30"), fidelity=Fidelity.T2_PROXY)
+    days = flat_days(w, 100.0)
+    res = run_backtest(small(CE.S042)(), build(w, days, "flat", actions=[a])(), w[0], w[-1], zero_cost(debug=False))
+    assert res.status == RunStatus.NOT_TESTABLE and "declaration" in res.not_testable_reason
+
+
+def test_s042_decl_proxy_requires_wrapper_and_trades_with_it():
+    from atlasbt.core.types import Fidelity
+    w = sess("2024-03-13", "2024-03-15")
+    known = CAL.open_close(pd.Timestamp("2024-03-14"))[1]
+    a = CorporateAction(SYM, ActionType.CASH_DIVIDEND, pd.Timestamp("2024-03-15"), known, amount=1.5,
+                        pay_date=pd.Timestamp("2024-04-30"), fidelity=Fidelity.T2_PROXY)
+    days = flat_days(w, 100.0, **{"2024-03-14": {"15:50": bar(100.2)}, "2024-03-15": {"09:35": bar(98.7)}})
+    base = build(w, days, "flat", actions=[a])
+    res0 = run_backtest(small(CE.S042)(decl_proxy=True), base(), w[0], w[-1], zero_cost())
+    assert res0.status == RunStatus.NOT_TESTABLE                      # no wrapper -> never silently proxied
+    portal = CE.DividendDeclarationLeadPortal(base(), lead_sessions=10)
+    res = run(small(CE.S042)(decl_proxy=True, decl_lead=10), portal, w)
+    _check_trade(res, dict(entry=(et_ts("2024-03-14", "15:50"), 100.2, 1000),
+                           exit=(et_ts("2024-03-15", "09:35"), 98.7)))
+    assert any("declaration" in r["reason"] for r in res.fidelity["reasons"])
+    # the wrapper re-stamps known_at 10 sessions before the ex-date, never later than the original
+    acts = portal.corporate_actions([SYM], pd.Timestamp("2024-03-01"), pd.Timestamp("2024-03-31"),
+                                    pd.Timestamp("2024-03-02", tz="UTC"))
+    assert len(acts) == 1 and acts[0].known_at == CAL.open_close(CAL.prev_session(pd.Timestamp("2024-03-15"), 10))[1]
+    assert portal.corporate_actions([SYM], pd.Timestamp("2024-03-01"), pd.Timestamp("2024-03-31"),
+                                    pd.Timestamp("2024-02-27", tz="UTC")) == []

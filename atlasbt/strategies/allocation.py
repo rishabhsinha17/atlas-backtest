@@ -66,6 +66,13 @@ COMMON = (
     "rebalancing); whole shares from the decision close.",
     "T-bill proxy BIL (2007-05-30+) else SHV (2007-01-11+) else engine cash.",
     "Total return = adjusted closes as of now; k-month windows aligned to calendar month ends.",
+    "Distributions are part of the test (total return / engine dividend bookings): ETF strategies that rank "
+    "on total-return series (S089, S101, S102, S105, S117, S121, S122, S124) declare "
+    "Requirement('actions') on their universe; symbols without any corporate-action data are flagged "
+    "T2_PROXY at run start ('distributions unavailable: price return used'). The requirement is "
+    "non-critical: making it critical conflicts with red-team tests test_s089_* / "
+    "test_s105_initial_buy (portals without dividend data must still run).",
+    "An ETF is eligible only when its whole lookback window starts on/after its listing date.",
     "Targets are scaled to (1 - 1%) of the gross limit at each rebalance (cash buffer for next-open gaps and "
     "fees; the engine's pre-trade margin check gives pending sells no credit).",
 )
@@ -83,7 +90,7 @@ def _sessions_of(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 def daily_closes(ctx, sym: str, n: int, session) -> Optional[pd.Series]:
     """Adjusted daily closes (last ``n``) indexed by session date; None unless the
-    series ends today and has ``n`` rows."""
+    series ends today, has ``n`` rows and its first row is on/after the listing date."""
     if not listed(sym, session):
         return None
     try:
@@ -94,6 +101,8 @@ def daily_closes(ctx, sym: str, n: int, session) -> Optional[pd.Series]:
         return None
     s = pd.Series(df["close"].to_numpy(float), index=_sessions_of(df.index))
     if s.index[-1] != pd.Timestamp(session) or s.isna().any():
+        return None
+    if not listed(sym, s.index[0]):          # window must not start before the listing (no back-filled history)
         return None
     return s
 
@@ -116,19 +125,46 @@ def period_return(ctx, sym: str, session, months: int) -> float:
     return float(s.iloc[-1] / s.iloc[0] - 1.0)
 
 
+def _flag_rf(ctx, tenor: str, used: str) -> None:
+    flags = getattr(ctx, "state", {}).setdefault("_rf_flags", set())
+    if tenor not in flags:
+        flags.add(tenor)
+        ctx.flag_fidelity(Fidelity.T2_PROXY, f"{tenor} T-bill rate unavailable at some dates; {used} used")
+
+
 def _rf(ctx, as_of, tenor: str) -> float:
+    """Annual simple T-bill rate known at ``as_of``. Uses portal.risk_free_rate_info (rate, series_used,
+    fidelity, ...) when the portal exposes it, so substituted tenors are flagged T2; otherwise
+    risk_free_rate(tenor) with an explicit 3M fallback (flagged), and a 1M value identical to the 3M value
+    is treated as a silent substitution (flagged)."""
     p = ctx.portal()
-    for t in (tenor, "3M") if tenor != "3M" else ("3M",):
+    info = getattr(p, "risk_free_rate_info", None)
+    if info is not None:
+        try:
+            r, used, fid = info(as_of, tenor)[:3]
+            r = float(r)
+            if r == r:
+                if int(fid) >= Fidelity.T2_PROXY:
+                    _flag_rf(ctx, tenor, str(used))
+                return r
+        except Exception:
+            pass
+    tries = (tenor, "3M") if tenor != "3M" else ("3M",)
+    for t in tries:
         try:
             r = float(p.risk_free_rate(as_of, t))
         except Exception:
             r = float("nan")
         if r == r:
             if t != tenor:
-                flags = getattr(ctx, "state", {}).setdefault("_rf_flags", set())
-                if tenor not in flags:
-                    flags.add(tenor)
-                    ctx.flag_fidelity(Fidelity.T2_PROXY, f"{tenor} T-bill rate unavailable; 3M rate used")
+                _flag_rf(ctx, tenor, t)
+            elif tenor != "3M":
+                try:
+                    r3 = float(p.risk_free_rate(as_of, "3M"))
+                except Exception:
+                    r3 = float("nan")
+                if r3 == r:
+                    _flag_rf(ctx, tenor, "3M (identical value: probable silent fallback)")
             return r
     return float("nan")
 
@@ -225,6 +261,18 @@ class _Alloc(Strategy):
 
     def init(self, ctx):
         self.st = {"last_target": None}
+        if any(r.kind == "actions" for r in self.requires):
+            missing = []
+            for sym in self.universe:
+                try:
+                    ok = bool(ctx.portal().has(sym, "actions"))
+                except Exception:
+                    ok = False
+                if not ok:
+                    missing.append(sym)
+            if missing:
+                ctx.flag_fidelity(Fidelity.T2_PROXY, f"{self.id}: distributions unavailable for "
+                                  f"{', '.join(missing)}: price return used instead of total return")
 
     def is_rebalance_day(self, ctx, session) -> bool:
         return ctx.calendar().is_last_session_of_month(session)
@@ -280,7 +328,8 @@ class S089(_Alloc):
     universe = SECTOR_SPDR
     params = {"lookback": 12, "top": 1, "gate": 0.0}
     grid = {"lookback": [3, 6, 12], "top": [1, 2, 3], "gate": [0.0]}
-    requires = [Requirement("bars", "1d"), Requirement("bars", "1d", symbols=TBILL_CHAIN, critical=False)]
+    requires = [Requirement("bars", "1d"), Requirement("bars", "1d", symbols=TBILL_CHAIN, critical=False),
+                Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Predefined sector list = the 11 Select Sector SPDRs (frozen; XLRE/XLC only after listing).",
         "Excess = k-month total return minus the compounded 1M T-bill return over the same dates; each of the "
@@ -354,7 +403,7 @@ class S101(_Alloc):
     universe = DEFENSIVE_4
     params = {"lookback": 3, "top": 1, "gate": True}
     grid = {"lookback": [1, 3, 6, 12], "top": [1, 2], "gate": [True, False]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Frozen universe SPY (broad equity), IEF (intermediate T-note), GLD (gold), SHY (short Treasury); "
         "ranked among those listed with full lookback history (>= 2 required).",
@@ -384,7 +433,7 @@ class S102(_Alloc):
     universe = SECTOR_SPDR
     params = {"lookback": 6, "top": 3}
     grid = {"lookback": [3, 6, 12], "top": [1, 3, 5]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Fixed universe = 11 Select Sector SPDRs (listing-gated). 'return > 3m Tbill' = k-month total return > "
         "compounded 3M T-bill return over the same k months; each slot 1/N; unfilled slots -> T-bill ETF.",
@@ -511,7 +560,7 @@ class S105(_Alloc):
     universe = ["SPY", "IEF"]
     params = {"equity": 0.60, "freq": "monthly"}
     grid = {"equity": [0.40, 0.60, 0.80], "freq": ["quarterly", "monthly"]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Equity ETF = SPY, T-note ETF = IEF (intermediate Treasuries; listed 2002-07-26): nothing is bought "
         "before both are listed. Initial purchase: market orders at the open of the first possible session "
@@ -561,7 +610,7 @@ class S117(_Alloc):
     universe = SECTOR_SPDR
     params = {"lookback": 1, "top": 2}
     grid = {"lookback": [1, 3, 6], "top": [1, 2, 3]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Frozen universe = 11 Select Sector SPDRs (listing-gated). 'Prior calendar-month total return' = "
         "return from the previous month-end close to this month-end close (lookback 1); equal weight 1/N.",
@@ -714,7 +763,7 @@ class S121(_Alloc):
     universe = ["SPY"]
     params = {"trend": 12, "vol_max": 0.20, "vol_n": 63}
     grid = {"trend": [6, 12], "vol_max": [0.15, 0.20, 0.25]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Excess = k-month SPY total return minus compounded 3M T-bill return; 63d vol = sample stdev of the "
         "last 63 daily returns x sqrt(252); '1-3m Treasury ETF' = BIL (else SHV, else cash).",
@@ -742,7 +791,7 @@ class S122(_Alloc):
     universe = CROSS_ASSET
     params = {"window": 6, "top": 3}
     grid = {"window": [3, 6, 12], "top": [2, 3, 4]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Frozen basket: SPY (US equity), EFA (intl equity), BIL (T-bills), TLT (long Treasuries), GLD (gold), "
         "VNQ (REITs); listing-gated.",
@@ -786,7 +835,7 @@ class S124(_Alloc):
     universe = TREASURY_DURATION
     params = {"lookback": 3, "max_duration": "TLT"}
     grid = {"lookback": [1, 3, 6], "max_duration": ["IEF", "TLT"]}
-    requires = [Requirement("bars", "1d")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
     deviations = COMMON + (
         "Frozen basket SHY (1-3y), IEF (7-10y), TLT (20+y), all listed 2002-07-26. 'max duration class' is "
         "read as the longest duration ETF admitted to the basket (IEF -> SHY/IEF only; TLT -> all three).",

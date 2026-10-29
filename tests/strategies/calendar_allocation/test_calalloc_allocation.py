@@ -362,3 +362,43 @@ def test_smoke_run_backtest(sid):
     assert len(res.fills) > 0
     assert not res.diagnostics["margin_calls"]
     assert not res.diagnostics["rejected_orders"]
+
+
+def test_daily_closes_rejects_window_before_listing():
+    ss = sess("2015-06-01", "2015-12-31")
+    p = InMemoryPortal(bars={("XLRE", "1d"): daily_frame(ss, np.full(len(ss), 30.0), spread=0.01)})
+    seen = {}
+
+    class Probe(AL._Alloc):
+        id = "PROBE2"; universe = ["XLRE"]; params = {}; requires = []
+        def on_bar(self, ctx):
+            d = ctx.session_date()
+            seen[d] = (AL.daily_closes(ctx, "XLRE", 20, d) is not None, AL.daily_closes(ctx, "XLRE", 63, d) is not None)
+    run_backtest(Probe(), p, "2015-11-05", "2015-11-06", zero_cost(), raise_errors=True)
+    assert seen[pd.Timestamp("2015-11-05")] == (True, False)        # 63-day window starts before 2015-10-08
+
+
+def test_rf_fallback_is_flagged():
+    seen = {}
+
+    class P1(InMemoryPortal):
+        def risk_free_rate(self, as_of, tenor="3M"):
+            if tenor == "1M":
+                raise KeyError("no 1M series")
+            return 0.03
+
+    class Probe(AL._Alloc):
+        id = "PROBE3"; universe = ["SPY"]; params = {}; requires = []
+        def on_bar(self, ctx):
+            seen["r"] = AL._rf(ctx, ctx.now, "1M")
+    p = P1(bars={("SPY", "1d"): daily_frame(HIST, path(UP), spread=0.01)})
+    res = run_backtest(Probe(), p, "2024-03-27", "2024-03-28", zero_cost(), raise_errors=True)
+    assert seen["r"] == 0.03
+    assert any("1M T-bill rate unavailable" in r["reason"] for r in res.fidelity["reasons"])
+
+
+def test_missing_distributions_flagged():
+    mk = portal_factory({"XLK": path(UP), "XLE": path(0.0005), "BIL": path(0.0001)})
+    res = run(small(AL.S089, ["XLK", "XLE"])(), mk())
+    assert res.status == RunStatus.OK
+    assert any("distributions unavailable" in r["reason"] for r in res.fidelity["reasons"])

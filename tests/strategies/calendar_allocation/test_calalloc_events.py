@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atlasbt.core.types import Fidelity, MarketEvent, RunStatus
+from atlasbt.core.types import Fidelity, MarketEvent, NotTestableError, RunStatus
 from atlasbt.engine.backtester import run_backtest
 from atlasbt.engine.testing import InMemoryPortal
 from atlasbt.strategies import calendar_events as CE
@@ -203,7 +203,8 @@ def test_synthetic_nearmiss_s040(variant):
 
 
 # ======================================================================= S043 / S044
-def index_inputs(sym, kind, known, eff_date, base=50.0, beta=1.5, borrow=None, ssr=False, fee=None):
+def index_inputs(sym, kind, known, eff_date, base=50.0, beta=1.5, borrow=None, ssr=False, fee=None,
+                 announce_source="sp_press_release_citation"):
     win = sess("2024-03-04", "2024-03-18")
     hs = sessions_before(win[0], 300)
     rng = np.random.default_rng(3)
@@ -224,7 +225,8 @@ def index_inputs(sym, kind, known, eff_date, base=50.0, beta=1.5, borrow=None, s
     bars = {(sym, "5m"): i_s, (sym, "1d"): combine_daily(hist_s, i_s),
             ("SPY", "5m"): i_spy, ("SPY", "1d"): combine_daily(hist_spy, i_spy)}
     eff_open = CAL.open_close(pd.Timestamp(eff_date))[0]
-    evs = [ev(kind, sym, known, eff=eff_open, index="SP500", effective_date=pd.Timestamp(eff_date))]
+    evs = [ev(kind, sym, known, eff=eff_open, index="SP500", effective_date=pd.Timestamp(eff_date),
+              announce_source=announce_source)]
     b = borrow if borrow is not None else ({sym: (True, fee)} if fee is not None else None)
     return make_factory(bars, evs, borrow=b), win
 
@@ -237,7 +239,7 @@ def test_synthetic_s043_after_hours_announcement():
     h = o[o["tag"] == "hedge"].iloc[0]
     t_open = CAL.open_close(win[0])[0]
     assert pd.Timestamp(ent["submitted_at"]) == t_open and ent["quantity"] == 2000      # 10% NAV / $50
-    assert h["quantity"] == -round(1.5 * 2000 * 50.0 / 400.0)                           # beta 1.5 hedge
+    assert abs(h["quantity"] + 1.5 * 2000 * 50.0 / 400.0) <= 1                        # beta 1.5 hedge (floored)
     fe = fill_of(res, ent)
     assert pd.Timestamp(fe["ts"]) == t_open and fe["price"] == pytest.approx(50.5)
     ex = o[o["tag"] == "exit"].iloc[0]
@@ -337,10 +339,11 @@ def test_synthetic_s045_trigger_trailing_and_time_exit():
     assert stops.iloc[0]["stop_price"] == pytest.approx(36.0)               # initial: 40 - 2 x 2
     assert stops["stop_price"].iloc[-1] > 36.0                              # ratcheted from the highest high
     assert (np.diff(stops["stop_price"].to_numpy()) >= -1e-9).all()
-    ex = o[o["tag"] == "time_exit"].iloc[0]
+    ex = o[o["tag"] == "time_exit"].iloc[0]                  # holding convention: exactly 10 sessions
     exit_sess = CAL.next_session(pd.Timestamp("2024-03-04"), 10)
-    assert ex["type"] == "MOC" and pd.Timestamp(ex["submitted_at"]) == CAL.open_close(exit_sess)[0]
-    assert pd.Timestamp(fill_of(res, ex)["ts"]) == CAL.open_close(exit_sess)[1]
+    assert ex["type"] == "MKT"
+    assert pd.Timestamp(ex["submitted_at"]) == CAL.open_close(CAL.prev_session(exit_sess))[1]
+    assert pd.Timestamp(fill_of(res, ex)["ts"]) == CAL.open_close(exit_sess)[0]
     assert list(res.trades["exit_reason"]) == ["time_exit"]
 
 
@@ -427,3 +430,108 @@ def test_smoke_run_backtest(sid):
     assert res.status == RunStatus.OK
     assert res.diagnostics["lookahead_guard_violations"] == 0
     assert len(res.fills) > 0
+
+
+# ======================================================================= red-team follow-ups
+def test_s043_s044_fallback_announcements_skipped_not_testable():
+    for cls, kind in ((CE.S043, "INDEX_ADD"), (CE.S044, "INDEX_DEL")):
+        make, win = index_inputs("XCO", kind, "2024-03-01 17:15", "2024-03-18", base=30.0, beta=1.0,
+                                 announce_source="fallback_prev_session")
+        st = cls()
+        res = run(st, make(), win[0], win[-1])
+        assert len(orders(res)) == 0
+        assert st.st["seen"] == st.st["skipped_fallback"] == 1
+        if res.status == RunStatus.NOT_TESTABLE:              # engine calls Strategy.on_run_end
+            assert "announcement" in res.not_testable_reason
+        else:
+            assert any("skipped" in l["msg"] for l in res.diagnostics["logs"])
+            with pytest.raises(NotTestableError):
+                st.on_run_end(None)
+
+
+def test_s043_batch_gross_cap_counts_pending():
+    win = sess("2024-03-04", "2024-03-06")
+    bars, evs = {}, []
+    for i in range(6):
+        make_i, _ = index_inputs(f"AD{i}", "INDEX_ADD", "2024-03-01 17:15", "2024-03-06", beta=1.0)
+        p = make_i()
+        bars.update(p._bars)
+        evs += p._events
+    res = run(CE.S043(), EventPortal(bars=bars, events=evs), win[0], win[-1])
+    f = res.fills
+    f0 = f[pd.DatetimeIndex(f["ts"]) == CAL.open_close(win[0])[0]]
+    marks = {s: 50.0 for s in f0["symbol"]}
+    marks["SPY"] = 400.0
+    assert float(sum(abs(q) * marks[s] for s, q in zip(f0["symbol"], f0["quantity"]))) <= 1_000_000 * 1.0001
+    assert (orders(res)["tag"] == "entry").sum() == 5               # 5 x (10% + 10% hedge) = 100%
+
+
+def s038_payload_inputs(payloads):
+    syms = [f"P{i:02d}" for i in range(len(payloads))]
+    ss = sess("2024-01-02", "2024-04-30")
+    bars = {(s, "1d"): daily_frame(ss, np.full(len(ss), 50.0)) for s in syms}
+    evs = [ev("EARNINGS", s, "2024-03-05 08:00", timing="BMO", **pl) for s, pl in zip(syms, payloads)]
+    return make_factory(bars, evs, {"SP500": syms}), syms
+
+
+def _base_payload(i, n, **kw):
+    est_k = pd.Timestamp("2024-03-01", tz="UTC")
+    d = dict(eps_estimate=1.0, estimate_known_at=est_k, estimate_source="dolthub_eps_estimate",
+             estimate_fidelity=1, fiscal_period="Q1", figure_quarters=1, eps_actual_basis="street",
+             eps_actual_street=1.0 + (i - (n - 1) / 2) / 10.0, eps_actual_gaap=0.5, eps_actual=1.0, source="ziplime")
+    d.update(kw)
+    return d
+
+
+def test_s038_uses_street_actual_not_gaap_or_annual():
+    n = 12
+    pls = [_base_payload(i, n) for i in range(n)]
+    # top name by street EPS; its GAAP/annual 'eps_actual' (12.09 style) must not matter
+    pls[-1].update(fiscal_period="FY", figure_quarters=4, eps_actual_gaap=12.09, eps_actual=1.55)
+    make, syms = s038_payload_inputs(pls)
+    res = run(CE.S038(min_pool=5), make(), "2024-03-04", "2024-03-08")
+    ent = orders(res)
+    ent = ent[ent["tag"] == "entry"].set_index("symbol")["quantity"]
+    assert ent[syms[-1]] > 0 and ent[syms[0]] < 0                 # ranked on street EPS
+
+
+def test_s038_skips_without_street_unless_gaap_fallback_quarterly():
+    n = 12
+    pls = [_base_payload(i, n) for i in range(n)]
+    for i, pl in enumerate(pls):
+        pl.update(eps_actual_street=float("nan"), eps_actual_basis="gaap", eps_actual_gaap=1.0 + (i - 5.5) / 10.0)
+    pls[-1].update(fiscal_period="FY", figure_quarters=4, eps_actual_gaap=12.09)   # annual: never used
+    make, syms = s038_payload_inputs(pls)
+    res = run(CE.S038(min_pool=5), make(), "2024-03-04", "2024-03-08")
+    assert len(orders(res)) == 0
+    assert any("street" in l["msg"] for l in res.diagnostics["logs"])
+    res2 = run(CE.S038(min_pool=5, gaap_fallback=True), make(), "2024-03-04", "2024-03-08")
+    ent = orders(res2)
+    ent = set(ent[ent["tag"] == "entry"]["symbol"])
+    assert syms[-1] not in ent and syms[-2] in ent and syms[0] in ent
+    assert any("GAAP" in r["reason"] for r in res2.fidelity["reasons"])
+
+
+def test_s038_posthoc_consensus_opt_in_flags():
+    n = 12
+    pls = [_base_payload(i, n, estimate_fidelity=2, estimate_source="dolthub_eps_history",
+                         estimate_reason="consensus recorded post hoc; revisions not PIT") for i in range(n)]
+    make, syms = s038_payload_inputs(pls)
+    assert len(orders(run(CE.S038(min_pool=5), make(), "2024-03-04", "2024-03-08"))) == 0
+    res = run(CE.S038(min_pool=5, posthoc_consensus=True), make(), "2024-03-04", "2024-03-08")
+    assert (orders(res)["tag"] == "entry").any()
+    assert any("post hoc" in r["reason"] for r in res.fidelity["reasons"])
+
+
+def test_s038_long_basket_never_exceeds_half_nav():
+    n = 200
+    est_k = pd.Timestamp("2024-02-20", tz="UTC")
+    syms = [f"G{i:03d}" for i in range(n)]
+    ss = sess("2024-01-02", "2024-04-30")
+    bars = {(s, "1d"): daily_frame(ss, np.full(len(ss), 50.0)) for s in syms}
+    evs = [ev("EARNINGS", s, "2024-03-05 08:00", eps_actual=1.0 + (i - 99.5) / 100.0, eps_estimate=1.0,
+              estimate_known_at=est_k, timing="BMO") for i, s in enumerate(syms)]
+    res = run(CE.S038(min_pool=20, pct=0.20), make_factory(bars, evs, {"SP500": syms})(), "2024-03-05", "2024-03-06")
+    f = res.fills
+    assert float((f["quantity"].clip(lower=0) * f["price"]).sum()) <= 0.5e6 * 1.0001
+    assert float((-f["quantity"].clip(upper=0) * f["price"]).sum()) <= 0.5e6 * 1.0001
