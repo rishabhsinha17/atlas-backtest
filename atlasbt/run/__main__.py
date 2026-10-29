@@ -215,6 +215,15 @@ def cmd_final(a) -> int:
     return 0
 
 
+def cmd_retier(a) -> int:
+    from .retier import retier_dir
+
+    log = Logger(Path(a.results_dir) / "logs" / "retier.log")
+    out = retier_dir(Path(a.results_dir), a.label, refinalize=not a.no_refinalize, log=log)
+    log(f"retier: {len(out)} results re-tiered with {a.label}")
+    return 0
+
+
 def cmd_launch(a) -> int:
     from .worktree import launch
 
@@ -306,6 +315,9 @@ def main(argv=None) -> int:
     fp.add_argument("--skip-extended", action="store_true")
     fp.add_argument("--allow-live-tree", action="store_true")
     fp.add_argument("--allow-stock-universes", action="store_true", default=True)
+    rt = sub.add_parser("retier", help="re-tier stored fills with the engine's reason->tier mapping, re-finalize")
+    rt.add_argument("--label", required=True, help="engine commit providing the mapping, e.g. dd5e315")
+    rt.add_argument("--no-refinalize", action="store_true")
     lp = sub.add_parser("launch", help="run any subcommand detached from a clean pinned git worktree")
     lp.add_argument("--commit", default="HEAD")
     lp.add_argument("--no-overlay", action="store_true",
@@ -317,7 +329,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     a.results_dir = Path(a.results_dir)
     return {"plan": cmd_plan, "run": cmd_run, "atlas": cmd_atlas, "audit": cmd_audit,
-            "replicate": cmd_replicate, "launch": cmd_launch, "final": cmd_final}[a.cmd](a)
+            "replicate": cmd_replicate, "launch": cmd_launch, "final": cmd_final,
+            "retier": cmd_retier}[a.cmd](a)
 
 
 if __name__ == "__main__":
