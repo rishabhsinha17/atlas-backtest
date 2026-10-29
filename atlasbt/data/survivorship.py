@@ -48,23 +48,26 @@ def _listed_now(portal) -> set:
     return portal._cache[key]
 
 
-def delisting_for(portal, symbol: str):
-    """-> (ex_date naive, known_at UTC, last_close) or None."""
-    key = ("delist", symbol.upper())
+def delisting_for(portal, symbol: str, ident=None):
+    """-> (ex_date naive, known_at UTC, last_close) or None. The identity's verified series ends
+    (merger / bankruptcy / take-private) more than 10 sessions before the latest session and the
+    ticker is not listed today (or now belongs to another company)."""
+    b = ident if ident is not None else portal._identity_frame(symbol)
+    sid = b.attrs.get("security_id") if hasattr(b, "attrs") else None
+    key = ("delist", symbol.upper(), sid)
     if key in portal._cache:
         return portal._cache[key]
     res = None
     latest = _latest_market_session(portal)
     listed = _listed_now(portal)
-    b = portal._daily_frame(symbol)
     if len(b) and not str(b.attrs.get("source", "")).startswith("cboe") and latest is not None and listed:
-        if True:
-            last = frames.to_naive_date(b.index)[-1]
-            sch = frames.schedule()
-            gap = int(((sch.index > last) & (sch.index <= latest)).sum())
-            if gap > 10 and symbol.upper() not in listed:
-                nxt = sch.index[sch.index.searchsorted(last, side="right")]
-                res = (nxt, b["known_at"].iloc[-1], float(b["close"].iloc[-1]))
+        last = frames.to_naive_date(b.index)[-1]
+        sch = frames.schedule()
+        gap = int(((sch.index > last) & (sch.index <= latest)).sum())
+        still_same = symbol.upper() in listed and sid and sid.startswith("TKR:")
+        if gap > 10 and not still_same:
+            nxt = sch.index[sch.index.searchsorted(last, side="right")]
+            res = (nxt, b["known_at"].iloc[-1], float(b["close"].iloc[-1]))
     portal._cache[key] = res
     return res
 
@@ -79,7 +82,7 @@ def membership_coverage(portal) -> pd.DataFrame:
         sym = r.get("yahoo") or str(r["base"]).replace(".", "-")
         start = pd.Timestamp(r["start"])
         end = pd.Timestamp(r["end"]) if pd.notna(r["end"]) else latest
-        b = portal._daily_frame(sym)
+        b = portal._daily_frame(sym, min(end, latest) if end is not None and latest is not None else start)
         src = b.attrs.get("source")
         first = last = None
         cov = 0.0
@@ -95,28 +98,56 @@ def membership_coverage(portal) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def universe_bias_report(portal, name: str, as_of) -> dict:
+def universe_bias_report(portal, name: str, as_of, window: int = 20) -> dict:
+    """Survivorship / coverage report (red-team #5, #13).
+
+    SP500 (and every universe derived from it, e.g. SP500_TOP50_DV): members at as_of whose
+    identity-verified series has a bar on the session (or within the 3 previous sessions) count as
+    covered; `stale` lists members whose last bar is 1-3 sessions old; `member_session_coverage` is
+    the share of (member, session) pairs over the trailing `window` sessions that have a bar.
+    Derived universes inherit the base coverage: they rank only members WITH data, so the bias is
+    the base universe's. Fixed ETF lists: no survivorship issue (members without listing history at
+    as_of are excluded)."""
     as_of = pd.Timestamp(as_of)
     as_of = as_of.tz_localize("UTC") if as_of.tzinfo is None else as_of
     n = name.upper()
-    if n not in ("SP500", "S&P500", "SPX_MEMBERS"):
+    base = "SP500" if n in ("SP500", "S&P500", "SPX_MEMBERS") or n.startswith("SP500") else None
+    if base is None:
         members = portal.universe(n, as_of)
         return {"universe": n, "as_of": str(as_of), "members": len(members), "with_data": len(members),
-                "coverage": 1.0, "survivorship_bias": False,
+                "coverage": 1.0, "survivorship_bias": False, "fidelity": int(Fidelity.T1_BAR),
                 "note": "fixed ETF list; members without listing history at as_of are excluded"}
     members = portal.universe("SP500", as_of)
     d = as_of.tz_convert("America/New_York").tz_localize(None).normalize()
-    have, missing = [], []
+    sch = frames.schedule().index
+    past = sch[sch <= d]
+    win = past[-window:]
+    recent = past[-4:]
+    have, missing, stale = [], [], []
+    pairs = covered = 0
     for s in members:
-        b = portal._daily_frame(s)
-        ok = False
-        if len(b):
-            dd = frames.to_naive_date(b.index)
-            ok = len(dd) > 0 and dd[0] <= d and dd[-1] >= d - pd.Timedelta(days=10)
-        (have if ok else missing).append(s)
+        b = portal._daily_frame(s, d)
+        dd = frames.to_naive_date(b.index) if len(b) else pd.DatetimeIndex([])
+        inwin = dd[(dd >= win[0]) & (dd <= d)] if len(dd) else dd
+        pairs += len(win)
+        covered += len(set(inwin) & set(win))
+        if len(dd) and dd[dd <= d].size and dd[dd <= d][-1] >= recent[0]:
+            have.append(s)
+            if dd[dd <= d][-1] < past[-1]:
+                stale.append(s)
+        else:
+            missing.append(s)
     cov = len(have) / max(len(members), 1)
-    return {"universe": "SP500", "as_of": str(as_of), "members": len(members), "with_data": len(have),
-            "coverage": round(cov, 4), "missing": missing, "survivorship_bias": cov < 0.999,
-            "fidelity": int(Fidelity.T1_BAR if cov >= 0.999 else Fidelity.T2_PROXY),
-            "note": ("members without price data are typically delisted/acquired names absent from Yahoo; "
-                     "cross-sectional results on this universe are biased toward survivors")}
+    rep = {"universe": "SP500", "as_of": str(as_of), "members": len(members), "with_data": len(have),
+           "coverage": round(cov, 4), "missing": missing, "stale": stale,
+           "member_session_coverage": round(covered / max(pairs, 1), 4),
+           "survivorship_bias": bool(cov < 0.999),
+           "fidelity": int(Fidelity.T1_BAR if cov >= 0.999 else Fidelity.T2_PROXY),
+           "note": ("members whose security identity / prices cannot be established are missing (fail "
+                    "closed); results on this universe are biased toward survivors")}
+    if n != "SP500" and n not in ("S&P500", "SPX_MEMBERS"):
+        derived = portal.universe(n, as_of)
+        rep.update({"universe": n, "base_universe": "SP500", "derived_members": len(derived),
+                    "base_coverage": rep["coverage"],
+                    "note": "derived from SP500 members WITH data: inherits the base universe's survivorship bias"})
+    return rep

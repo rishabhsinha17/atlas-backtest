@@ -123,6 +123,11 @@ def parse_daily(symbol: str, h: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
             rows.append(_action_row(symbol, ActionType.SPECIAL_DIVIDEND, d, amount=float(amt) * fac,
                                     yahoo_amount=float(amt), sch=sch, note="capital gains distribution"))
     acts = pd.DataFrame(rows)
+    if len(acts):
+        from ..actions_classify import classify
+        acts = classify(symbol, acts, bars)       # spin-offs / special dividends (red-team #9)
+        for note in acts["classify_note"].dropna():
+            log.info("yahoo %s action reclassified: %s", symbol, note)
     info = {"rows": len(bars), "dropped_non_sessions": [str(x.date()) for x in dropped],
             "first": str(bars.index[0]) if len(bars) else None,
             "last": str(bars.index[-1]) if len(bars) else None}
@@ -224,10 +229,16 @@ def parse_intraday(symbol: str, h: pd.DataFrame, interval: str,
     if store is not None:
         acts = store.read("actions", SOURCE, symbol)
         if len(acts):
-            sp = acts[acts["type"] == ActionType.SPLIT.value]
+            # Yahoo's own adjustment factors (splits AND spin-offs encoded as splits)
+            if "adj_factor" in acts.columns:
+                sp = acts[acts["adj_factor"].notna()]
+                ratios = sp["adj_factor"].to_numpy(dtype=float)
+            else:
+                sp = acts[acts["type"] == ActionType.SPLIT.value]
+                ratios = sp["ratio"].to_numpy(dtype=float)
             if len(sp):
                 d = frames.to_naive_date(bars.index)
-                f = split_factor_after(d, pd.DatetimeIndex(sp["ex_date"]), sp["ratio"].to_numpy())
+                f = split_factor_after(d, pd.DatetimeIndex(sp["ex_date"]), ratios)
                 if (f != 1).any():
                     for c in ("open", "high", "low", "close"):
                         bars[c] = bars[c].to_numpy() * f

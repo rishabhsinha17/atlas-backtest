@@ -28,7 +28,12 @@ class DataPortal(Protocol):
     # ---- reference
     def instrument(self, symbol: str) -> Instrument: ...
     def security_master(self, as_of: pd.Timestamp) -> pd.DataFrame: ...
-    def universe(self, name: str, as_of: pd.Timestamp) -> list[str]: ...
+    def universe(self, name: str, as_of: pd.Timestamp) -> list[str]:
+        """PIT members as the ticker used AT as_of (e.g. 'FISV', 'UTX')."""
+        ...
+    def security_id(self, symbol: str, as_of: pd.Timestamp) -> Optional[str]:
+        """Stable identity (CIK-based) of the security that `symbol` denoted at as_of."""
+        ...
 
     # ---- prices
     def bars(self, symbol: str, freq: str, start: pd.Timestamp, end: pd.Timestamp,
@@ -36,7 +41,9 @@ class DataPortal(Protocol):
              sessions: Sequence[str] = ("RTH",)) -> pd.DataFrame:
         """Bars with start in [start, end) AND known_at <= as_of.
         adjusted=True -> split & dividend adjusted using only actions with
-        ex_date <= as_of (total-return style back-adjustment). Raw otherwise."""
+        ex_date <= as_of (total-return style back-adjustment). Raw otherwise.
+        FAIL-CLOSED: raises DataUnavailableError for sessions whose security identity
+        cannot be verified; attrs['identity_log'] documents accepted/rejected segments."""
         ...
 
     def quotes(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp,

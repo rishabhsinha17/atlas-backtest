@@ -56,3 +56,12 @@ def test_risk_free_rate_info_fallback_flagged(store, portal):
     # every series stale (> 10 days): freshest value returned, flagged T2
     r, sid, fid, obs = portal.risk_free_rate_info(utc("2024-02-15"), "1M")
     assert fid == Fidelity.T2_PROXY and obs == pd.Timestamp("2024-01-09") and sid == "DTB3"
+
+
+def test_fed_holiday_publication_rule():
+    """H.15 for Fri 2025-10-10 is published Tue 2025-10-14 (Mon is Columbus Day, a Fed holiday while
+    NYSE trades); Veterans Day 2025-11-11 likewise; Saturday holidays are not observed by the Fed."""
+    idx = pd.DatetimeIndex(["2025-10-10", "2025-11-10", "2026-07-02"])
+    ka = fred.known_at_for(idx)
+    assert ka[0] == utc("2025-10-14 20:30") and ka[1] == utc("2025-11-12 21:30")
+    assert ka[2] == utc("2026-07-03 20:30")         # 2026-07-04 is a Saturday: Fri 07-03 is a Fed business day

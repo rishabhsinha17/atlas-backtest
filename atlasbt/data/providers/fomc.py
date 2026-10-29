@@ -33,6 +33,10 @@ CAL_URL = BASE + "/monetarypolicy/fomccalendars.htm"
 HIST_URL = BASE + "/monetarypolicy/fomchistorical{year}.htm"
 
 # Unscheduled/intermeeting statements with widely reported release times (ET). T2.
+# 1994 statements (first year of announced policy changes): times from the Gurkaynak-Sack-Swanson
+# (2005) intraday event table, not printed on the Fed pages -> T2 with source note.
+GSS_1994 = {"1994-02-04": "11:05", "1994-03-22": "14:20", "1994-04-18": "10:06", "1994-05-17": "14:26",
+            "1994-08-16": "13:18", "1994-11-15": "14:20"}
 MANUAL_TIMES = {
     "1998-10-15": "15:15", "2001-01-03": "13:13", "2001-04-18": "10:54", "2001-09-17": "08:20",
     "2007-08-10": "09:15", "2007-08-17": "08:15", "2008-01-22": "08:20", "2008-10-08": "07:00",
@@ -41,7 +45,7 @@ MANUAL_TIMES = {
     "2011-04-27": "12:30", "2011-06-22": "12:30", "2011-11-02": "12:30", "2012-01-25": "12:30",
     "2012-04-25": "12:30", "2012-06-20": "12:30", "2012-09-13": "12:30", "2012-12-12": "12:30",
 }
-UNSCHEDULED = {"1998-10-15", "2001-01-03", "2001-04-18", "2001-09-17", "2007-08-10", "2007-08-17",
+UNSCHEDULED = {"1994-04-18", "1998-10-15", "2001-01-03", "2001-04-18", "2001-09-17", "2007-08-10", "2007-08-17",
                "2008-01-22", "2008-10-08", "2020-03-03", "2020-03-15"}
 _TIME_RE = re.compile(r"for\s+release\s+at\s+(\d{1,2}):(\d{2})\s*([ap])\.?\s*m", re.I)
 
@@ -106,6 +110,8 @@ def fetch_fomc(store: Optional[ParquetStore] = None, first_year: int = 1994) -> 
             src = "page" if t else None
         except FetchError as e:
             log.warning("fomc statement %s: %s", u, e)
+        if t is None and d in GSS_1994:
+            t, src = GSS_1994[d], "gss_2005_table"
         if t is None and d in MANUAL_TIMES:
             t, src = MANUAL_TIMES[d], "manual_unscheduled"
         if t is None:

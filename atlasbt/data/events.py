@@ -14,6 +14,9 @@ EARNINGS_SCHEDULE   DoltHub calendar entries as *expected* dates: known_at = 7 c
 EARNINGS_RELEASE    SEC submissions 8-K Item 2.02 acceptance times (per-symbol fetch).
 INDEX_ADD/INDEX_DEL S&P 500 changes (providers/sp500.py).
 FOMC                statement releases (providers/fomc.py).
+FOMC_SCHEDULE       scheduled statements as known in advance: effective_at = statement time,
+                    known_at = statement date - 30 days (conservative; calendars are published
+                    ~1 year ahead) -> T2_PROXY.
 """
 from __future__ import annotations
 
@@ -52,6 +55,19 @@ def load_events(portal, kind: str, symbols: Optional[Iterable[str]], start, end)
         return _window(_sym_filter(df, symbols), start, end)
     if k == "FOMC":
         return _window(portal._read("events", "fomc", "FOMC"), start, end)
+    if k == "FOMC_SCHEDULE":
+        f = portal._read("events", "fomc", "FOMC")
+        if not len(f):
+            return f
+        f = f[f["scheduled"].astype(bool)].copy()
+        # the Fed publishes meeting calendars ~a year ahead; we do not have the publication date
+        # of each calendar, so conservatively assume the date was known 30 days before
+        f["effective_at"] = f["known_at"]
+        f["known_at"] = [et(pd.Timestamp(d) - pd.Timedelta(days=30), "00:00") for d in f["date"]]
+        f["kind"] = "FOMC_SCHEDULE"
+        f["fidelity"] = int(Fidelity.T2_PROXY)
+        f["known_at_rule"] = "statement date - 30 calendar days (conservative assumption)"
+        return _window(f, start, end)
     if k == "EARNINGS_RELEASE":
         syms = symbols or [s.replace("EARNINGS_RELEASE_", "") for s in st.symbols("events", "sec")
                            if s.startswith("EARNINGS_RELEASE_")]

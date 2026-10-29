@@ -207,6 +207,33 @@ def task_ohlcv_bulk(symbols=None):
     return [dolthub_bulk.load_ohlcv_csv(os.environ["ATLASBT_OHLCV_CSV"], symbols or _bulk_symbols())]
 
 
+def task_identity(symbols=None):
+    """Build + persist identity-verified daily series for every S&P 500 member interval (resolved
+    at the interval's start, middle and end) and the megacaps."""
+    from .portal import Portal
+    p = Portal()
+    m = default_store().read("reference", "sp500", "membership")
+    jobs = []
+    for r in m.to_dict("records"):
+        t = str(r["base"]).replace(".", "-")
+        s0 = max(pd.Timestamp(r["start"]), pd.Timestamp("1996-01-02"))
+        e0 = pd.Timestamp(r["end"]) if pd.notna(r["end"]) else pd.Timestamp.now().normalize()
+        for d in {s0, s0 + (e0 - s0) / 2, e0 - pd.Timedelta(days=1)}:
+            jobs.append((t, d))
+    jobs += [(s, None) for s in U.MEGACAPS]
+    if symbols:
+        jobs = [j for j in jobs if j[0] in symbols]
+    out = []
+    for i, (t, d) in enumerate(jobs):
+        try:
+            out.append(p.persist_identity(t, d))
+        except Exception as e:
+            log.error("identity %s %s: %s", t, d, e)
+        if i % 200 == 0:
+            log.info("identity %d/%d", i, len(jobs))
+    return out
+
+
 TASKS: dict[str, Callable] = {
     "daily_etf": task_daily_etf, "intraday": task_intraday, "cboe": task_cboe, "fred": task_fred,
     "french": task_french, "sp500": task_sp500, "daily_sp500": task_daily_sp500, "sec": task_sec,
@@ -214,7 +241,7 @@ TASKS: dict[str, Callable] = {
     "nasdaqtrader": task_nasdaqtrader, "borrow": task_borrow, "dukascopy": task_dukascopy,
     "dukascopy_backfill": task_dukascopy_backfill, "options_bulk": task_options_bulk,
     "ohlcv_bulk": task_ohlcv_bulk, "ziplime": task_ziplime, "dolthub_tables": task_dolthub_tables,
-    "iex_sample": task_iex_sample, "hod": task_hod,
+    "iex_sample": task_iex_sample, "hod": task_hod, "identity": task_identity,
 }
 SETS = {
     # time-sensitive first (Yahoo 1m keeps only ~30 days)

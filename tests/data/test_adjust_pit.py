@@ -179,10 +179,57 @@ def test_option_quotes_window(store, portal):
     q = portal.option_quotes(inst, utc("2024-01-03 12:00"), utc("2024-01-05"), as_of=utc("2024-01-05"))
     assert list(q.index) == [utc("2024-01-03 21:00"), utc("2024-01-04 21:00")]
     # (start, end] is open on the left and capped by as_of
-    q = portal.option_quotes(inst, utc("2024-01-03 21:00"), utc("2024-01-05"), as_of=utc("2024-01-04 20:59"))
+    q = portal.option_quotes(inst, utc("2024-01-03 21:00"), utc("2024-01-05"), as_of=utc("2024-01-04 20:59"),
+                             synthetic=False)
     assert q.empty
     q = portal.option_quotes(inst, utc("2024-01-03 21:00"), utc("2024-01-05"), as_of=utc("2024-01-04 21:00"))
     assert list(q.index) == [utc("2024-01-04 21:00")] and q["bid"].iloc[0] == c1["bid"].iloc[0]
+
+
+def test_option_quotes_synthetic_fallback_never_mixed(store, portal, monkeypatch):
+    import json
+    from atlasbt.data.providers import dolthub
+    from atlasbt.options import marking
+    from .conftest import FIX
+    rows = json.load(open(FIX / "dolthub_option_chain_SPY_20240103.json"))["rows"]
+    c1 = dolthub.parse_option_rows(rows)
+    store.write("option_chain", "dolthub", "SPY", c1, partition="year", time_col="ts", key=["ts", "symbol"])
+    inst = portal.instrument(c1["symbol"].iloc[0])
+    calls = []
+
+    def fake(instrument, start, end, as_of, portal_, real_first=True, **kw):
+        calls.append(real_first)
+        f = pd.DataFrame({"bid": [1.0], "ask": [1.2], "fidelity": [int(Fidelity.T3_MODELED)]},
+                         index=pd.DatetimeIndex([utc("2024-01-08 21:00")], name="ts"))
+        f.attrs.update(fidelity=Fidelity.T3_MODELED, synthetic=True)
+        return f
+    monkeypatch.setattr(marking, "synthetic_option_quotes", fake)
+    real = portal.option_quotes(inst, utc("2024-01-03 12:00"), utc("2024-01-05"), as_of=utc("2024-01-05"))
+    assert len(real) and not calls and not real.attrs.get("synthetic")       # real rows -> no synthesis
+    syn = portal.option_quotes(inst, utc("2024-01-05"), utc("2024-01-09"), as_of=utc("2024-01-09"))
+    assert calls == [False] and syn.attrs["synthetic"] and (syn["fidelity"] == int(Fidelity.T3_MODELED)).all()
+    assert portal.option_quotes(inst, utc("2024-01-05"), utc("2024-01-09"), as_of=utc("2024-01-09"),
+                                synthetic=False).empty
+
+
+def test_options_has_honours_freq(store, portal):
+    import json
+    from atlasbt.data.providers import dolthub
+    from .conftest import FIX
+    rows = json.load(open(FIX / "dolthub_option_chain_SPY_20240103.json"))["rows"]
+    store.write("option_chain", "dolthub", "SPY", dolthub.parse_option_rows(rows), partition="year",
+                time_col="ts", key=["ts", "symbol"])
+    assert portal.has("SPY", "options", "1d") and portal.has("*", "options", "1d")
+    assert not portal.has("SPY", "options", "1m") and not portal.has("*", "options", "1m")
+    assert portal.fidelity_of("SPY", "options", "1m") == Fidelity.NA
+    assert portal.fidelity_of("SPY", "options", "1d") == Fidelity.T2_PROXY
+    # a timestamped intraday OPRA store (e.g. Databento when keyed) is T0 and honours freq
+    q = pd.DataFrame({"symbol": ["SPY   240119C00470000"], "bid": [1.0], "ask": [1.1],
+                      "ts": [utc("2024-01-03 15:00")], "known_at": [utc("2024-01-03 15:00")]})
+    store.write("option_bars_1m", "databento", "SPY", q, time_col="ts", key=["ts", "symbol"])
+    assert portal.has("SPY", "options", "1m") and portal.fidelity_of("SPY", "options", "1m") == Fidelity.T0_QUOTE
+    assert portal.fidelity_of("SPY", "options", "1d") == Fidelity.T2_PROXY
+    assert not portal.has("QQQ", "options", "1m") and portal.fidelity_of("QQQ", "options", "1m") == Fidelity.NA
 
 
 def test_lookahead_perturbation_bars(store):
@@ -369,3 +416,15 @@ def test_earnings_gaap_vs_street_eps(store, portal):
     assert p["eps_actual_basis"] == "street" and p["eps_actual"] == p["eps_actual_street"]
     assert p["eps_estimate"] == 1.93 and p["estimate_fidelity"] == 2         # final consensus, post hoc
     assert p["estimate_reason"] == "consensus recorded post hoc; revisions not PIT"
+
+
+def test_fundamentals_ignore_future_period_end(store, portal):
+    """A fact tagged with a period_end far after its filing (mis-tagged XBRL context) must not
+    become 'the latest period' and block newer filings."""
+    f = pd.DataFrame({"symbol": "X", "field": "shares_outstanding", "value": [1.0, 2.0],
+                      "period_end": pd.to_datetime(["2027-07-17", "2026-09-30"]), "period_start": pd.NaT,
+                      "known_at": [utc("2026-07-23 20:00"), utc("2026-10-25 20:00")], "source": "sec",
+                      "accn": ["a1", "a2"]})
+    store.write("fundamentals", "sec", "X", f, key=["field", "period_start", "period_end", "accn"])
+    r = portal.fundamentals(["X"], ["shares_outstanding"], utc("2026-10-28"))
+    assert r["value"].iloc[0] == 2.0 and r["period_end"].iloc[0] == pd.Timestamp("2026-09-30")

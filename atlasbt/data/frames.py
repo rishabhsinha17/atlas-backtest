@@ -104,9 +104,23 @@ def intraday_bars(df: pd.DataFrame, freq: str, extra_cols: tuple[str, ...] = ())
             out[c] = pd.to_numeric(df[c], errors="coerce").to_numpy()
     out["session"] = tag_sessions(out.index)
     out = out[out["session"] != ""]
-    out["known_at"] = out.index + freq_to_timedelta(freq)
-    # an RTH bar cannot be known after the session close on early-close days etc.
+    out["known_at"] = cap_known_at(out.index, out["session"].to_numpy(), freq_to_timedelta(freq))
     return out[~out.index.duplicated(keep="last")].sort_index()
+
+
+def cap_known_at(start: pd.DatetimeIndex, session: np.ndarray, length: pd.Timedelta) -> pd.DatetimeIndex:
+    """known_at = bar end, but an RTH bar is complete at the session close at the latest
+    (Yahoo 60m 15:30-16:00 bar -> 16:00 not 16:30; 12:30 bar on half days -> 13:00)."""
+    st = pd.DatetimeIndex(start).tz_convert("UTC").as_unit("ns")
+    end = st + length
+    closes = pd.DatetimeIndex(schedule().reindex(to_naive_date(st))["close"].to_numpy())
+    closes = (closes.tz_localize("UTC") if closes.tz is None else closes.tz_convert("UTC")).as_unit("ns")
+    rth = np.asarray(session) == "RTH"
+    over = rth & ~pd.isna(closes) & (end > closes)
+    out = end.to_series(index=range(len(end)))
+    out[over] = closes[over]
+    return pd.DatetimeIndex(out.to_numpy()).tz_localize("UTC") if pd.DatetimeIndex(out.to_numpy()).tz is None \
+        else pd.DatetimeIndex(out.to_numpy())
 
 
 def empty_bars() -> pd.DataFrame:

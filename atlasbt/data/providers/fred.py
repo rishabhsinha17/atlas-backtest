@@ -4,10 +4,11 @@ Stored raw (percent units as published) in rates/fred/<ID> with columns
 value (percent), known_at.  Conversion to the engine's convention happens in
 atlasbt.data.rates (see DTB3 discount -> money-market yield).
 
-PIT: H.15 daily rates for date d are published the next business day (~16:15 ET);
-EFFR (DFF) is published by the NY Fed ~09:00 ET next business day. We use one
-conservative rule for all daily series: known_at = 16:30 ET of the next NYSE
-session after d. Monthly macro series (CPI) are not used for trading signals here;
+PIT: H.15 daily rates for date d are published the next Federal Reserve business day
+(~16:15 ET; Fed holidays incl. Columbus & Veterans Day, Sunday holidays observed Monday,
+Saturday holidays not observed); EFFR (DFF) is published by the NY Fed ~09:00 ET next
+business day. One conservative rule for all daily series: known_at = 16:30 ET of the next
+Fed business day after d. Monthly macro series (CPI) are not used for trading signals here;
 their real release lag (~2 weeks) is NOT modelled -> known_at = period start + 45d
 (conservative), flagged T2. FRED serves the latest vintage (revisions not PIT;
 irrelevant for T-bill/treasury yields, relevant for macro series).
@@ -65,14 +66,63 @@ def parse_csv(series_id: str, content: bytes) -> pd.DataFrame:
     return out
 
 
+def _nth_weekday(y, m, wd, n):
+    d = pd.Timestamp(y, m, 1)
+    d += pd.Timedelta(days=(wd - d.weekday()) % 7)
+    return d + pd.Timedelta(weeks=n - 1)
+
+
+def _last_weekday(y, m, wd):
+    d = pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)
+    return d - pd.Timedelta(days=(d.weekday() - wd) % 7)
+
+
+def fed_holidays(y0: int = 1950, y1: int = 2035) -> set:
+    """Federal Reserve Bank holidays. Fixed-date holidays falling on Sunday are observed Monday;
+    on Saturday they are NOT observed (the Fed stays open the Friday before)."""
+    out = set()
+    for y in range(y0, y1 + 1):
+        fixed = [(1, 1), (7, 4), (11, 11), (12, 25)] + ([(6, 19)] if y >= 2022 else [])
+        for m, d in fixed:
+            t = pd.Timestamp(y, m, d)
+            if t.weekday() == 6:
+                t += pd.Timedelta(days=1)
+            if t.weekday() < 5:
+                out.add(t)
+        if y >= 1986:
+            out.add(_nth_weekday(y, 1, 0, 3))          # MLK
+        out.add(_nth_weekday(y, 2, 0, 3))              # Washington's Birthday
+        out.add(_last_weekday(y, 5, 0))                # Memorial Day
+        out.add(_nth_weekday(y, 9, 0, 1))              # Labor Day
+        out.add(_nth_weekday(y, 10, 0, 2))             # Columbus Day
+        out.add(_nth_weekday(y, 11, 3, 4))             # Thanksgiving
+    return out
+
+
+_FED_HOL: set = set()
+
+
+def next_fed_business_day(d: pd.Timestamp) -> pd.Timestamp:
+    if not _FED_HOL:
+        _FED_HOL.update(fed_holidays())
+    t = pd.Timestamp(d).normalize() + pd.Timedelta(days=1)
+    while t.weekday() >= 5 or t in _FED_HOL:
+        t += pd.Timedelta(days=1)
+    return t
+
+
 def known_at_for(dates: pd.DatetimeIndex, monthly: bool = False) -> pd.DatetimeIndex:
+    """H.15 publishes day-d rates on the next FEDERAL RESERVE business day ~16:15 ET (Columbus and
+    Veterans Day are Fed holidays while NYSE trades) -> known_at = 16:30 ET of that day."""
     if monthly:
         return pd.DatetimeIndex([et(d + pd.Timedelta(days=45), "08:30") for d in dates])
-    sch = frames.schedule()
-    pos = sch.index.searchsorted(dates, side="right")       # next session strictly after d
-    pos = pos.clip(max=len(sch) - 1)
-    nxt = sch.index[pos]
-    return pd.DatetimeIndex([et(d, "16:30") for d in nxt])
+    cache: dict = {}
+    out = []
+    for d in pd.DatetimeIndex(dates):
+        if d not in cache:
+            cache[d] = et(next_fed_business_day(d), "16:30")
+        out.append(cache[d])
+    return pd.DatetimeIndex(out)
 
 
 def fetch_series(series_id: str, store: Optional[ParquetStore] = None, ttl_hours: float = 12) -> dict:

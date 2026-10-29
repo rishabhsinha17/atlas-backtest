@@ -25,7 +25,7 @@ import pandas as pd
 from atlasbt.core.types import ActionType, CorporateAction
 
 PRICE_COLS = ("open", "high", "low", "close", "vwap")
-DIVIDEND_TYPES = (ActionType.CASH_DIVIDEND, ActionType.SPECIAL_DIVIDEND)
+DIVIDEND_TYPES = (ActionType.CASH_DIVIDEND, ActionType.SPECIAL_DIVIDEND, ActionType.SPINOFF)   # SPINOFF: amount = value spun off per share
 
 
 def split_factor_after(dates: pd.DatetimeIndex, split_dates: pd.DatetimeIndex, ratios: np.ndarray) -> np.ndarray:

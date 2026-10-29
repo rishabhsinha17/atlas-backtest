@@ -19,13 +19,23 @@ def ohlc_violations(b: pd.DataFrame) -> pd.Series:
     return hi_bad | lo_bad | nonpos | (b["low"] > b["high"])
 
 
-def bad_ticks(close: pd.Series, k: float = 10.0, min_move: float = 0.25) -> pd.Series:
-    """Spikes: |r_t| large vs rolling MAD AND reversed next bar (|r_t + r_{t+1}| small)."""
+def bad_ticks(close: pd.Series, k: float = 6.0, min_move: float = 0.08, revert: float = 0.25,
+              market: pd.Series | None = None, market_move: float = 0.03) -> pd.Series:
+    """Spike-and-revert glitches: |r_t| > max(k x rolling 60-bar median |r|, min_move) AND the next
+    bar reverses almost all of it (|r_t + r_{t+1}| < revert x |r_t|). Default 6 MADs / 8 % (red-team:
+    DoltHub CB 2014-09-08 -13.6 % whole-bar glitch must be caught). `market` (e.g. SPY closes on the
+    same index): days when the market itself moved > market_move are never flagged (2020-03 crash /
+    rebound days are real)."""
     r = np.log(close).diff()
     mad = r.abs().rolling(60, min_periods=20).median().shift(1)
-    big = (r.abs() > np.maximum(k * mad, min_move))
-    rev = (r + r.shift(-1)).abs() < 0.5 * r.abs()
-    return big & rev
+    big = r.abs() > np.maximum(k * mad.fillna(r.abs().median()), min_move)
+    rev = (r + r.shift(-1)).abs() < revert * r.abs()
+    out = big & rev
+    if market is not None:
+        mr = np.log(market).diff().reindex(r.index)
+        mr1 = mr.shift(-1)
+        out &= ~((mr.abs() > market_move) | (mr1.abs() > market_move)).fillna(False)
+    return out.fillna(False)
 
 
 def calendar_gaps(b: pd.DataFrame) -> pd.DatetimeIndex:
