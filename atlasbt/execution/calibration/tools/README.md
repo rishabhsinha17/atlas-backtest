@@ -9,3 +9,4 @@ Work directory: `$SPREAD_WORK` (default /tmp/spread_work) with `out/` and `dl/`.
     python3 features.py YYYYMMDD ...     # PIT features from DoltHub ohlcv (dl/ohlcv/ohlcv_2016plus.parquet, dl/dolt_2026/*.csv)
     python3 assemble.py nbbo:20260701 iex:20170322 ...   # -> ../nbbo_*.csv.gz, ../iex_*.csv.gz (needs out/ref_master_20260701.txt)
     python -m atlasbt.execution.calibration.build_calibration --oos-days 20260702 --write
+    python3 qlib_xs.py                   # 2000-2010 Yahoo/qlib cross-section -> ../hasbrouck_xs.csv.gz (2000-2005 rows)

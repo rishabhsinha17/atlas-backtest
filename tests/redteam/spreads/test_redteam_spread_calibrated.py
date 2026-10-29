@@ -75,11 +75,12 @@ def test_validation_report_reproducible_from_build_script(build):
     for t, b in shipped_c["beta"].items():
         assert cal["beta"][t] == pytest.approx(b, abs=1e-5)
     assert cal["q"] == pytest.approx(shipped_c["q"], rel=1e-5)
-    assert cal["era_anchors"] == shipped_c["era_anchors"]
+    assert cal["era"] == shipped_c["era"]                    # v2 schema (era_anchors -> era)
     for k in ("in_sample", "holdout_symbols"):
         assert rep[k]["mae_bp"] == pytest.approx(shipped_r[k]["mae_bp"], rel=1e-6)
-    assert rep["oos_days"]["20260702"]["model"]["mae_bp"] == pytest.approx(
-        shipped_r["oos_days"]["20260702"]["model"]["mae_bp"], rel=1e-6)
+    for k in ("time_stability_all_symbols", "oos_symbol_and_day"):        # item 11 relabel
+        assert rep["oos_days"]["20260702"][k]["mae_bp"] == pytest.approx(
+            shipped_r["oos_days"]["20260702"][k]["mae_bp"], rel=1e-6)
 
 
 def test_next_day_oos_is_mostly_symbol_persistence(model):
@@ -136,40 +137,25 @@ def test_jones_2000_djia_level_matches():
     assert 100 * np.mean(per) == pytest.approx(0.181, rel=0.2)
 
 
-def test_furfine_anchor_inputs_use_split_adjusted_prices():
-    """historical_checks.csv feeds XOM/KO at ~$41/$28 on 2001-01-16; their raw closes were ~$87/$61
-    (XOM 2:1 split 2001-07-19, KO 2:1 2012-08-13 are baked into qlib's 'raw' = close/factor). The
-    2001 era level a01 is solved from these rows (brentq on the 7.0c group mean)."""
+def test_furfine_anchor_inputs_are_as_traded():
+    """FIXED (item 2): historical_checks.csv now feeds as-traded 2001 prices (XOM ~$83, KO ~$57 on
+    2001-01-16, atlasbt Yahoo store) and drops 'T' (Yahoo's T history before 2005 is SBC, not old AT&T)."""
     hc = pd.read_csv(CALDIR / "historical_checks.csv")
     post = hc[hc.check == "furfine_2001_post_decimal"].set_index("symbol")
-    assert post.loc["XOM", "prev_close"] < 45 and post.loc["KO", "prev_close"] < 30   # i.e. half the raw price
+    assert post.loc["XOM", "prev_close"] > 75 and post.loc["KO", "prev_close"] > 50
+    assert "T" not in post.index
 
 
-def test_furfine_anchor_shift_when_prices_repaired(build):
-    bc, cal, _ = build
-    center = cal["center"]
-    th = np.array([cal["beta"][t] for t in bc.TERMS] + [cal["c_d"], math.log(cal["q"])])
-    a03, b03 = cal["era_anchors"][2][1], cal["era_anchors"][2][2]
-    hc = pd.read_csv(CALDIR / "historical_checks.csv")
-    hc["etf"] = hc.etf.astype(float)
-    post = hc[hc.check == "furfine_2001_post_decimal"].copy()
-    from scipy.optimize import brentq
-
-    def anchor(df):
-        FX = bc.design(df, center)
-        fp, ftk = df.prev_close.to_numpy(), df.tick.to_numpy()
-        return a03 + brentq(lambda d: float(np.mean(bc.model_half(th, FX, fp, ftk, np.exp(a03 + d + b03 * FX[:, 1]))
-                                                    * 2 * fp * 100)) - 7.0, -3, 3)
-    a_ship = anchor(post)
-    post.loc[post.symbol.isin(["XOM", "KO"]), "prev_close"] *= 2
-    a_fix = anchor(post)
-    assert a_ship == pytest.approx(cal["era_anchors"][0][1], abs=1e-3)
-    assert a_fix - a_ship == pytest.approx(-0.153, abs=0.02)     # 2001-and-earlier latent level -14%
+def test_furfine_post_decimal_check_with_repaired_inputs(build):
+    """After the repair the 2001 level cannot be lowered to hit 7.0c: the monotone era floor (item 1) already
+    gives ~8.0c (+14%); the shipped era keeps the 2003 level for 2001 (no extra 2001 shift)."""
+    _, cal, rep_ = build
+    ck = rep_["historical_checks"]["furfine_2001_post_decimal"]
+    assert 7.0 <= ck["pred_full_cents_mean"] <= 7.0 * 1.25
+    assert rep_["furfine_2001_level"]["delta_vs_2003"] == pytest.approx(0.0, abs=1e-9)
 
 
-@pytest.mark.xfail(strict=True, reason="era b>0 + linear 2003->2010 ramp: at fixed (ADV$, sigma, P) small-cap "
-                                       "spreads RISE 2-4x from 2003 to 2010 (contradicts Hasbrouck 2009 Fig.2, "
-                                       "Knight R2000 median spreads flat/down 2003-07)")
+# FIXED (was xfail strict)
 def test_small_cap_cost_should_not_rise_2003_to_2010_at_fixed_characteristics(model):
     for adv in (5e4, 2e5, 1e6):
         h03, _ = model.half_spread(None, "2003-04-01", 8.0, adv, 0.035, "STK")
@@ -177,17 +163,20 @@ def test_small_cap_cost_should_not_rise_2003_to_2010_at_fixed_characteristics(mo
         assert h03 >= 0.9 * h10
 
 
-def test_era_multiplier_values_pinned(model):
-    """Evidence for the report: era multipliers (latent, vs 2026) at fixed ADV$."""
+def test_era_multiplier_monotone_in_time_and_floored(model):
+    """FIXED (item 1): era(t, ADV$) is non-increasing in t at fixed ADV$ (backward cumulative max), so it is
+    >= 1 before 2010 for every size; below HJM Q5 the size slope is <= 0."""
     m = lambda d, a: float(model.era_multiplier([d], [a])[0])
-    assert m("2003-04-01", 1e5) == pytest.approx(0.27, abs=0.02)
-    assert m("1995-06-01", 1e6) == pytest.approx(0.56, abs=0.02)
-    assert m("2003-04-01", 1e10) == pytest.approx(2.96, abs=0.05)
+    for adv in (5e4, 1e6, 2.17e6, 1e8, 1e10):
+        seq = [m(f"{y}-06-01", adv) for y in range(1993, 2027)]
+        assert all(x >= y - 1e-12 for x, y in zip(seq, seq[1:]))
+        assert min(seq) >= 1.0 - 1e-12
+    for y in ("1995-06-01", "2003-04-01", "2005-06-01"):
+        assert m(y, 5e4) >= m(y, 2.17e6) - 1e-12
 
 
 # ----------------------------------------------------------------------------- (4) tick regimes
-@pytest.mark.xfail(strict=True, reason="SPDRs traded in 1/64 on Amex (SEC Rel. 34-38571); model floors SPY at "
-                                       "1/8 (pre-1997-06-24) / 1/16 (to 2001-01-29)")
+# FIXED (was xfail strict)
 def test_spy_pre_decimal_floor_should_be_one_sixty_fourth(model):
     data = _qlib(["spy"])
     c, raw, vol = data["spy"]
@@ -195,20 +184,19 @@ def test_spy_pre_decimal_floor_should_be_one_sixty_fourth(model):
     sig = np.log(c).diff().rolling(20).std().shift(1)
     m = (c.index >= "2000-02-01") & (c.index < "2001-01-26")
     args = (c.index[m].values, raw.shift(1)[m].values, adv[m].values, sig[m].values, np.ones(m.sum()))
-    h_model, _ = model.half_spread_vec(*args)
+    h_model, _ = model.half_spread_vec(*args, symbol="SPY")      # per-symbol tick schedule (item 5)
     h_164, _ = model.half_spread_vec(*args, tick=1 / 64)
     # currently 2.20 bp vs 0.65 bp (3.4x)
     assert h_model.mean() <= 1.5 * h_164.mean()
 
 
-@pytest.mark.xfail(strict=True, reason="Rule 612 compliance date was 2006-01-31, not 2005-08-29")
+# FIXED (was xfail strict)
 def test_rule_612_compliance_date():
     assert era_tick("2005-10-03", 0.50) == 0.01
 
 
 # ----------------------------------------------------------------------------- (5) edge cases
-@pytest.mark.xfail(strict=True, reason="series() uses the UNADJUSTED prior raw close on a split day "
-                                       "(DailyStats.prior_close is split-adjusted but not passed)")
+# FIXED (was xfail strict)
 def test_split_day_spread_uses_split_adjusted_price(model):
     n = 40
     rng = np.random.default_rng(0)
@@ -222,14 +210,18 @@ def test_split_day_spread_uses_split_adjusted_price(model):
     assert ss.est[30] == pytest.approx(ss.est[31], rel=0.25)
 
 
-def test_stale_or_new_listing_falls_back_to_10bp_default(model):
-    """Evidence: zero ADV, NaN history (IPO first sessions) and zero sigma (stale/halted price) all
-    get the size-blind 10 bp half-spread default, whatever the stock."""
+def test_stale_or_new_listing_no_longer_flat_10bp(model):
+    """FIXED (item 8): no volume -> CS/AR fallback when a CS/AR value exists (else the flagged default);
+    missing / zero sigma (IPO, stale price) -> price-bucket sigma prior; series needs 1 prior session."""
     assert model.half_spread(None, "2024-01-02", 3.0, 0.0, 0.02, "STK") == (0.001, "default")
-    assert model.half_spread(None, "2024-01-02", 3.0, np.nan, np.nan, "STK") == (0.001, "default")
+    h, why = model.half_spread(None, "2024-01-02", 3.0, 0.0, 0.02, "STK", cs_half=0.004)
+    assert h == pytest.approx(0.004) and why.startswith("Corwin-Schultz/Abdi-Ranaldo fallback")
+    h, why = model.half_spread(None, "2024-01-02", 3.0, 2e5, np.nan, "STK")
+    assert "sigma prior" in why and h != 0.001
     c = np.full(40, 4.0)
     ss = model.series(c, c, c, raw_close=c, volume=np.full(40, 1e4), dates=pd.bdate_range("2024-01-02", periods=40))
-    assert ss.src[-1] == "default"
+    assert ss.src[-1].startswith("calibrated") and "sigma prior" in ss.src[-1]
+    assert ss.src[1].startswith("calibrated")          # IPO: second session already priced
 
 
 def test_etf_flag_is_worth_4_to_5x(model):
@@ -241,22 +233,21 @@ def test_etf_flag_is_worth_4_to_5x(model):
     assert 3.5 < r_spy < 4.5 and 4.5 < r_small < 6
 
 
-def test_liquid_high_vol_etfs_overstated(model):
-    """Evidence: in the liquid-ETF regime the sigma elasticity is ~2.0 (0.96-0.49+1.53) and price ~+1.0;
-    in-sample high-priced leveraged/sector ETFs are overstated 2-8x (SOXL 2.7x, SOXX 2.8x, MUU 8.1x)."""
+def test_liquid_etf_sigma_slope_capped(model):
+    """FIXED (item 4): the liquid-ETF sigma elasticity is bounded by the stock slope (constrained refit);
+    SOXL/SOXX/SMH/MUU are no longer overstated 2-8x."""
+    b = model.cal["beta"]
+    assert b["ls"] + b["e_ls"] + b["e_s_ls"] <= b["ls"] + 1e-9 and b["e_ls"] <= 0
     from atlasbt.execution.calibration.build_calibration import load, prepare
     nb = prepare(load("nbbo", "20260701")).set_index("symbol")
-    ratios = {}
     for s in ("SOXL", "SOXX", "SMH", "MUU"):
         r = nb.loc[s]
         h, _ = model.half_spread(s, "2026-07-01", r.prev_close, r.adv_dollar, r.sigma, "ETF")
-        ratios[s] = 1e4 * h / r.tw_hs_bp
-    assert min(ratios.values()) > 2.0
+        assert 0.3 < 1e4 * h / r.tw_hs_bp < 1.5, s
 
 
 # ----------------------------------------------------------------------------- (6) monotonicity
-@pytest.mark.xfail(strict=True, reason="liquid-ETF logistic regime (e_s_ls, e_s_lp) makes the ETF spread RISE "
-                                       "with ADV$ across the $100M knot for high-price/high-vol ETFs")
+# FIXED (was xfail strict)
 def test_etf_spread_monotone_decreasing_in_adv():
     m = CalibratedSpreadModel(CalibratedSpreadConfig(tick_floor=False))
     advs = np.exp(np.linspace(np.log(1e6), np.log(1e9), 300))
@@ -283,11 +274,10 @@ def test_tod_close_narrower_replicates_next_day_for_stocks():
     assert p[0] > 3.5 and p[-1] < 0.6
 
 
-@pytest.mark.xfail(strict=True, reason="'liquid' profile is stock-dominated (1104 of 1411); liquid ETFs are "
-                                       "~1.9x at the open and ~0.97x at the close, not 4.3x / 0.51x")
+# FIXED (was xfail strict)
 def test_tod_profile_fits_liquid_etfs(model):
     p = _bucket_profile("20260702", etf_only=True)
-    shipped_open = model.tod_multiplier(0, 390, 1e10)
-    shipped_close = model.tod_multiplier(388, 2, 1e10)
+    shipped_open = model.tod_multiplier(0, 390, 1e10, "ETF")       # liquid-ETF profile (item 7)
+    shipped_close = model.tod_multiplier(388, 2, 1e10, "ETF")
     assert shipped_open == pytest.approx(p[0], rel=0.3)
     assert shipped_close == pytest.approx(p[-1], rel=0.3)

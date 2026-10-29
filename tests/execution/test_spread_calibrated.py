@@ -28,7 +28,8 @@ def _hand(price, adv, sigma, etf, date, tick, mult=None):
     terms = {"1": 1.0, "la": la, "ls": ls, "lp": lp, "e": etf, "e_la": etf * la, "e_ls": etf * ls,
              "e_lp": etf * lp, "e_hinge_hi": etf * max(la - ka, 0.0), "hinge_la_hi": max(la - ka, 0.0),
              "hinge_lp_lo": min(lp - (math.log(kn["price_lo"]) - c["log_price"]), 0.0),
-             "e_s": etf * s, "e_s_la": etf * s * (la - ka), "e_s_ls": etf * s * ls, "e_s_lp": etf * s * lp}
+             "e_s": etf * s, "e_s_la": etf * s * (la - ka), "e_s_ls": etf * s * ls, "e_s_lp": etf * s * lp,
+             "e_hinge_vhi": etf * max(la - (math.log(kn["adv_vhi"]) - c["log_adv"]), 0.0)}
     x = sum(b[t] * terms[t] for t in CAL["terms"])
     if mult is None:
         mult = float(M.era_multiplier([np.datetime64(pd.Timestamp(date))], [adv])[0])
@@ -42,8 +43,10 @@ def test_formula_matches_hand_calculation():
     h, why = M.half_spread("XYZ", "2026-07-01", 50.0, 2e7, 0.02, "STK")
     assert h == pytest.approx(_hand(50.0, 2e7, 0.02, 0, "2026-07-01", 0.01), rel=1e-9)
     assert why.startswith("calibrated spread model (T2)")
-    h2, _ = M.half_spread("ETFX", "2026-07-01", 300.0, 5e9, 0.01, "ETF")
+    nomono = CalibratedSpreadModel(CalibratedSpreadConfig(etf_monotone=False))
+    h2, _ = nomono.half_spread("ETFX", "2026-07-01", 300.0, 5e9, 0.01, "ETF")
     assert h2 == pytest.approx(_hand(300.0, 5e9, 0.01, 1, "2026-07-01", 0.01), rel=1e-9)
+    assert M.half_spread("ETFX", "2026-07-01", 300.0, 5e9, 0.01, "ETF")[0] <= h2 + 1e-15   # running min
 
 
 def test_era_multiplier_is_one_on_fit_day():
@@ -162,10 +165,11 @@ def test_vectorised_equals_scalar():
     adv = pd.Series(c * v).rolling(20, min_periods=10).mean().shift(1).to_numpy()
     r = pd.Series(c).pct_change()
     sig = r.rolling(20, min_periods=10).std().shift(1).to_numpy()
-    for i in (15, 30, 79):
+    for i in (25, 50, 79):        # full 20-return windows (shorter windows shrink sigma to the prior)
         hs, why = M.half_spread("E", d[i], c[i - 1], adv[i], sig[i], "ETF")
         assert s.est[i] == pytest.approx(2 * hs, rel=1e-12)
         assert s.at(i)[1] == "calibrated"
+    assert "sigma prior" in s.at(15)[1]
     assert np.isnan(s.est[0]) and s.src[0] == "default"
 
 
@@ -206,3 +210,55 @@ def test_default_and_cap_and_effective():
     assert 0.25 * q <= e <= q
     o = CalibratedSpreadModel(CalibratedSpreadConfig(overrides={"SPY": 0.00002}))
     assert o.half_spread("SPY", "2024-03-01", 500.0, 3e10, 0.01, "ETF") == (0.00002, "spread override (user)")
+
+
+# ------------------------------------------------------------------ red-team fixes (v2)
+def test_exchange_specific_tick_schedules():
+    assert era_tick("1999-06-01", 130.0, "AMEX", symbol="SPY") == pytest.approx(1 / 64)   # SPDRs in 1/64
+    assert era_tick("1996-06-03", 66.0, None, symbol="SPY") == pytest.approx(1 / 64)
+    assert era_tick("1996-06-03", 40.0, "AMEX", symbol="MDY") == pytest.approx(1 / 64)
+    assert era_tick("2001-01-29", 130.0, "AMEX", symbol="SPY") == 0.01
+    assert era_tick("1996-06-03", 5.0, "AMEX") == 0.0625 and era_tick("1996-06-03", 20.0, "AMEX") == 0.125
+    assert era_tick("1997-05-07", 20.0, "AMEX") == 0.0625
+    assert era_tick("2001-01-26", 50.0, "NYSE") == 0.0625 and era_tick("2001-01-29", 50.0, "NYSE") == 0.01
+    assert era_tick("2001-03-30", 50.0, "NASDAQ") == 0.0625 and era_tick("2001-04-09", 50.0, "NASDAQ") == 0.01
+    assert era_tick("2005-10-03", 0.5) == 0.01 and era_tick("2006-01-31", 0.5) == 0.0001     # Rule 612
+    assert era_tick("2000-09-01", 50.0, "NYSE", decimal_date="2000-08-28") == 0.01            # pilot stock
+    pilot = CalibratedSpreadModel(CalibratedSpreadConfig(decimal_dates={"FDX": "2000-08-28"}))
+    assert pilot.half_spread("FDX", "2000-09-01", 40.0, 5e7, 0.02, "STK", exchange="NYSE")[0] < \
+        M.half_spread("FDX", "2000-09-01", 40.0, 5e7, 0.02, "STK", exchange="NYSE")[0]
+
+
+def test_unknown_exchange_is_flagged_pre_decimal_only():
+    assert "listing assumed NYSE" in M.half_spread("X", "1999-06-01", 30.0, 5e7, 0.02, "STK")[1]
+    assert "listing assumed" not in M.half_spread("X", "1999-06-01", 30.0, 5e7, 0.02, "STK", exchange="NASDAQ")[1]
+    assert "listing assumed" not in M.half_spread("X", "2012-06-01", 30.0, 5e7, 0.02, "STK")[1]
+    nas = M.half_spread("X", "1999-06-01", 8.0, 5e6, 0.03, "STK", exchange="NASDAQ")[0]
+    nyse = M.half_spread("X", "1999-06-01", 8.0, 5e6, 0.03, "STK", exchange="NYSE")[0]
+    assert nas < nyse                       # Nasdaq < $10 quoted in 1/32 vs NYSE 1/16
+
+
+def test_liquid_etf_intraday_profile_and_full_spread_asset_class():
+    o_etf = M.tod_multiplier(0, 390, 1e10, "ETF"); o_stk = M.tod_multiplier(0, 390, 1e10, "STK")
+    assert 1.4 < o_etf < 2.5 < o_stk
+    assert M.tod_multiplier(388, 2, 1e10, "ETF") > M.tod_multiplier(388, 2, 1e10, "STK")
+    est = 2e-5
+    assert M.full_spread(est, 500.0, 0.01, 1.0, 389.0, adv_dollars=1e10, asset_class="ETF") == \
+        pytest.approx(max(est * o_etf, 0.01 / 500))
+
+
+def test_split_day_and_prior_close():
+    n = 40
+    rc = np.where(np.arange(n) < 30, 500.0, 50.0)
+    adj = np.full(n, 50.0)
+    d = pd.bdate_range("2024-01-02", periods=n)
+    a = M.series(adj * 1.01, adj * 0.99, adj, raw_close=rc, volume=np.where(np.arange(n) < 30, 2e5, 2e6), dates=d)
+    pc = np.r_[np.nan, rc[:-1]]; pc[30] = 50.0
+    b = M.series(adj * 1.01, adj * 0.99, adj, raw_close=rc, volume=np.where(np.arange(n) < 30, 2e5, 2e6), dates=d,
+                 prior_close=pc)
+    assert a.est[30] == pytest.approx(b.est[30]) == pytest.approx(a.est[31], rel=0.05)
+
+
+def test_asset_class_unknown_is_flagged():
+    h, why = M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, None)
+    assert "asset class inferred STK" in why and h == M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, "STK")[0]
