@@ -48,6 +48,16 @@ from atlasbt.pricing.time import year_fraction
 
 from .listing import listed_expiries, product_spec, strike_grid, tick_size
 
+
+def _vix30_or_default(fam: pd.DataFrame) -> float:
+    """VIX level from a vix_family() frame; 0.20 when the frame is empty/columnless
+    (no PIT VIX, e.g. before VIX history). Callers gate quoting on the ATM term, which is
+    empty in that case, so the default only reaches spread-model inputs."""
+    if fam is None or fam.empty or "index" not in fam.columns:
+        return 0.20
+    m = fam["index"] == "VIX"
+    return float(fam.loc[m, "level"].iloc[0]) if bool(m.any()) else 0.20
+
 ROOT = Path(__file__).resolve().parents[2]
 CBOE_DIR = ROOT / "data_raw" / "cboe_indices"
 PARAMS_PATH = Path(__file__).resolve().parent / "calibration" / "synthetic_params.json"
@@ -97,6 +107,7 @@ def _last_known(series: pd.Series, as_of: pd.Timestamp, close_hhmm: str = VOL_IN
 # parameters
 # --------------------------------------------------------------------------
 @dataclass
+
 class SyntheticParams:
     atm_ratio_index: float = 0.88        # SPX-family ATM IV / vol index (30d) at index level 20
     atm_ratio_logvix: float = 0.0        # d ratio / d ln(index level)  (regime dependence)
@@ -384,7 +395,7 @@ class SyntheticChainGenerator:
         pf_reasons, use_fe = params_fit_reasons(self.params, sess)
         reasons += pf_reasons
         fam = self.vol.vix_family(as_of)
-        vix30 = float(fam.loc[fam["index"] == "VIX", "level"].iloc[0]) if (fam["index"] == "VIX").any() else 0.20
+        vix30 = _vix30_or_default(fam)
         return dict(sess=sess, term=term, reasons=reasons, ratio_label=ratio_label, use_fe=use_fe,
                     sk=self.vol.skew_index(as_of), vix30=vix30)
 
@@ -459,7 +470,7 @@ class SyntheticChainGenerator:
         reasons += pf_reasons
         sk = self.vol.skew_index(as_of)
         fam = self.vol.vix_family(as_of)
-        vix30 = float(fam.loc[fam["index"] == "VIX", "level"].iloc[0]) if (fam["index"] == "VIX").any() else 0.20
+        vix30 = _vix30_or_default(fam)
         exps = listed_expiries(u, sess, horizon_days=max_dte, include_weeklies=include_weeklies)
         if exps.attrs.get("fidelity") == Fidelity.NA:
             out = pd.DataFrame(columns=cols)
