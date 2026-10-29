@@ -37,6 +37,10 @@ def mem_available_gb() -> float:
 
 def _child(kind: str, sid: str, payload: dict, plan_row: dict, opts: P.RunOptions, log_path: str,
            status_path: str) -> None:
+    from .offline import enable, enabled_by_env
+
+    if enabled_by_env():
+        enable(strict=False)          # runs read cache/ only (raw HTTP cache still served)
     fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     os.dup2(fd, 1)
     os.dup2(fd, 2)

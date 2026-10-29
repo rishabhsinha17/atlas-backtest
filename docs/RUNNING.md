@@ -16,7 +16,7 @@ Common options: `--results-dir DIR`, `--workers 4`, `--max-configs N`, `--budget
 budget per strategy, default 30), `--daily-budget MIN` (same for daily+ strategies, default unlimited),
 `--force` (wipe and rerun a strategy), `--timeout MIN` (per task, default 360), `--mem-reserve GB`
 (default 3), `--start/--end` (window override, smoke tests only; recorded in config.json),
-`--use-quotes never|auto|always` (default `never`, see §8), `--universe-coverage filter|strict` and
+`--use-quotes never|auto|always` (default `auto`, the engine default since its per-window quote-coverage fix; see §8), `--universe-coverage filter|strict` and
 `--min-universe-coverage 0.95` (§2), `--label TEXT` (a run label shown in summaries and the leaderboard,
 e.g. `shakeout-2y`), `--extend-grid` (grows existing grid subsets to the current caps; the seeded subsets
 are prefix-stable, so it only adds configs and re-finalizes), `--allow-stock-universes`/env
@@ -67,7 +67,7 @@ Window start is the first session at which every critical input exists:
 |---|---|
 | bars of explicitly named symbols | latest first bar |
 | bars of a static universe | all members if <= 6 names; else the date by which 80% are listed (strategies trade late listers once they have bars) |
-| PIT universe `SP500` | first month start at which PIT price coverage >= `--min-universe-coverage` (default 0.95 → 2018-04). The engine NOT_TESTABLEs a run when ANY member lacks data at the first session, and under the fail-closed identity layer some member always does (2008: 94 of 497 lack data, 2018: 8, 2024: 1). So the default `--universe-coverage filter` runs use `CoverageFilteredPortal`. It drops members without daily data (has() true AND bars returned), logs every drop, and records the coverage per result. `strict` reproduces the engine rule (coverage 1.0, never met). Members without INTRADAY data are not dropped: those stay NOT_TESTABLE. |
+| PIT universe `SP500` | first month start at which PIT price coverage (`universe(require_bars=True)` / `universe()`, the engine's own windowed-`has()` definition) >= `--min-universe-coverage` (default 0.95 → 2018-04). The engine NOT_TESTABLEs a run when ANY member lacks data at the first session, and under the fail-closed identity layer some member always does (2008: 94 of 497 lack data, 2018: 8, 2024: 1). Since eea82fa the engine filters natively (`BacktestConfig.min_universe_coverage`; coverage in `meta['universe_coverage']`, flagged T2), and `--universe-coverage engine` (default) passes the threshold through. The runner's earlier `CoverageFilteredPortal` is kept as `--universe-coverage filter`. It drops members without daily data (has() true AND bars returned), logs every drop, and records the coverage per result. `strict` reproduces the engine rule (coverage 1.0, never met). Members without INTRADAY data are not dropped: those stay NOT_TESTABLE. |
 | events / fundamentals | first event in the store / first XBRL filing (2009-07-22) |
 | real option chains (`min_fidelity <= T2`) | first DoltHub snapshot of the underlying |
 
@@ -213,10 +213,10 @@ synthetic chains ~2 min/yr. Memory: ~0.4-1.3 GB per task.
 
 ## 8. Known cross-layer issues the runner works around or reports
 
-* ENGINE `use_quotes='auto'` makes SPY/QQQ/AAPL quote-only, because single sample days of quotes exist.
-  Those symbols then fill only on 2019-12-24 (IEX) or 2026-10-27. The runner uses `'never'`. After the
-  engine fix lands, switch back to `auto` and spot-check that results match `never` except on
-  quote-covered days.
+* ENGINE `use_quotes='auto'` (fixed): it used to make SPY/QQQ/AAPL quote-only because single sample
+  days of quotes exist. Now quotes are used only where they cover the bar window. Spot check (SPY coin
+  flip and buy & hold, Dec 2019 - Jan 2020): NAV is identical to `'never'` until the only quote-covered
+  day (2019-12-24). The default is back to `auto`.
 * ENGINE spread estimator (fixed in e3d3d4d): Corwin-Schultz on daily bars put SPY's full spread at
   18-50 bp, against ~0.6 bp quoted. The engine default is now the calibrated model: an SPY coin-flip round
   trip costs 1.0 bp (31 bp under CS), and calibrated per-fill slippage is 0.27 bp vs 0.31 bp quoted
@@ -225,10 +225,11 @@ synthetic chains ~2 min/yr. Memory: ~0.4-1.3 GB per task.
   serve real quotes only, so synthetic-chain strategies never filled. It now falls back to synthetic
   session-close snapshots (T3). Options runs made before the fix are invalid; rerun them with `--force`.
 * DATA: single-stock identity. The first fix (568edb7, fail-closed PIT identity) briefly lifted the hold.
-  The hold is ACTIVE again (07:10): the engine path resolves identity at as_of = range_end, so BBT 2019
-  filled at Berkshire Hills prices. Stock strategies are skipped (`held()`). Their outputs, and the
-  UMD/HML replications, are marked STALE in `results/runs/<SID>/STALE` and in replication.json. Lift with
-  `ATLASBT_STOCK_HOLD=0` or `--allow-stock-universes`. Every stock result records its universe coverage:
+  A second hold (07:10) followed, because the engine path resolved identity at as_of = range_end, so BBT
+  2019 filled at Berkshire Hills prices. It was LIFTED for the final atlas after the date-based identity
+  redesign (f39aa6b: `TICKER~CIK` security keys; 50c0d9a: a single key resolver) and engine coverage by
+  windowed `has()` (eea82fa). Re-arm with `ATLASBT_STOCK_HOLD=1`; held outputs are marked STALE.
+  Reports show keys as `BBT (CIK0000092230)`. Every stock result records its universe coverage:
   DATA's `universe_survivorship_bias` at window start, middle and end, plus the runner filter log.
 * DATA: `has(sym,'bars','1d')` can be True while `bars()` returns nothing (ABC, 2026-10-29). The coverage
   filter checks for rows.

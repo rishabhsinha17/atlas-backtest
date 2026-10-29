@@ -168,13 +168,17 @@ def cmd_replicate(a) -> int:
 
 
 def main(argv=None) -> int:
+    from .offline import enable, enabled_by_env
+
+    if enabled_by_env():
+        enable(strict=False)
     ap = argparse.ArgumentParser(prog="python -m atlasbt.run", description="atlasbt atlas runner")
     ap.add_argument("--results-dir", default=str(DEFAULT_RESULTS))
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("plan", help="resolve requirements/windows -> results/plan.csv")
     p.add_argument("--ids", help="comma list or ranges (S046-S084); default all 172")
     p.add_argument("--allow-stock-universes", action="store_true")
-    p.add_argument("--universe-coverage", default="filter", choices=["filter", "strict"])
+    p.add_argument("--universe-coverage", default="engine", choices=["engine", "filter", "strict"])
     p.add_argument("--min-universe-coverage", type=float, default=0.95)
     for name, h in (("run", "baseline + grid + WF/holdout + PBO + cost stress + bootstrap + reports"),
                     ("atlas", "atlas-wide DSR/SPA/RC/FDR leaderboard -> ATLAS_REPORT.md"),
@@ -195,17 +199,17 @@ def main(argv=None) -> int:
         q.add_argument("--start", help="override the planned window start (smoke tests)")
         q.add_argument("--end", help="override the planned window end (smoke tests)")
         q.add_argument("--fees", default="IBKR_PRO_TIERED")
-        q.add_argument("--use-quotes", default="never", choices=["never", "auto", "always"],
-                       help="engine quote mode (default never: 'auto' breaks SPY/QQQ/AAPL, see RUNNING.md)")
+        q.add_argument("--use-quotes", default="auto", choices=["never", "auto", "always"],
+                       help="engine quote mode (default auto: quotes only where they cover the bar window)")
         q.add_argument("--include-untestable", action="store_true")
         q.add_argument("--allow-live-tree", action="store_true",
                        help="permit `run` from the live working tree (smoke tests only; long runs use `launch`)")
         q.add_argument("--spread-model", default=None, choices=["calibrated", "corwin_schultz"],
                        help="engine spread model (default: engine default, 'calibrated')")
         q.add_argument("--label", help="run label recorded in summaries/leaderboard (e.g. shakeout)")
-        q.add_argument("--universe-coverage", default="filter", choices=["filter", "strict"],
-                       help="filter: stock universes restricted to members with data (coverage recorded); "
-                            "strict: engine rule (NOT_TESTABLE if any member lacks data)")
+        q.add_argument("--universe-coverage", default="engine", choices=["engine", "filter", "strict"],
+                       help="engine: native engine filter with --min-universe-coverage (default); filter: runner "
+                            "CoverageFilteredPortal (pre-f39aa6b fallback); strict: coverage 1.0")
         q.add_argument("--min-universe-coverage", type=float, default=0.95)
         q.add_argument("--extend-grid", action="store_true",
                        help="grow existing strategies' grid subsets to the current caps (adds configs, re-finalizes)")

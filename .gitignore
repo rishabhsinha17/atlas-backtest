@@ -7,3 +7,7 @@ data_raw/**/*.zip
 data_raw/*
 !data_raw/SOURCES.md
 !data_raw/inventory.json
+
+# atlas runner outputs (keep only the README)
+results/*
+!results/README.md

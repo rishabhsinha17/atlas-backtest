@@ -3,21 +3,18 @@ leaderboard.md, REPLICATION.md and each strategy report). Remove an entry when i
 the affected results were re-run with --force."""
 
 ACTIVE_NOTICES = [
-    ("CALIBRATED-SPREADS", "Runs labelled calibrated-v1 use the engine's calibrated spread model (default since e3d3d4d; "
-     "T2 'spread modelled (calibrated)'): SPY coin-flip round trip 1.0 bp vs 31 bp under the legacy Corwin-Schultz "
-     "model, per-fill slippage 0.27 bp vs 0.31 bp quoted (IEX 2019-12-24). Earlier Corwin-Schultz results are "
-     "superseded. Results remain pre-final until the pending engine fixes (quote mode per session, combo legs on "
-     "master instruments, stale-mark early assignment) land."),
-    ("QUOTES-NEVER", "Runs use BacktestConfig(use_quotes='never'): the engine's 'auto' mode switched SPY/QQQ/AAPL to "
-     "quote-only fills because single sample days of quotes are cached (fix dispatched to ENGINE)."),
-    ("STOCK-HOLD", "Single-stock strategies are on HOLD again (integrator 2026-10-29 07:10): the engine path resolves "
-     "identity at as_of=range_end, so reused tickers show the wrong company (BBT 2019 at Berkshire Hills prices). "
-     "All stock-universe outputs (incl. the UMD/HML replications) are STALE until DATA's identity-qualified keys land. "
-     "When lifted: primary stock runs use the >=95% coverage window (2018-04+) with --universe-coverage filter; "
-     "EXTENDED_SURVIVORSHIP_BIASED runs (>=60%) live in results/extended and are never ranked."),
-    ("SYNTHETIC-FILLS-T3", "Since 2026-10-29 Portal.option_quotes falls back to synthetic session-close snapshots (T3), "
-     "so synthetic-chain options strategies fill; their results are T3_MODELED (OPTIONS.md §7.4: synthetic "
-     "put-writes ~+1.5%/yr rich vs the Cboe PUT index). Options runs made before the fallback are invalid."),
+    ("CALIBRATED-SPREADS", "Taker costs use the engine's calibrated spread model (v3 + 2010-2025 pessimistic floor, "
+     "T2 'spread modelled (calibrated)'): SPY coin-flip round trip ~1.0 bp vs 31 bp under the legacy Corwin-Schultz "
+     "model; per-fill slippage 0.26 bp vs 0.31 bp quoted (IEX 2019-12-24)."),
+    ("STOCK-COVERAGE", "Stock-universe (S&P 500 PIT) primary results start at the first month with >= 95% PIT price "
+     "coverage; members without verified data are excluded by the engine (coverage recorded per result, flagged T2). "
+     "EXTENDED_SURVIVORSHIP_BIASED secondary runs (>= 60% coverage, results/extended) are never ranked: delisted and "
+     "failed names are under-represented, so they are likely optimistic."),
+    ("SYNTHETIC-FILLS-T3", "Options filled from synthetic session-close snapshots (no real chain: SPX/QQQ/IWM, SPY "
+     "before 2019/2020) are T3_MODELED (OPTIONS.md §7.4: synthetic put-writes ~+1.5%/yr rich vs the Cboe PUT index); "
+     "the fidelity scorecard shows the T2/T3 split."),
+    ("QUOTES-AUTO", "use_quotes='auto': quote fills only where cached quotes cover the bar window (IEX 2019-12-24, "
+     "Dukascopy 2026-10-27 sample days); bars elsewhere."),
 ]
 
 

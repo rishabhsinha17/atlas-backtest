@@ -7,6 +7,7 @@ from .conftest import needs_cache
 
 
 @needs_cache
+@pytest.mark.slow
 def test_lookahead_guard_rejects_perfect_foresight(portal):
     r = R.rep_lookahead(portal, **R.QUICK["lookahead"])
     assert r["modes"]["future_as_of"]["raised"] and r["modes"]["future_actions"]["raised"]
@@ -15,6 +16,7 @@ def test_lookahead_guard_rejects_perfect_foresight(portal):
 
 
 @needs_cache
+@pytest.mark.slow
 def test_spy_buy_and_hold_vs_adjclose(portal):
     r = R.rep_spy(portal, **R.QUICK["spy"])
     d = r["default_fees"]
@@ -25,12 +27,14 @@ def test_spy_buy_and_hold_vs_adjclose(portal):
 
 
 @needs_cache
+@pytest.mark.slow
 def test_s105_vs_pandas_reference(portal):
     r = R.rep_s105(portal, **R.QUICK["s105"])
     assert r["daily_corr"] > 0.99 and abs(r["td_ann"]) < 0.005
 
 
 @needs_cache
+@pytest.mark.slow
 def test_random_entries_have_no_positive_fill_bias(portal):
     r = R.rep_random(portal, **R.QUICK["random"])
     assert r["fills_better_than_mid"] == 0

@@ -164,7 +164,22 @@ def environment_info() -> dict:
             "pinned_worktree": os.environ.get("ATLASBT_RUN_WORKTREE"),
             "runner_overlay_sha": os.environ.get("ATLASBT_RUNNER_OVERLAY_SHA"),
             "cache_root": os.environ.get("ATLASBT_CACHE", str(REPO / "cache")),
+            "offline": os.environ.get("ATLASBT_OFFLINE", "1") != "0",
+            "network_blocked": __import__("atlasbt.run.offline", fromlist=["x"]).blocked_summary(),
             "timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat()}
+
+
+def display_symbol(sym) -> str:
+    """'BBT~CIK0000092230' -> 'BBT (CIK0000092230)'; plain tickers unchanged (DATA security keys, f39aa6b)."""
+    s = str(sym)
+    if "~CIK" in s:
+        t, c = s.split("~CIK", 1)
+        return f"{t} (CIK{c})"
+    return s
+
+
+def ticker_of(sym) -> str:
+    return str(sym).split("~CIK", 1)[0]
 
 
 def data_provenance(portal, symbols, freqs=("1d",)) -> dict:
@@ -173,14 +188,15 @@ def data_provenance(portal, symbols, freqs=("1d",)) -> dict:
     store = getattr(portal, "store", None)
     if store is None:
         return out
-    for sym in sorted(set(symbols or [])):
+    for key in sorted(set(symbols or [])):
+        sym = ticker_of(key)                    # store files are per ticker; the key names the security
         for f in freqs:
             kind = f"bars_{f}"
             for src in store.sources(kind):
                 try:
                     if store.exists(kind, src, sym):
                         m = store.meta(kind, src, sym)
-                        out[f"{kind}/{src}/{sym}"] = {k: m.get(k) for k in
+                        out[f"{kind}/{src}/{key}"] = {k: m.get(k) for k in
                                                        ("source", "fetched_at", "first_fetched_at", "rows", "files",
                                                         "fidelity", "adjusted")}
                 except Exception as e:  # pragma: no cover

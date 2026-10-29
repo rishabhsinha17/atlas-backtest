@@ -60,12 +60,13 @@ class RunOptions:
     wf_intraday: tuple = ("6M", "2M")
     fees: str = "IBKR_PRO_TIERED"
     spread_model: Optional[str] = None      # None = engine default ('calibrated' since 2026-10-29)
-    #: 'never' until the ENGINE's 'auto' mode stops switching SPY/QQQ/AAPL to quote-only fills because
-    #: single sample days of quotes exist (IEX 2019-12-24, Dukascopy 2026-10-27) -- see docs/RUNNING.md
-    use_quotes: str = "never"
-    #: 'filter' = stock universes restricted to members with daily data (CoverageFilteredPortal, coverage
-    #: recorded per result); 'strict' = engine behaviour (NOT_TESTABLE if any member lacks data)
-    universe_coverage: str = "filter"
+    #: engine default 'auto' since the per-window quote-coverage fix (spot check 2026-10-29: NAV identical to
+    #: 'never' until the only quote-covered day 2019-12-24). 'never' reproduces the earlier workaround.
+    use_quotes: str = "auto"
+    #: 'engine' (default since f39aa6b): the engine's native filter (members without verified data excluded,
+    #: NOT_TESTABLE below BacktestConfig.min_universe_coverage, coverage in meta['universe_coverage']);
+    #: 'filter' = the runner's CoverageFilteredPortal (pre-f39aa6b fallback); 'strict' = coverage 1.0
+    universe_coverage: str = "engine"
     min_universe_coverage: float = 0.95
     initial_cash: float = 1_000_000.0
     make_charts: bool = True
@@ -105,6 +106,14 @@ def make_config(opts: RunOptions, **over):
     from atlasbt.engine import BacktestConfig
 
     kw = {"initial_cash": opts.initial_cash, "fees": opts.fees, "use_quotes": opts.use_quotes}
+    try:
+        from atlasbt.engine import BacktestConfig as _BC
+
+        if "min_universe_coverage" in _BC.__dataclass_fields__:
+            kw["min_universe_coverage"] = 1.0 if opts.universe_coverage == "strict" else (
+                0.0 if opts.universe_coverage == "filter" else float(opts.min_universe_coverage))
+    except Exception:  # pragma: no cover
+        pass
     if opts.spread_model:
         kw["spread_model"] = opts.spread_model
     kw.update(over)
@@ -157,6 +166,7 @@ def run_engine(sid: str, params: dict, start: str, end: str, opts: RunOptions, p
     from .fastportal import CoverageFilteredPortal, FastPortal
 
     portal = portal or (CoverageFilteredPortal() if opts.universe_coverage == "filter" else FastPortal())
+    # engine mode: FastPortal + BacktestConfig.min_universe_coverage (make_config)
     cls = R.get(sid)
     strat = cls(**params)
     bt = Backtester(strat, portal, make_config(opts, **cfg_over))
@@ -210,11 +220,15 @@ def task_baseline(sid: str, plan_row: dict, opts: RunOptions) -> dict:
         except Exception:
             pass
     freqs = tuple(dict.fromkeys(["1d"] + ([strat.bar_freq] if is_intraday(strat.bar_freq) else [])))
-    ucov = universe_coverage_record(portal, strat, start, end)
-    if hasattr(portal, "coverage_series"):
+    ucov = universe_coverage_record(portal, strat, start, end, res)
+    cs = None
+    em = (res.meta or {}).get("universe_coverage") or {}
+    if isinstance(em.get("series"), pd.DataFrame) and len(em["series"]):
+        cs = em["series"]
+    elif hasattr(portal, "coverage_series"):
         cs = portal.coverage_series()
-        if len(cs):
-            cs.to_csv(d / "baseline" / "universe_coverage.csv", index=False)
+    if cs is not None and len(cs):
+        cs.to_csv(d / "baseline" / "universe_coverage.csv", index=False)
     write_json(d / "config.json", {
         "strategy_id": sid, "params": params, "grid": strat.grid, "window": [start, end], "seed": seed,
         "plan": plan_row, "options": opts.to_dict(), "engine_config": res.meta.get("config"),
@@ -236,7 +250,7 @@ def task_baseline(sid: str, plan_row: dict, opts: RunOptions) -> dict:
     return st
 
 
-def universe_coverage_record(portal, strat, start: str, end: str) -> dict:
+def universe_coverage_record(portal, strat, start: str, end: str, res=None) -> dict:
     """Survivorship coverage of the strategy's PIT universe: DATA's universe_survivorship_bias at the
     window start / middle / end, plus the runner filter log (members dropped for lack of data)."""
     un = getattr(strat, "universe_name", None)
@@ -254,6 +268,15 @@ def universe_coverage_record(portal, strat, start: str, end: str) -> dict:
         except Exception as e:
             pts[lab] = {"error": f"{type(e).__name__}: {e}"}
     out["survivorship_bias"] = pts
+    em = ((getattr(res, "meta", None) or {}).get("universe_coverage") or {}) if res is not None else {}
+    if em:
+        from .common import display_symbol
+
+        dropped = em.get("dropped") or {}
+        out["engine_filter"] = {"min_universe_coverage": em.get("min_universe_coverage"),
+                                "coverage_min": em.get("coverage_min"), "n_dropped": len(dropped),
+                                "most_dropped": sorted(((display_symbol(k), v.get("n"), v.get("reason"))
+                                                        for k, v in dropped.items()), key=lambda x: -(x[1] or 0))[:15]}
     if hasattr(portal, "coverage_summary"):
         out["runner_filter"] = portal.coverage_summary()
     return out
@@ -530,7 +553,8 @@ def task_finalize(sid: str, plan_row: dict, opts: RunOptions) -> dict:
     uc = bst.get("universe_coverage") or {}
     sb = uc.get("survivorship_bias") or {}
     row["universe_coverage_start"] = (sb.get("start") or {}).get("coverage")
-    row["universe_coverage_min_filter"] = (uc.get("runner_filter") or {}).get("coverage_min")
+    row["universe_coverage_min_filter"] = ((uc.get("engine_filter") or {}).get("coverage_min")
+                                           or (uc.get("runner_filter") or {}).get("coverage_min"))
     ad = bst.get("activity_detail") or {}
     row["n_entries"] = ad.get("n_entries")
     if bst.get("activity") == "ZERO_ACTIVITY":
@@ -613,6 +637,10 @@ def _append_report_section(path: Path, s: dict, plan_row: dict) -> None:
         lines += ["Universe survivorship coverage (" + str(uc.get("universe")) + "): " + "; ".join(
             f"{k} {v.get('date')}: {v.get('with_data')}/{v.get('members')} ({_f(v.get('coverage'), 'pct')})"
             for k, v in sb.items() if isinstance(v, dict) and "date" in v)
+            + (f"; engine filter (min {_f((uc.get('engine_filter') or {}).get('min_universe_coverage'), 'pct')}) "
+               f"coverage min {_f((uc.get('engine_filter') or {}).get('coverage_min'), 'pct')}, "
+               f"{(uc.get('engine_filter') or {}).get('n_dropped')} members dropped, e.g. "
+               f"{((uc.get('engine_filter') or {}).get('most_dropped') or [])[:5]}" if uc.get("engine_filter") else "")
             + (f"; runner filter min coverage {_f((uc.get('runner_filter') or {}).get('coverage_min'), 'pct')}, "
                f"most dropped {((uc.get('runner_filter') or {}).get('most_dropped') or [])[:6]}" if uc.get("runner_filter") else ""), ""]
     ad = s.get("activity_detail") or {}

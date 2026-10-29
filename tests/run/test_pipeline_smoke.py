@@ -1,3 +1,4 @@
+import pytest
 """End-to-end smoke of `python -m atlasbt.run run/atlas` on a short window (real cache)."""
 import json
 import shutil
@@ -9,6 +10,7 @@ from .conftest import needs_cache
 
 
 @needs_cache
+@pytest.mark.slow
 def test_run_pipeline_end_to_end_and_resume(tmp_path):
     if (DEFAULT_RESULTS / "plan_cache.json").exists():
         shutil.copy(DEFAULT_RESULTS / "plan_cache.json", tmp_path / "plan_cache.json")

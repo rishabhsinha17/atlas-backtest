@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -7,6 +8,7 @@ from .conftest import needs_cache
 
 
 @needs_cache
+@pytest.mark.slow
 def test_fastportal_corporate_actions_identical_to_portal(portal):
     p = Portal()
     syms = ["SPY", "QQQ", "IEF", "XLE", "AAPL", "GE"]
@@ -19,6 +21,7 @@ def test_fastportal_corporate_actions_identical_to_portal(portal):
 
 
 @needs_cache
+@pytest.mark.slow
 def test_fastportal_never_returns_actions_known_after_as_of(portal):
     asof = pd.Timestamp("2015-06-01 20:00", tz="UTC")
     acts = portal.corporate_actions(["SPY", "AAPL"], "2015-01-01", "2016-12-31", asof)

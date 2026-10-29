@@ -88,8 +88,15 @@ def audit_rows(opts, ids=None, allow_stock: bool = False) -> list[dict]:
                        f"log results/logs/{sid}.log")
                 if act == "ZERO_ACTIVITY":
                     cause = known_cause(sid, pr, dg)
-                    rec.update(verdict="DECLARED" if note else "OFFENDER", status=act,
-                               detail=(f"KNOWN CAUSE: {cause} || " if cause else "") + det)
+                    o = dg.get("orders") or {}
+                    engine_rejected = bool(o.get("combo_rejected") or any(
+                        "REJECTED" in k for k in (o.get("by_type_status") or {})))
+                    # a declared note explains "no signal / zero size by design"; it never covers orders that
+                    # were submitted and rejected by the engine (an infrastructure failure, e.g. symbol mismatch)
+                    verdict = "OFFENDER" if (not note or engine_rejected) else "DECLARED"
+                    if note and engine_rejected:
+                        cause = (cause + " | " if cause else "") + "declared activity_note does not cover engine rejections"
+                    rec.update(verdict=verdict, status=act, detail=(f"KNOWN CAUSE: {cause} || " if cause else "") + det)
                 elif act == "LOW_ACTIVITY":
                     rec.update(verdict="REVIEW", status=act, detail=det)
                 else:

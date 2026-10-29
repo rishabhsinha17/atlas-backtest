@@ -40,8 +40,8 @@ from .common import DEFAULT_RESULTS, adjusted_close, jsonable, to_session_dates,
 from .fastportal import FastPortal
 
 LAST = "2026-10-27"
-#: see RunOptions.use_quotes: ENGINE 'auto' mode turns SPY/QQQ/AAPL into quote-only symbols (sample-day quotes)
-USE_QUOTES = "never"
+#: see RunOptions.use_quotes (engine 'auto' = quotes only where they cover the bar window)
+USE_QUOTES = "auto"
 
 
 # ===================================================================== validation strategies
@@ -536,7 +536,8 @@ def rep_hml(portal=None, start="2010-06-30", end="2026-09-30") -> dict:
     be, sh = {}, {}
     for s in syms:
         try:
-            raw = portal.store.read("fundamentals", "sec", s)
+            fs = portal._fund_symbol(s) if hasattr(portal, "_fund_symbol") else s   # key 'T~CIK' -> XBRL store symbol
+            raw = portal.store.read("fundamentals", "sec", fs) if fs else None
         except Exception:
             raw = None
         if raw is None or not len(raw):
@@ -803,7 +804,7 @@ def write_replication_md(path: Path, R_: dict) -> None:
     def row(name, r, txt):
         st = "PASS" if r.get("pass") else ("ERROR" if r.get("error") else "FAIL")
         if r.get("provisional"):
-            st += " (provisional)"
+            st += " (STALE)" if "STALE" in str(r.get("provisional")) else " (provisional)"
         L.append(f"| {name} | {st} | {txt} |")
 
     s = R_.get("spy", {})
@@ -818,7 +819,13 @@ def write_replication_md(path: Path, R_: dict) -> None:
     s = R_.get("put", {})
     if s:
         row("S129 (engine) vs Cboe PUT", s, f"ann {_p(s.get('engine_ann_return'))} vs {_p(s.get('put_index_ann_return'))}, "
-            f"TE {_p(s.get('tracking_error_ann'))}/yr, corr {_p(s.get('monthly_corr'), 'f')}")
+            f"TE {_p(s.get('tracking_error_ann'))}/yr, corr {_p(s.get('monthly_corr'), 'f')}"
+            + (f"; BLOCKED: {s['blocked_by']}" if s.get("blocked_by") else ""))
+        pv = s.get("previous_engine_run")
+        if pv:
+            row("S129 (engine, bridge, earlier run) vs Cboe PUT", pv,
+                f"ann {_p(pv.get('engine_ann_return'))} vs {_p(pv.get('put_index_ann_return'))} over {pv.get('months')} months, "
+                f"TE {_p(pv.get('tracking_error_ann'))}/yr, corr {_p(pv.get('monthly_corr'), 'f')} ({pv.get('note', '')[:120]})")
     s = R_.get("umd", {})
     if s:
         row("12-2 momentum decile spread vs UMD", s, f"corr {_p(s.get('corr_full'), 'f')} over {s.get('months')} months")
@@ -835,7 +842,8 @@ def write_replication_md(path: Path, R_: dict) -> None:
         L.append(f"| Spread model vs real quotes (SPY, {sc.get('quote_day')}) | EVIDENCE | IEX quoted half-spread median "
                  f"{_p(sc.get('iex_median_half_spread_bp'), 'bp')} vs engine bar-mode (Corwin-Schultz) "
                  f"{_p(sc.get('model_half_spread_bp_same_day'), 'bp')} = {sc.get('overstatement_x', 0):.0f}x; "
-                 f"engine slippage per fill by year: {s.get('slippage_bp_by_year')} |")
+                 f"engine slippage per fill by year under the default model ({s.get('spread_model', 'n/a')}): "
+                 f"{s.get('slippage_bp_by_year')} |")
     s = R_.get("spreadcost", {})
     if s and "calibrated" in s:
         row("SPY coin-flip cost: calibrated vs Corwin-Schultz", s,

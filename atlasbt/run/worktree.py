@@ -5,8 +5,9 @@ versions (e.g. a calibration JSON rewritten mid-run). ``launch`` therefore:
 
 1. resolves the commit (default HEAD) and creates ``results/_worktrees/<hash12>`` with
    ``git worktree add --detach`` (no commits, branches or pushes);
-2. overlays the runner package ``atlasbt/run`` from the main tree if the commit does not contain it
-   (runner-owned, not yet committed); its sha256 is recorded as ``runner_overlay_sha``;
+2. overlays the runner package ``atlasbt/run`` from the main tree if the commit lacks it or the main
+   tree's runner differs (runner-owned code ahead of the last commit); its sha256 is recorded as
+   ``runner_overlay_sha`` (empty when the committed runner is used as is);
 3. REFUSES to launch if ``git status --porcelain`` in the worktree shows anything other than the overlay;
 4. starts ``python -m atlasbt.run <args>`` detached inside the worktree with ``ATLASBT_CACHE`` = the main
    repo's cache (shared, read-only for runs), ``--results-dir`` = the main repo's results, and
@@ -25,8 +26,9 @@ from pathlib import Path
 from .common import REPO
 
 
-def _git(*args, cwd: Path = REPO) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+def _git(*args, cwd: Path = REPO, strip: bool = True) -> str:
+    out = subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True).stdout
+    return out.strip() if strip else out
 
 
 def tree_sha(path: Path) -> str:
@@ -50,13 +52,18 @@ def prepare(commit: str = "HEAD", main: Path = REPO) -> dict:
     for rel in OVERLAY:
         src, dst = main / rel, wt / rel
         tracked = bool(_git("ls-tree", "-r", "--name-only", full, rel, cwd=main))
-        if not tracked:
+        # overlay the runner when the commit lacks it OR the main tree has newer runner code
+        if not tracked or tree_sha(src) != tree_sha(dst):
             if dst.exists():
                 shutil.rmtree(dst)
             shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        # record the overlay whenever the worktree's runner differs from the commit (also when an earlier
+        # launch already synced it)
+        if not tracked or _git("status", "--porcelain", rel, cwd=wt, strip=False).strip():
             overlay[rel] = tree_sha(dst)
-    dirty = [l for l in _git("status", "--porcelain", cwd=wt).splitlines()
-             if not any(l[3:].startswith(o) for o in OVERLAY)]
+    # porcelain v1: "XY <path>" (two status columns + space); never strip the leading column
+    dirty = [l for l in _git("status", "--porcelain", cwd=wt, strip=False).splitlines()
+             if l.strip() and not any(l[3:].startswith(o) for o in OVERLAY)]
     return {"commit": full, "worktree": str(wt), "overlay": overlay, "dirty": dirty}
 
 

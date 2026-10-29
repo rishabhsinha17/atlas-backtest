@@ -89,11 +89,18 @@ class PlanContext:
 
         def f():
             p = self.portal
+            now = _today_utc()
+            start = pd.Timestamp("1960-01-01", tz="UTC") if freq == "1d" else now - pd.Timedelta(days=800)
             try:
+                if hasattr(p, "bars_coverage"):        # f39aa6b+: computed BY bars() (identity-verified)
+                    c = p.bars_coverage(sym, start, now, now, freq=freq)
+                    if not c.get("available"):
+                        return None
+                    i0 = pd.Timestamp(c["first"]).tz_convert("America/New_York")
+                    i1 = pd.Timestamp(c["last"]).tz_convert("America/New_York")
+                    return [str(i0.date()), str(i1.date())]
                 if not p.has(sym, "bars", freq):
                     return None
-                now = _today_utc()
-                start = pd.Timestamp("1960-01-01", tz="UTC") if freq == "1d" else now - pd.Timedelta(days=800)
                 df = p.bars(sym, freq, start, now, as_of=now, adjusted=False)
             except Exception:
                 return None
@@ -174,8 +181,14 @@ class PlanContext:
         th = self.min_coverage
 
         def cov(d):
-            r = self.portal.universe_survivorship_bias("SP500", pd.Timestamp(d, tz="UTC") + pd.Timedelta(hours=21))
-            return float(r.get("coverage", 0.0))
+            a = pd.Timestamp(d, tz="UTC") + pd.Timedelta(hours=21)
+            try:                                   # f39aa6b+: exactly the engine's / has(window) definition
+                allm = self.portal.universe("SP500", a)
+                kept = self.portal.universe("SP500", a, require_bars=True)
+                return len(kept) / len(allm) if allm else 0.0
+            except TypeError:
+                r = self.portal.universe_survivorship_bias("SP500", a)
+                return float(r.get("coverage", 0.0))
 
         def f():
             # yearly scan for the first full-coverage January, then month-level binary search in the
@@ -378,7 +391,7 @@ def plan_strategy(sid: str, pc: PlanContext) -> dict:
             for s in syms:
                 if s == "*":
                     continue
-                if pit_filter and (not p.has(s, "bars", f) or pc.bar_range(s, f) is None):
+                if pit_filter and pc.bar_range(s, f) is None:
                     dropped.append(s)          # CoverageFilteredPortal drops it at run time too
                     continue
                 if not p.has(s, "bars", f):
@@ -395,8 +408,11 @@ def plan_strategy(sid: str, pc: PlanContext) -> dict:
                     return row
                 rng[s] = (pd.Timestamp(br[0]), pd.Timestamp(br[1]))
             if dropped:
+                from .common import display_symbol
+
                 notes.append(f"{len(dropped)} of {len(syms)} {uname} members at the start have no {f} data and are "
-                             f"dropped by the coverage filter ({', '.join(dropped[:6])}{'...' if len(dropped) > 6 else ''})")
+                             f"dropped by the coverage filter ({', '.join(display_symbol(x) for x in dropped[:6])}"
+                             f"{'...' if len(dropped) > 6 else ''})")
             if not rng:
                 continue
             firsts = sorted(v[0] for v in rng.values())

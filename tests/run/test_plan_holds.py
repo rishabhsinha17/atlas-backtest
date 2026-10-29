@@ -1,3 +1,4 @@
+import pytest
 import pandas as pd
 
 from atlasbt.run.holds import held, stock_symbols
@@ -18,6 +19,7 @@ def test_stock_hold_classification(monkeypatch):
 
 
 @needs_cache
+@pytest.mark.slow
 def test_plan_windows_and_reasons(portal, tmp_path):
     pc = PlanContext(portal, tmp_path)
     r = plan_strategy("S105", pc)              # SPY + IEF, IEF listed 2002-07-26 -> + 252-session warm-up

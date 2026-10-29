@@ -84,7 +84,8 @@ def stock_hold_active(allow: bool = False) -> bool:
     --allow-stock-universes / ATLASBT_ALLOW_STOCK=1 (or ATLASBT_STOCK_HOLD=0) once the integrator says so."""
     if allow or os.environ.get("ATLASBT_ALLOW_STOCK", "") == "1":
         return False
-    return os.environ.get("ATLASBT_STOCK_HOLD", "1") != "0"
+    # LIFTED for the final atlas (integrator 2026-10-29: identity redesign f39aa6b + 50c0d9a, engine eea82fa)
+    return os.environ.get("ATLASBT_STOCK_HOLD", "0") == "1"
 
 
 def held(sid: str, allow: bool = False) -> str:
