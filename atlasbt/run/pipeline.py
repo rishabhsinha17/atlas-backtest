@@ -297,6 +297,9 @@ def grid_plan(sid: str, plan_row: dict, opts: RunOptions, baseline_runtime: floa
         cap = int(opts.max_configs)
         reasons.append(f"--max-configs {opts.max_configs}")
     budget = opts.budget_intraday_min if is_intraday(plan_row.get("bar_freq", "1d")) else opts.budget_daily_min
+    bo = (opts.extra or {}).get("budget_overrides") or {}
+    if sid in bo:                                   # per-group budgets set by `final` (minutes; None = full grid)
+        budget = bo[sid]
     if budget is not None:
         per = max(float(baseline_runtime), 1.0)
         afford = int(budget * 60 // per)

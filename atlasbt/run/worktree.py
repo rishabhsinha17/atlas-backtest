@@ -42,14 +42,14 @@ def tree_sha(path: Path) -> str:
 OVERLAY = ("atlasbt/run",)
 
 
-def prepare(commit: str = "HEAD", main: Path = REPO) -> dict:
+def prepare(commit: str = "HEAD", main: Path = REPO, overlay_runner: bool = True) -> dict:
     full = _git("rev-parse", commit, cwd=main)
     wt = main / "results" / "_worktrees" / full[:12]
     if not wt.exists():
         wt.parent.mkdir(parents=True, exist_ok=True)
         _git("worktree", "add", "--detach", str(wt), full, cwd=main)
     overlay = {}
-    for rel in OVERLAY:
+    for rel in (OVERLAY if overlay_runner else ()):
         src, dst = main / rel, wt / rel
         tracked = bool(_git("ls-tree", "-r", "--name-only", full, rel, cwd=main))
         # overlay the runner when the commit lacks it OR the main tree has newer runner code
@@ -62,13 +62,15 @@ def prepare(commit: str = "HEAD", main: Path = REPO) -> dict:
         if not tracked or _git("status", "--porcelain", rel, cwd=wt, strip=False).strip():
             overlay[rel] = tree_sha(dst)
     # porcelain v1: "XY <path>" (two status columns + space); never strip the leading column
+    allowed = OVERLAY if overlay_runner else ()
     dirty = [l for l in _git("status", "--porcelain", cwd=wt, strip=False).splitlines()
-             if l.strip() and not any(l[3:].startswith(o) for o in OVERLAY)]
+             if l.strip() and not any(l[3:].startswith(o) for o in allowed)]
     return {"commit": full, "worktree": str(wt), "overlay": overlay, "dirty": dirty}
 
 
-def launch(args: list[str], commit: str = "HEAD", log_path: str | None = None, main: Path = REPO) -> dict:
-    info = prepare(commit, main)
+def launch(args: list[str], commit: str = "HEAD", log_path: str | None = None, main: Path = REPO,
+           overlay_runner: bool = True) -> dict:
+    info = prepare(commit, main, overlay_runner)
     if info["dirty"]:
         raise SystemExit(f"refusing to launch: worktree {info['worktree']} is dirty: {info['dirty'][:10]}")
     env = dict(os.environ)
