@@ -31,6 +31,25 @@ from .common import is_intraday
 
 REBALANCE_SIZING = {"PORTFOLIO", "CROSS_SECTION"}
 LABELS = ("OK", "LOW_ACTIVITY", "ZERO_ACTIVITY", "n/a")
+#: "empty leading window": first fill this many years AND this share of the window after the start
+LEAD_GAP_YEARS = 2.0
+LEAD_GAP_FRAC = 0.20
+
+
+def leading_gap(result) -> dict:
+    """Years between the window start and the first trading fill (e.g. the 2026-10-29 OCC year-pivot bug
+    made every pre-2000 option silently unfillable: OK runs with nine empty leading years)."""
+    eq = getattr(result, "equity", None)
+    f = getattr(result, "fills", None)
+    if eq is None or len(eq) < 2 or f is None or not len(f) or "ts" not in f.columns:
+        return {}
+    t0, t1 = pd.Timestamp(eq.index[0]), pd.Timestamp(eq.index[-1])
+    first = pd.to_datetime(f["ts"], utc=True).min()
+    yrs = max((first - t0).days / 365.25, 0.0)
+    span = max((t1 - t0).days / 365.25, 1e-9)
+    return {"first_fill": str(first.date()), "leading_gap_years": round(yrs, 2),
+            "leading_gap_frac": round(yrs / span, 3),
+            "empty_leading_window": bool(yrs >= LEAD_GAP_YEARS and yrs / span >= LEAD_GAP_FRAC)}
 
 
 def _years(result) -> float:
@@ -86,6 +105,7 @@ def classify_activity(result, freq: str, sizing: str, declared_note: str = "") -
     yrs = _years(result)
     floor, rule = activity_floor(freq, sizing, yrs)
     out.update(c)
+    out.update(leading_gap(result))
     out.update({"years": round(yrs, 2), "floor": floor, "rule": rule,
                 "entries_per_year": round(c["n_entries"] / yrs, 3) if yrs > 0 else None})
     if c["n_fills"] == 0 or c["n_entries"] == 0:

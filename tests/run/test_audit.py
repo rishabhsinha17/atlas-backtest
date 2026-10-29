@@ -26,3 +26,4 @@ def test_baseline_is_not_silently_inactive(sid):
     if r["verdict"] in ("NOT_RUN", "HOLD"):
         pytest.skip(f"{sid}: {r['verdict']} ({r['detail'][:120]}); run `python -m atlasbt.run audit --live`")
     assert r["verdict"] != "OFFENDER", f"{sid} ZERO_ACTIVITY without NOT_TESTABLE or declared reason: {r['detail']}"
+    assert r["verdict"] != "LEADING_GAP", f"{sid} first fill years after the window start: {r['detail']}"

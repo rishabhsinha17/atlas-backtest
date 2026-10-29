@@ -38,3 +38,14 @@ def test_synthetic_intraday_floor_one_per_month():
 
 def test_not_ok_runs_are_not_labelled():
     assert classify_activity(_synthetic_result(0, status=RunStatus.NOT_TESTABLE), "1d", "")["activity"] == "n/a"
+
+
+def test_synthetic_empty_leading_window_flagged():
+    from atlasbt.run.activity import leading_gap
+
+    r = _synthetic_result(60, years=10)
+    late = r.fills["ts"].iloc[len(r.fills) // 2:]            # first fill ~5 years in
+    r.fills = r.fills.loc[late.index]
+    g = leading_gap(r)
+    assert g["empty_leading_window"] and g["leading_gap_years"] > 4
+    assert not leading_gap(_synthetic_result(60, years=10))["empty_leading_window"]

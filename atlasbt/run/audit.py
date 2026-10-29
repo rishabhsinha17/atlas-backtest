@@ -41,11 +41,18 @@ def baseline_activity(opts, sid: str, plan_row: dict) -> dict:
     st = P.baseline_status(opts, sid)
     if not st:
         return {}
-    if st.get("status") == "OK" and not st.get("activity"):
+    ad = st.get("activity_detail") or {}
+    if st.get("status") == "OK" and (not st.get("activity") or "leading_gap_years" not in ad):
         f = P.run_dir(opts, sid) / "baseline" / "result.pkl.gz"
         if f.exists():
-            a = P._activity(sid, read_pickle(f), plan_row)
-            st["activity"], st["activity_detail"] = a.get("activity"), a
+            res = read_pickle(f)
+            if not st.get("activity"):
+                a = P._activity(sid, res, plan_row)
+                st["activity"], st["activity_detail"] = a.get("activity"), a
+            else:
+                from .activity import leading_gap
+
+                st["activity_detail"] = {**ad, **leading_gap(res)}
     return st
 
 
@@ -97,6 +104,11 @@ def audit_rows(opts, ids=None, allow_stock: bool = False) -> list[dict]:
                     if note and engine_rejected:
                         cause = (cause + " | " if cause else "") + "declared activity_note does not cover engine rejections"
                     rec.update(verdict=verdict, status=act, detail=(f"KNOWN CAUSE: {cause} || " if cause else "") + det)
+                elif a.get("empty_leading_window"):
+                    # OK/LOW run whose first fill comes years after the window start (silent empty years)
+                    lead = (f"EMPTY LEADING WINDOW: first fill {a.get('first_fill')}, {a.get('leading_gap_years')} y "
+                            f"({a.get('leading_gap_frac', 0):.0%} of the window) after the start || ")
+                    rec.update(verdict="DECLARED" if note else "LEADING_GAP", status=act or "OK", detail=lead + det)
                 elif act == "LOW_ACTIVITY":
                     rec.update(verdict="REVIEW", status=act, detail=det)
                 else:
@@ -128,7 +140,7 @@ def run_audit(opts, ids=None, live: bool = False, allow_stock: bool = False, log
     annotate_plan(res_dir, allow_stock)
     write_json(res_dir / "audit.json", recs)
     _write_md(res_dir / "AUDIT.md", recs)
-    bad = [r["id"] for r in recs if r["verdict"] == "OFFENDER"]
+    bad = [r["id"] for r in recs if r["verdict"] in ("OFFENDER", "LEADING_GAP")]
     log(f"audit: {len(bad)} offenders {bad}; -> {res_dir / 'AUDIT.md'}")
     return bad
 
@@ -140,10 +152,11 @@ def _write_md(path: Path, recs: list[dict]) -> None:
     L = ["# Activity audit", "",
          "Baseline runs (sheet params, planned window, real cache) checked by the runner's activity safeguard "
          "(atlasbt/run/activity.py). OFFENDER = status OK but ZERO_ACTIVITY without a declared `activity_note`; "
+         "LEADING_GAP = first fill >= 2 years and >= 20% of the window after the start (silent empty years); "
          "REVIEW = LOW_ACTIVITY (below the family plausibility floor); DECLARED = zero activity with a declared "
          "reason; HOLD = integrator data hold; NOT_RUN = no baseline yet.", "",
          "| Verdict | Count |", "|---|---:|"] + [f"| {k} | {v} |" for k, v in sorted(c.items())] + [""]
-    for verdict in ("OFFENDER", "REVIEW", "DECLARED", "FAILED", "HOLD", "NOT_RUN", "PASS"):
+    for verdict in ("OFFENDER", "LEADING_GAP", "REVIEW", "DECLARED", "FAILED", "HOLD", "NOT_RUN", "PASS"):
         sub = [r for r in recs if r["verdict"] == verdict]
         if not sub:
             continue
