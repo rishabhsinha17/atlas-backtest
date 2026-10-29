@@ -17,18 +17,19 @@ ones in ``deviations``):
   side); weight removed by caps stays in cash (sizing module rule). Orders =
   ``rebalance_deltas`` between target and current shares, risk-reducing orders
   first.
-* Fundamentals: ``portal.fundamentals`` returns only the latest value per
-  (symbol, field) known at ``as_of``. Factors that need history (prior fiscal
-  year, TTM, 5y growth) use :class:`FundHistory`, which re-queries the portal
-  at past month-end closes (``as_of`` <= now, PIT-safe) and keeps every value as
-  it was known then; ``known_at`` = SEC acceptance time, so only filings public
-  at the signal close are used.
-* Sectors/industries/exchange come from ``portal.security_master(as_of)``
-  (columns tried in order: sector ``gics_sector``/``sector``/``sector_sic``;
-  industry ``gics_sub_industry``/``gics_industry``/``industry``; ``sic``;
-  exchange ``exchange``/``primary_exchange``/``listing_exchange``/``exchanges``).
-  Current GICS from Wikipedia is not point-in-time (declared). If exchange data
-  is missing, NYSE breakpoints are approximated with the universe (T2 flag).
+* Fundamentals: factors that need history (prior fiscal year, TTM, 5y growth)
+  use :class:`FundHistory`. It loads ``portal.fundamentals_history`` (every
+  filing incl. restatements, known_at <= now) when the PIT portal exposes it,
+  else re-queries ``portal.fundamentals`` at past month-end closes (``as_of`` <=
+  now). Per period the latest filing known at the cutoff is used; ``known_at`` =
+  SEC acceptance time, so only filings public at the signal close are used.
+* Sectors/industries/exchange come from ``portal.security_master(as_of)``:
+  sector = ``sector`` (SIC->GICS-like, current snapshot, T2), industry =
+  ``gics_sub_industry_current`` (current Wikipedia GICS, T2) or 3-digit ``sic``,
+  exchange = ``exchange``. None is point-in-time; each use is flagged T2 once.
+  An unloadable security master / missing industry column raises NotTestableError.
+  If exchange data is missing, NYSE breakpoints are approximated with the
+  universe (T2 flag).
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ from typing import Iterable, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from ..core.types import ActionType, Fidelity
+from ..core.types import ActionType, Fidelity, LookaheadError, NotTestableError
 from ..engine.strategy import Requirement, Strategy
 from ..indicators import cross_section as xs
 from ..indicators import realized_vol, rolling_ols
@@ -66,7 +67,7 @@ COMMON_XS_DEVIATIONS = [
     "Total returns from split+dividend back-adjusted closes as of the signal time",
     "CROSS_SECTION caps via risk.sizing.cross_section_weights: weight removed by the 2% name cap / 10% sector "
     "cap stays in cash (not redistributed); sector caps per side",
-    "GICS sector/industry from security_master is the current classification (not point-in-time)",
+    "Sector = SIC->GICS-like sector (current snapshot, T2) from security_master column 'sector'; flagged once",
     "Names whose sector is unknown are treated as their own group (cap not enforceable) and flagged T2",
 ]
 
@@ -174,29 +175,35 @@ def ols_beta(y: pd.Series, x: pd.Series, min_obs: int) -> float:
 
 
 class SecMaster:
-    """Security-master lookups (sector / industry / SIC / exchange)."""
+    """Security-master lookups (sector / industry / SIC / exchange) from
+    ``portal.security_master(as_of)``. None of these columns is point-in-time
+    (current SEC SIC snapshot, current Wikipedia GICS), so every use is flagged
+    T2 once per run. A missing/unloadable security master raises NotTestableError
+    (never swallowed)."""
 
-    SECTOR_COLS = ("gics_sector", "sector", "sector_sic")
-    INDUSTRY_COLS = ("gics_sub_industry", "gics_industry", "industry")
-    EXCH_COLS = ("exchange", "primary_exchange", "listing_exchange", "exchanges")
+    SECTOR_COLS = ("sector",)                       # SIC -> GICS-like sector (data layer), current snapshot
+    GICS_INDUSTRY_COLS = ("gics_sub_industry_current", "gics_sub_industry")   # 2nd = in-memory test alias
+    EXCH_COLS = ("exchange",)
+    INDUSTRY_COVERAGE_FLOOR = 0.50
 
     def __init__(self):
         self._df = pd.DataFrame()
         self._session = None
+        self._flagged: set = set()
+        self.coverage: list[tuple] = []             # (session, mode, coverage) at each industry use
 
-    def refresh(self, ctx) -> None:
+    def refresh(self, ctx, uses_sector: bool = True) -> None:
         s = ctx.session_date()
-        if self._session is not None and s == self._session:
-            return
-        try:
-            df = ctx.portal().security_master()
-        except Exception:
-            df = None
-        if df is None or len(df) == 0 or "symbol" not in df.columns:
-            self._df = pd.DataFrame()
-        else:
+        if self._session is None or s != self._session:
+            df = ctx.portal().security_master()     # exceptions propagate (no silent empty master)
+            if df is None or len(df) == 0 or "symbol" not in df.columns:
+                raise NotTestableError("security master unavailable (empty or without 'symbol' column)")
             self._df = df.drop_duplicates("symbol", keep="last").set_index("symbol")
-        self._session = s
+            self._session = s
+        if uses_sector and "sector" not in self._flagged:
+            self._flagged.add("sector")
+            ctx.flag_fidelity(Fidelity.T2_PROXY, "sector = SIC->GICS-like sector from the security master "
+                                                 "(current snapshot, not point-in-time)")
 
     def _get(self, sym: str, cols: Sequence[str]):
         if self._df.empty or sym not in self._df.index:
@@ -205,7 +212,7 @@ class SecMaster:
         for c in cols:
             if c in self._df.columns:
                 v = row[c]
-                if v is not None and not (isinstance(v, float) and math.isnan(v)) and str(v) != "":
+                if v is not None and not (isinstance(v, float) and math.isnan(v)) and str(v) not in ("", "nan", "None"):
                     return v
         return None
 
@@ -217,11 +224,36 @@ class SecMaster:
         if mode.upper() == "SIC":
             v = self._get(sym, ("sic",))
             try:
-                return f"SIC{int(float(v)) // 100:02d}" if v is not None else None
+                return f"SIC{int(float(v)) // 10:03d}" if v is not None else None
             except (TypeError, ValueError):
                 return None
-        v = self._get(sym, self.INDUSTRY_COLS)
+        v = self._get(sym, self.GICS_INDUSTRY_COLS)
         return None if v is None else str(v)
+
+    def require_industry(self, ctx, syms: Sequence[str], mode: str, label: str) -> float:
+        """Check the industry column exists and covers >= INDUSTRY_COVERAGE_FLOOR of the
+        PIT universe; flag T2 once with the coverage; raise NotTestableError otherwise."""
+        cols = ("sic",) if mode.upper() == "SIC" else self.GICS_INDUSTRY_COLS
+        if not any(c in self._df.columns for c in cols):
+            raise NotTestableError(f"{label}: security master has no industry column {cols}")
+        n = max(len(syms), 1)
+        cov = sum(1 for s in syms if self.industry(s, mode) is not None) / n
+        self.coverage.append((ctx.session_date(), mode.upper(), cov))
+        ctx.log(f"{label} industry coverage", mode=mode.upper(), coverage=cov, n=len(syms))
+        if cov < self.INDUSTRY_COVERAGE_FLOOR:
+            raise NotTestableError(f"{label}: {mode.upper()} industry coverage {cov:.0%} of the PIT universe on "
+                                   f"{ctx.session_date().date()} < floor {self.INDUSTRY_COVERAGE_FLOOR:.0%}")
+        key = ("industry", mode.upper())
+        if key not in self._flagged:
+            self._flagged.add(key)
+            what = ("3-digit SIC industry group (latest SEC SIC)" if mode.upper() == "SIC" else
+                    "GICS sub-industry (Wikipedia current classification, current S&P members only -> "
+                    "survivorship-biased coverage)")
+            ctx.flag_fidelity(Fidelity.T2_PROXY, f"{label}: industry = {what}; not point-in-time; coverage "
+                                                 f"{cov:.0%} of the PIT universe at first use "
+                                                 f"(floor {self.INDUSTRY_COVERAGE_FLOOR:.0%}; per-rebalance "
+                                                 f"coverage in logs)")
+        return cov
 
     def is_nyse(self, sym: str) -> Optional[bool]:
         v = self._get(sym, self.EXCH_COLS)
@@ -231,7 +263,13 @@ class SecMaster:
         return any(t in ("NYSE", "N", "XNYS", "NEW YORK STOCK EXCHANGE") for t in toks)
 
     def sectors(self, syms: Iterable[str]) -> dict[str, str]:
+        """Sector per name for the CROSS_SECTION caps; an unknown sector forms its own
+        group (cap not enforceable, flagged by flag_unknown_sectors)."""
         return {s: (self.sector(s) or f"UNKNOWN:{s}") for s in syms}
+
+    def sector_groups(self, syms: Iterable[str]) -> pd.Series:
+        """Sector labels for neutral sorts / z-scores: unknown sector -> NaN (not ranked)."""
+        return pd.Series({s: self.sector(s) for s in syms}, dtype=object)
 
 
 def nyse_mask(ctx, sm: SecMaster, syms: Sequence[str]) -> pd.Series:
@@ -250,6 +288,18 @@ def flag_unknown_sectors(ctx, sectors: dict[str, str]) -> None:
     n = sum(1 for v in sectors.values() if v.startswith("UNKNOWN:"))
     if n:
         ctx.flag_fidelity(Fidelity.T2_PROXY, "sector unknown for some names: sector cap not enforceable for them")
+
+
+def dollar_balance(w: dict[str, float]) -> dict[str, float]:
+    """Scale the heavier side down to the lighter side's gross (equal weights within
+    a side and every cap are preserved because weights only shrink)."""
+    gl = sum(v for v in w.values() if v > 0)
+    gs = -sum(v for v in w.values() if v < 0)
+    if gl <= 0 or gs <= 0:
+        return dict(w)
+    if gl > gs:
+        return {k: (v * gs / gl if v > 0 else v) for k, v in w.items()}
+    return {k: (v * gl / gs if v < 0 else v) for k, v in w.items()}
 
 
 def rebalance_to(ctx, weights: dict[str, float], tag: str = "rebalance") -> list:
@@ -296,6 +346,7 @@ class FundHistory:
         self._seen: set[str] = set()
         self._by: Optional[dict[str, pd.DataFrame]] = None
         self.queried: set[str] = set()
+        self.mode = ""
 
     # ---------------------------------------------------------------- loading
     def _add(self, df: Optional[pd.DataFrame]) -> None:
@@ -313,23 +364,40 @@ class FundHistory:
         self._by = None
 
     def update(self, ctx, symbols: Sequence[str]) -> None:
-        syms = [s for s in symbols]
-        new = [s for s in syms if s not in self._seen]
+        """Bring the history up to ``ctx.now``. Preferred path: ``portal.fundamentals_history``
+        (every filing incl. restatements/comparatives with known_at <= now) when the PIT portal
+        exposes it; otherwise re-query ``portal.fundamentals`` at past month-end closes
+        (bootstrap for new names) and at every call."""
+        syms = list(symbols)
         portal = ctx.portal()
+        hist = getattr(portal, "fundamentals_history", None)
+        df = None
+        if callable(hist) and self.mode != "fundamentals_as_of_resampling":
+            start = (ctx.session_date() - pd.DateOffset(months=self.boot + 15)).normalize()
+            try:
+                df = hist(syms, list(self.fields), as_of=ctx.now, start=start)
+            except (AttributeError, NotImplementedError):
+                df = None          # underlying portal predates the history API (e.g. old test doubles)
+                self.mode = "fundamentals_as_of_resampling"
+        if df is not None:
+            if len(df) and "known_at" in df.columns:
+                if (pd.to_datetime(df["known_at"], utc=True) > ctx.now).any():
+                    raise LookaheadError("fundamentals_history returned rows known after now")
+            self._add(df)
+            self.mode = "fundamentals_history"
+            self._seen.update(syms)
+            self.queried.update(syms)
+            return
+        self.mode = "fundamentals_as_of_resampling"
+        new = [s for s in syms if s not in self._seen]
         if new and self.boot > 0:
             for m in month_end_sessions(ctx.calendar(), ctx.session_date(), self.boot)[1:]:
                 asof = ctx.calendar().open_close(m)[1]
                 if asof >= ctx.now:
                     continue
-                try:
-                    self._add(portal.fundamentals(new, list(self.fields), as_of=asof))
-                except Exception:
-                    pass
+                self._add(portal.fundamentals(new, list(self.fields), as_of=asof))
         self._seen.update(new)
-        try:
-            self._add(portal.fundamentals(syms, list(self.fields)))
-        except Exception:
-            pass
+        self._add(portal.fundamentals(syms, list(self.fields)))
         self.queried.update(syms)
 
     def _index(self) -> dict[str, pd.DataFrame]:
@@ -540,12 +608,15 @@ class _XSBase(Strategy):
         return px.loc[date]
 
     def select(self, score: pd.Series, q: int, high_long: bool = True, groups: Optional[pd.Series] = None,
-               mask: Optional[pd.Series] = None) -> tuple[list[str], list[str]]:
+               mask: Optional[pd.Series] = None, symmetric: bool = False) -> tuple[list[str], list[str]]:
         s = score.dropna()
         if len(s) < 2:
             return [], []
         if groups is not None:
-            b = xs.group_quantile_bucket(s, groups.reindex(s.index), q)
+            if symmetric:
+                b = xs.group_quantile_bucket(s, groups.reindex(s.index), q, min_group_size=q, symmetric=True)
+            else:
+                b = xs.group_quantile_bucket(s, groups.reindex(s.index), q)
         else:
             b = xs.quantile_bucket(s, q, None if mask is None else mask.reindex(s.index).fillna(False))
         top = list(b.index[b == q])
@@ -603,7 +674,9 @@ class S085(_XSBase):
         "Formation 't-12 to t-2' read with t = holding month: at signal month-end M0 the score is "
         "P(M_skip)/P(M_lookback) - 1 (11 monthly returns for 12/1), i.e. the signal month is skipped",
         "'decile 10/20%' = top/bottom 10% (deciles) or 20% (quintiles) of ranked names",
-        "Optional industry neutrality = deciles formed within GICS sector (param industry_neutral, default off)",
+        "Optional industry neutrality (param industry_neutral, default off) = within each sector (SIC->GICS-like, "
+        "current snapshot, T2) take k = floor(n_sector/q) names from each end (group_quantile_bucket "
+        "symmetric=True, min_group_size=q); names without a sector and sectors with fewer than q names are not ranked",
         "Optional volatility scaling (param vol_scale, default off) = Barroso & Santa-Clara (2015): book scaled "
         "by min(1, target_vol / realized vol of the formation long-short portfolio over the prior 126 sessions)",
     ]
@@ -618,8 +691,8 @@ class S085(_XSBase):
         if px.empty:
             return None
         score = self.at(px, me[k]) / self.at(px, me[L]) - 1.0
-        groups = pd.Series(self.sm.sectors(score.index)) if p["industry_neutral"] else None
-        longs, shorts = self.select(score, q_of(p["decile"]), True, groups)
+        groups = self.sm.sector_groups(score.index) if p["industry_neutral"] else None
+        longs, shorts = self.select(score, q_of(p["decile"]), True, groups, symmetric=True)
         w = self.weights_from(ctx, longs, shorts)
         if p["vol_scale"] and longs and shorts:
             r = daily_returns(px).iloc[-126:]
@@ -676,8 +749,11 @@ class S087(_XSBase):
     fund_bootstrap_months = 0
     requires = _common_requires(fund=True)
     deviations = COMMON_XS_DEVIATIONS + [
-        "Industry = GICS sub-industry (security_master gics_sub_industry; fallback gics_industry) or SIC 2-digit "
-        "major group; GICS sectors would leave ~2 sectors per side, which the 10% sector cap cannot hold",
+        "Industry = GICS sub-industry from security_master gics_sub_industry_current (baseline; Wikipedia CURRENT "
+        "classification, only current S&P members -> coverage of the PIT universe ~59% in 2012, ~93% in 2025, "
+        "survivorship-biased) or 3-digit SIC industry group (latest SEC SIC); both T2 (not point-in-time), flagged "
+        "once with coverage, per-rebalance coverage logged; NotTestableError if the column is missing or coverage "
+        "< 50% of the PIT universe; names without an industry are not ranked",
         "Formation 'previous 6m excluding latest 1m' = P(M1)/P(M_{1+rank_m}) - 1 per stock",
         "Value weights = market cap at formation start, backed out as current market cap (raw close x latest "
         "filed shares_outstanding, split-adjusted) / (1 + total return since formation start)",
@@ -697,6 +773,7 @@ class S087(_XSBase):
             return None
         ret = self.at(px, me[1]) / self.at(px, me[1 + F]) - 1.0
         since = self.at(px, me[0]) / self.at(px, me[1 + F]) - 1.0
+        self.sm.require_industry(ctx, syms, self.params["industry_map"], "S087")
         rows = []
         for s in ret.dropna().index:
             ind = self.sm.industry(s, self.params["industry_map"])
@@ -732,10 +809,14 @@ class S088(_XSBase):
     deviations = COMMON_XS_DEVIATIONS + [
         "Daily total returns regressed on SPY and the stock's sector SPDR (rolling OLS, window reg_window); the "
         "residual of day d uses betas fit through d-1 only (indicators.rolling_ols resid_oos)",
-        "Sector SPDR before its inception (XLRE 2015-10, XLC 2018-06) or unknown sector: market-only regression",
+        "The stock's sector SPDR is used only if it has >= reg_window daily returns before the formation start "
+        "(so every formation-day residual has a full-window fit); otherwise (unknown sector, XLRE before ~2016-10, "
+        "XLC before ~2019-06) the stock gets a market-only regression for the whole window",
         "Score = sum of daily OOS residuals over months t-12..t-2 = sessions in (M_mom, M1]; >=90% of days required",
-        "'preserve dollar and estimated beta neutrality': equal-weight stock book is dollar neutral; residual "
-        "net market beta (univariate reg_window beta vs SPY, sum w*beta) hedged with an SPY position (beta_hedge)",
+        "'preserve dollar and estimated beta neutrality': after the CROSS_SECTION name/sector caps, the heavier side "
+        "is scaled down to the lighter side's gross (equal weights within a side, caps kept) so the stock book is "
+        "dollar neutral; residual net market beta (univariate reg_window beta vs SPY, sum w*beta) hedged with an "
+        "SPY position (beta_hedge)",
     ]
     spec = ("OLS each stock daily return vs market and sector past 252 sessions, rank residual cumulative return "
             "months t-12:t-2; long top decile, short bottom. || Rebalance monthly; preserve dollar and estimated "
@@ -756,12 +837,13 @@ class S088(_XSBase):
             return None
         r = daily_returns(px)
         fwin = (r.index > me[M]) & (r.index <= me[1])
+        usable = {e for e in etfs if e in r and int(r[e][r.index <= me[M]].notna().sum()) >= W}
         score, beta = {}, {}
         for s in syms:
             if s not in r:
                 continue
             e = sector_etf(self.sm.sector(s), ctx.session_date())
-            X = r[["SPY"] + ([e] if e and e in r else [])]
+            X = r[["SPY"] + ([e] if e in usable else [])]
             o = rolling_ols(r[s], X, W)
             res = o["resid_oos"][fwin]
             if res.notna().sum() < 0.9 * max(form_days, 1):
@@ -771,7 +853,7 @@ class S088(_XSBase):
         if not score:
             return None
         longs, shorts = self.select(pd.Series(score), q_of(p["decile"]), True)
-        w = self.weights_from(ctx, longs, shorts)
+        w = dollar_balance(self.weights_from(ctx, longs, shorts))
         if p["beta_hedge"]:
             nb = sum(v * beta.get(s, float("nan")) for s, v in w.items() if beta.get(s) == beta.get(s))
             if abs(nb) > 1e-6:
@@ -791,13 +873,15 @@ class S091(_XSBase):
     name = "Value factor (book-to-market)"
     params = {"decile": 0.10, "frequency": "annual"}
     grid = {"decile": [0.10, 0.20], "frequency": ["annual", "semiannual"]}
-    fund_fields = ("stockholders_equity", "shares_outstanding") + FY_ANCHORS
+    fund_fields = ("stockholders_equity", "deferred_taxes", "preferred_stock", "shares_outstanding") + FY_ANCHORS
     fund_bootstrap_months = 18
     requires = _common_requires(fund=True)
     deviations = COMMON_XS_DEVIATIONS + [
-        "Book equity: Fama-French BE = SE + deferred taxes/ITC - preferred stock, but the data layer's XBRL map "
-        "only has StockholdersEquity -> BE = stockholders_equity at the fiscal-year end (no DT/ITC, no preferred "
-        "adjustment); BE <= 0 excluded",
+        "Book equity (Fama-French, DATA.md 4.4): BE = stockholders_equity + deferred_taxes - preferred_stock at the "
+        "fiscal-year end; a missing deferred_taxes / preferred_stock fact = not reported = 0 (deferred_taxes is "
+        "sparse after ASU 2015-17; investment tax credit not separately available); preferred uses the data "
+        "layer's PreferredStockValue > CarryingAmount > ... fallback (not FF's redemption > liquidation > par "
+        "order); missing stockholders_equity -> excluded; BE <= 0 excluded",
         "Fiscal year end = period_end of the latest revenue_fy/net_income_fy known at the signal with period_end "
         "<= the end of the market-equity month (December 31 of t-1 for June formation)",
         "ME(December t-1) = raw close on the last December session x shares_outstanding known at that close "
@@ -827,7 +911,10 @@ class S091(_XSBase):
             fy = self.fh.fy_end(s, ctx.now, FY_ANCHORS, not_after=me_date + pd.offsets.MonthEnd(0))
             if fy is None or (me_date - fy).days > 550:
                 continue
-            be = self.fh.value_at(s, "stockholders_equity", fy, ctx.now, tol_days=10)
+            se = self.fh.value_at(s, "stockholders_equity", fy, ctx.now, tol_days=10)
+            dt = self.fh.value_at(s, "deferred_taxes", fy, ctx.now, tol_days=10)
+            ps = self.fh.value_at(s, "preferred_stock", fy, ctx.now, tol_days=10)
+            be = se + (dt if dt == dt else 0.0) - (ps if ps == ps else 0.0)
             if not (be == be and be > 0):
                 continue
             me_ = market_cap(ctx, self.fh, s, me_date, cutoff=me_close)
@@ -895,14 +982,15 @@ class S093(_XSBase):
     params = {"rank": 0.20, "lag": "exact"}
     grid = {"rank": [0.10, 0.20], "lag": ["exact", "30d"]}
     fund_fields = ("operating_cash_flow_fy", "operating_cash_flow_q", "operating_cash_flow_ytd", "capex_fy",
-                   "capex_q", "capex_ytd", "long_term_debt", "cash", "shares_outstanding")
+                   "capex_q", "capex_ytd", "long_term_debt", "short_term_debt", "preferred_stock", "cash",
+                   "shares_outstanding")
     fund_bootstrap_months = 27
     requires = _common_requires(fund=True)
     deviations = COMMON_XS_DEVIATIONS + [
         "Quarter end = last NYSE session of Mar/Jun/Sep/Dec",
         "FCF TTM = TTM(operating_cash_flow) - TTM(capex) (YTD-based TTM; capex = PaymentsToAcquirePPE)",
-        "EV = market cap + long_term_debt - cash (short-term debt, preferred and minority interest are not in the "
-        "data layer's XBRL map); missing debt counted as 0, missing cash as 0",
+        "EV = market cap + long_term_debt + short_term_debt + preferred_stock - cash (latest balance sheet known "
+        "at the cutoff); minority interest not in the data layer's XBRL map; a missing component counts as 0",
         "EV <= 0 excluded; negative FCF kept and ranked (falls into the short side) - explicit handling",
         "lag='30d': only filings with known_at <= signal - 30 days (all fundamentals incl. shares)",
     ]
@@ -924,9 +1012,10 @@ class S093(_XSBase):
             mc = market_cap(ctx, self.fh, s, cutoff=cut)
             if not (mc == mc and mc > 0):
                 continue
-            debt, _, _ = self.fh.latest(s, "long_term_debt", cut)
-            cash, _, _ = self.fh.latest(s, "cash", cut)
-            ev = mc + (debt if debt == debt else 0.0) - (cash if cash == cash else 0.0)
+            comp = {f: self.fh.latest(s, f, cut)[0] for f in ("long_term_debt", "short_term_debt", "preferred_stock",
+                                                                "cash")}
+            comp = {f: (v if v == v else 0.0) for f, v in comp.items()}
+            ev = mc + comp["long_term_debt"] + comp["short_term_debt"] + comp["preferred_stock"] - comp["cash"]
             if ev <= 0:
                 continue
             y[s] = (cfo - abs(capex)) / ev
@@ -1011,7 +1100,7 @@ class S095(_XSBase):
     fund_fields = ("net_income_fy", "net_income_q", "net_income_ytd", "gross_profit_fy", "gross_profit_q",
                    "gross_profit_ytd", "revenue_fy", "revenue_q", "revenue_ytd", "cost_of_revenue_fy",
                    "cost_of_revenue_q", "cost_of_revenue_ytd", "stockholders_equity", "total_assets",
-                   "long_term_debt")
+                   "long_term_debt", "short_term_debt")
     fund_bootstrap_months = 75
     long_gross = 0.60
     short_gross = 0.60
@@ -1021,15 +1110,17 @@ class S095(_XSBase):
     deviations = COMMON_XS_DEVIATIONS + [
         "Book 60%/60% long/short as stated in the strategy text (overrides CROSS_SECTION 50/50); name cap 2% and "
         "sector caps 10% per side still applied",
-        "Industry cross-section = GICS sector (sub-industries too thin for z-scores in the S&P 500); group_zscore "
+        "Industry cross-section = SIC->GICS-like sector (current snapshot, T2; sub-industries too thin for z-scores "
+        "in the S&P 500); names without a sector are not ranked; group_zscore "
         "requires >= 2 names",
         "ROE = TTM net income / latest stockholders_equity; GP/A = TTM gross profit (or revenue - cost of revenue) "
         "/ latest total_assets; 5y sales growth = (revenue_fy / revenue_fy five fiscal years earlier)^(1/5)-1; "
-        "debt/assets = long_term_debt / total_assets (short-term debt not in data map); earnings volatility = "
+        "debt/assets = (long_term_debt + short_term_debt; a missing short-term component = 0, both missing -> no "
+        "metric) / total_assets; earnings volatility = "
         "stdev of fiscal-year ROE over up to the last 5 fiscal years (>= 3 required)",
         "'weighted' = AQR QMJ pillars: profitability (ROE, GP/A) 1/3, growth 1/3, safety (-D/A, -EVOL) 1/3",
         "Winsorize = cross-sectional clip at (p, 1-p) per metric before z-scoring",
-        "Sector neutrality = deciles formed within each GICS sector (group_quantile_bucket)",
+        "Sector neutrality = deciles formed within each sector (group_quantile_bucket)",
     ]
     spec = ("For each industry cross-section z-score ROE, gross profit/assets, 5y sales growth, -debt/assets, "
             "-earnings volatility; mean available z; long top decile and short bottom. || Monthly rebalance; 60/60 "
@@ -1054,9 +1145,10 @@ class S095(_XSBase):
             old = rev[np.abs((rev.index - (E - pd.DateOffset(years=5))).days) <= 20]
             if len(old) and old.iloc[-1] > 0 and rev[E] > 0:
                 out["sg5"] = (rev[E] / old.iloc[-1]) ** 0.2 - 1.0
-        debt, _, _ = fh.latest(s, "long_term_debt", cut)
-        if ta == ta and ta > 0 and debt == debt:
-            out["lev"] = -debt / ta
+        ltd, _, _ = fh.latest(s, "long_term_debt", cut)
+        std, _, _ = fh.latest(s, "short_term_debt", cut)
+        if ta == ta and ta > 0 and (ltd == ltd or std == std):
+            out["lev"] = -((ltd if ltd == ltd else 0.0) + (std if std == std else 0.0)) / ta
         nfy = fh.fy_values(s, "net_income", cut)
         roes = []
         for E in list(nfy.index[-5:]):
@@ -1072,7 +1164,7 @@ class S095(_XSBase):
         m = pd.DataFrame({s: self._metrics(s, ctx.now) for s in syms}).T
         if m.empty:
             return None
-        sec = pd.Series(self.sm.sectors(m.index))
+        sec = self.sm.sector_groups(m.index)
         z = pd.DataFrame(index=m.index)
         for c in m.columns:
             col = m[c].dropna()
@@ -1125,7 +1217,7 @@ class S096(_XSBase):
         nyse = nyse_mask(ctx, self.sm, list(size.index))
         if not p["sector_neutral"]:
             return self.weights_from(ctx, *self.select_in_size_buckets(ctx, vol, size, q, False, nyse))
-        sec = pd.Series(self.sm.sectors(size.index))
+        sec = self.sm.sector_groups(size.index)
         sb = xs.size_buckets(size, nyse.reindex(size.index), 2)
         longs, shorts = [], []
         for g in sorted(sb.dropna().unique()):
@@ -1186,18 +1278,23 @@ class S097(_XSBase):
 class S098(_XSBase):
     id = "S098"
     name = "Shareholder yield"
-    params = {"issuance_window": "TTM", "rank": 0.20}
+    params = {"issuance_window": "TTM", "rank": 0.20, "net_issuance": "cash"}
     grid = {"issuance_window": ["TTM", "3y"], "rank": [0.10, 0.20]}
-    fund_fields = ("dividends_paid_fy", "dividends_paid_q", "dividends_paid_ytd", "shares_outstanding")
+    fund_fields = ("dividends_paid_fy", "dividends_paid_q", "dividends_paid_ytd", "repurchase_fy", "repurchase_q",
+                   "repurchase_ytd", "stock_issuance_proceeds_fy", "stock_issuance_proceeds_q",
+                   "stock_issuance_proceeds_ytd", "shares_outstanding")
     fund_bootstrap_months = 40
     requires = _common_requires(fund=True)
     deviations = COMMON_XS_DEVIATIONS + [
         "Quarter end = last NYSE session of Mar/Jun/Sep/Dec",
-        "Dividend yield = TTM dividends_paid (cash flow statement, YTD-based TTM) / market cap",
-        "Net repurchase yield = -(net issuance) measured from split-adjusted shares_outstanding: TTM: "
-        "-(sh_now/sh_1y - 1); 3y: -((sh_now/sh_3y)^(1/3) - 1); share counts as filed and known 1y/3y before the "
-        "signal; issuance proceeds are not in the data layer's XBRL map, so the share-count measure is used",
-        "Missing dividends counted as 0 when shares data exist; names without both measures excluded",
+        "Dividend yield = TTM dividends_paid (cash flow statement, YTD-based TTM) / market cap; missing = 0",
+        "Net repurchase yield (baseline net_issuance='cash') = (repurchase - stock_issuance_proceeds) / market cap: "
+        "TTM = YTD-based TTM flows; 3y = mean of the last 3 fiscal years' net repurchases (fiscal years ending "
+        "within 3y+60d of the signal); a missing component = 0 when the other is reported",
+        "Names reporting neither repurchase nor issuance proceeds fall back to the share-count measure "
+        "-(sh_now/sh_then_split_adj)^(1/years) + 1 (shares_outstanding as filed and known 1y/3y before the signal); "
+        "the fallback is flagged T2 and its share of the cross-section logged; net_issuance='shares' uses the "
+        "share-count measure for every name",
     ]
     spec = ("Quarterly rank cash dividends yield + net share repurchase yield (net issuance negative); public "
             "filing only; long top quintile/short bottom. || Rebalance quarterly; dividend adjusted total return.")
@@ -1205,23 +1302,60 @@ class S098(_XSBase):
     def is_rebalance(self, ctx):
         return ctx.session_date().month in QUARTER_END_MONTHS
 
+    def _net_repurchase_cash(self, ctx, s, years: int) -> float:
+        now = ctx.now
+        if years == 1:
+            rp = self.fh.ttm(s, "repurchase", now)
+            iss = self.fh.ttm(s, "stock_issuance_proceeds", now)
+            if not (rp == rp or iss == iss):
+                return float("nan")
+            return (abs(rp) if rp == rp else 0.0) - (abs(iss) if iss == iss else 0.0)
+        today = ctx.session_date()
+        rp = self.fh.fy_values(s, "repurchase", now)
+        iss = self.fh.fy_values(s, "stock_issuance_proceeds", now)
+        ends = sorted(set(rp.index) | set(iss.index))
+        ends = [e for e in ends if (today - e).days <= 365 * years + 60]
+        if len(ends) < years:
+            return float("nan")
+        ends = ends[-years:]
+        tot = sum((abs(rp[e]) if e in rp.index else 0.0) - (abs(iss[e]) if e in iss.index else 0.0) for e in ends)
+        return tot / years
+
+    def _net_repurchase_shares(self, ctx, s, years: int) -> float:
+        sh, _, kat = self.fh.latest(s, "shares_outstanding", ctx.now)
+        sh0, _, kat0 = self.fh.latest(s, "shares_outstanding", ctx.now - pd.DateOffset(years=years))
+        if not (sh == sh and sh0 == sh0 and sh0 > 0):
+            return float("nan")
+        sh0_adj = sh0 * split_factor(ctx, s, kat0, pd.Timestamp(kat).tz_convert(ET).tz_localize(None))
+        return -((sh / sh0_adj) ** (1.0 / years) - 1.0)
+
     def target_weights(self, ctx, syms):
         years = 1 if self.params["issuance_window"] == "TTM" else 3
-        y = {}
+        cash_mode = self.params["net_issuance"] == "cash"
+        y, n_fallback = {}, 0
         for s in syms:
-            sh, _, kat = self.fh.latest(s, "shares_outstanding", ctx.now)
-            old_cut = ctx.now - pd.DateOffset(years=years)
-            sh0, _, kat0 = self.fh.latest(s, "shares_outstanding", old_cut)
             mc = market_cap(ctx, self.fh, s)
-            if not (sh == sh and sh0 == sh0 and sh0 > 0 and mc == mc and mc > 0):
+            if not (mc == mc and mc > 0):
                 continue
-            sh0_adj = sh0 * split_factor(ctx, s, kat0, pd.Timestamp(kat).tz_convert(ET).tz_localize(None))
-            nr = -((sh / sh0_adj) ** (1.0 / years) - 1.0)
+            nr = float("nan")
+            if cash_mode:
+                v = self._net_repurchase_cash(ctx, s, years)
+                if v == v:
+                    nr = v / mc
+            if not nr == nr:
+                nr = self._net_repurchase_shares(ctx, s, years)
+                if nr == nr and cash_mode:
+                    n_fallback += 1
+            if not nr == nr:
+                continue
             dv = self.fh.ttm(s, "dividends_paid", ctx.now)
-            dy = abs(dv) / mc if dv == dv else 0.0
-            y[s] = dy + nr
+            y[s] = (abs(dv) / mc if dv == dv else 0.0) + nr
         if not y:
             return None
+        if n_fallback:
+            ctx.flag_fidelity(Fidelity.T2_PROXY, "S098: share-count net-issuance fallback for names without "
+                                                 "repurchase/issuance-proceeds facts")
+            ctx.log("S098 share-count fallback", n=n_fallback, of=len(y))
         longs, shorts = self.select(pd.Series(y), q_of(self.params["rank"]), True)
         return self.weights_from(ctx, longs, shorts)
 
@@ -1236,8 +1370,8 @@ class S099(_XSBase):
     fund_bootstrap_months = 40
     requires = _common_requires(fund=True)
     deviations = COMMON_XS_DEVIATIONS + [
-        "A_t = total_assets at the latest fiscal-year end known at June end (FY end = period_end of latest "
-        "revenue_fy/net_income_fy); A_{t-k} = total_assets at the fiscal-year end k years earlier (+/-20 days); "
+        "A_t = total_assets at the fiscal-year end ending in calendar year t-1 (Fama-French CMA timing; latest such "
+        "FY known at June end, FY end = period_end of revenue_fy/net_income_fy); A_{t-k} = total_assets at the fiscal-year end k years earlier (+/-20 days); "
         "2y window = A_t/A_{t-2} - 1",
         "Index exits between annual rebalances are held",
     ]
@@ -1251,8 +1385,9 @@ class S099(_XSBase):
         k = int(self.params["growth_years"])
         g = {}
         for s in syms:
-            E = self.fh.fy_end(s, ctx.now, FY_ANCHORS)
-            if E is None:
+            E = self.fh.fy_end(s, ctx.now, FY_ANCHORS,
+                               not_after=pd.Timestamp(year=ctx.session_date().year - 1, month=12, day=31))
+            if E is None or (ctx.session_date() - E).days > 550:
                 continue
             a1 = self.fh.value_at(s, "total_assets", E, ctx.now, 10)
             a0 = self.fh.value_at(s, "total_assets", E - pd.DateOffset(years=k), ctx.now, 20)
@@ -1278,7 +1413,9 @@ class S100(_XSBase):
     deviations = COMMON_XS_DEVIATIONS + [
         "B/M = latest stockholders_equity / current market cap (monthly, no FF June lag); ROA = TTM net income / "
         "latest total_assets; momentum 12-2 = P(M1)/P(M12)-1",
-        "Industry z-scores = group_zscore within GICS sector (>= 2 names); names need all three z",
+        "Industry z-scores = group_zscore within the SIC->GICS-like sector (current snapshot, T2; >= 2 names); "
+        "names without a sector or needing all three z are dropped",
+        "B/M undefined (NaN, name not ranked) when stockholders' equity <= 0",
         "Weights '0.25/0.25/0.5' read in the listed order (V, Q, M): momentum gets 0.5",
         "Optional turnover cap (param turnover_cap, e.g. 0.15; default None): if one-sided turnover "
         "sum|w_new - w_old|/2 exceeds the cap, the move is scaled to w_old + (cap/turnover)(w_new - w_old)",
@@ -1297,11 +1434,11 @@ class S100(_XSBase):
             ta, _, _ = self.fh.latest(s, "total_assets", ctx.now)
             ni = self.fh.ttm(s, "net_income", ctx.now)
             mc = market_cap(ctx, self.fh, s)
-            rows[s] = {"bm": se / mc if se == se and mc == mc and mc > 0 else np.nan,
+            rows[s] = {"bm": se / mc if se == se and se > 0 and mc == mc and mc > 0 else np.nan,
                        "roa": ni / ta if ni == ni and ta == ta and ta > 0 else np.nan,
                        "mom": mom.get(s, np.nan)}
         f = pd.DataFrame(rows).T.astype(float)
-        sec = pd.Series(self.sm.sectors(f.index))
+        sec = self.sm.sector_groups(f.index)
         z = pd.DataFrame({c: xs.group_zscore(f[c], sec) for c in ("bm", "roa", "mom")})
         wv, wq, wm = self.W[self.params["weights"]]
         comp = (wv * z["bm"] + wq * z["roa"] + wm * z["mom"]).dropna()

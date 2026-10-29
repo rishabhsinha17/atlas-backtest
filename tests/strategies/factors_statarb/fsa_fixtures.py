@@ -74,15 +74,34 @@ class SMPortal(InMemoryPortal):
             return super().security_master(as_of)
         return self._master.copy()
 
+    def fundamentals_history(self, symbols, fields, as_of, start=None):
+        """Every filed value with known_at <= as_of (and period_end >= start), like the real Portal."""
+        cols = ["symbol", "field", "value", "period_end", "known_at", "source"]
+        f = self._fund
+        if f is None or not len(f):
+            return pd.DataFrame(columns=cols)
+        a = pd.Timestamp(as_of)
+        a = a.tz_localize("UTC") if a.tzinfo is None else a.tz_convert("UTC")
+        m = f["field"].isin(list(fields)) & (pd.to_datetime(f["known_at"], utc=True) <= a)
+        if symbols is not None:
+            m &= f["symbol"].isin(list(symbols))
+        if start is not None:
+            m &= pd.to_datetime(f["period_end"]) >= pd.Timestamp(start)
+        return f[m].sort_values(["symbol", "field", "period_end", "known_at"]).reset_index(drop=True)
 
-def master(symbols, sectors=None, sub=None, exchange="NYSE") -> pd.DataFrame:
+
+def master(symbols, sectors=None, sub=None, exchange="NYSE", sic=None) -> pd.DataFrame:
+    """Security master with the REAL Portal column names (sector = SIC->GICS-like, gics_*_current,
+    exchange, sic). Default SIC: one 3-digit group per sub-industry label."""
     n = len(symbols)
+    sec = sectors if sectors is not None else [SECTORS5[i % 5] for i in range(n)]
+    sb = sub if sub is not None else [f"SUB{i % 10}" for i in range(n)]
+    if sic is None:
+        uniq = list(dict.fromkeys(sb))
+        sic = [2000 + 10 * uniq.index(x) for x in sb]
     return pd.DataFrame({
-        "symbol": list(symbols),
-        "gics_sector": sectors if sectors is not None else [SECTORS5[i % 5] for i in range(n)],
-        "gics_sub_industry": sub if sub is not None else [f"SUB{i % 10}" for i in range(n)],
-        "exchange": exchange if isinstance(exchange, list) else [exchange] * n,
-        "sic": [3570 + i for i in range(n)],
+        "symbol": list(symbols), "sector": sec, "gics_sector_current": sec, "gics_sub_industry_current": sb,
+        "exchange": exchange if isinstance(exchange, list) else [exchange] * n, "sic": sic,
     })
 
 

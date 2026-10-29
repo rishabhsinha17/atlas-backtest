@@ -159,7 +159,7 @@ class S106(_PairBase):
         "Gatev-Goetzmann-Rouwenhorst schedule: pairs formed on the trailing `formation` sessions, traded for the "
         "next trading_period=126 sessions (GGR 6 months), then re-formed; pairs still open at re-formation are "
         "closed (exit reason 'period_end'); no trading on the formation bar itself",
-        "Eligible = PIT SP500 members with a complete formation window; same sector = same GICS sector "
+        "Eligible = PIT SP500 members with a complete formation window; same sector = same SIC->GICS-like sector (current snapshot, T2) "
         "(security_master); best 20 = smallest SSD, greedy non-overlapping (indicators.select_pairs)",
         "z = (normalised spread - formation mean)/formation stdev (indicators.pair_spread_z, moments frozen at "
         "formation end); a pair is rich when z > 0 -> short a / long b",
@@ -234,12 +234,15 @@ class S107(_PairBase):
     asset = "STK"
     universe_name = "SP500"
     params = {"p_value": 0.05, "z_entry": 2.0, "formation": 252, "sigma_window": 60, "max_hold": 30,
-              "max_pairs": 10}
+              "max_pairs": 10, "industry_map": "SIC"}
     grid = {"p_value": [0.01, 0.05], "z_entry": [1.5, 2.5], "formation": [126, 252]}
     requires = [Requirement("bars", "1d", note="daily bars for the PIT SP500 universe")]
     deviations = COMMON_PAIR_DEVIATIONS + [
         SURVIVORSHIP_NOTE,
-        "Industry pairs = same GICS sub-industry (security_master gics_sub_industry, fallback gics_industry); "
+        "Industry pairs = same 3-digit SIC industry group (baseline; latest SEC SIC, T2) or, with "
+        "industry_map='GICS', same GICS sub-industry (gics_sub_industry_current: current members only, ~59% PIT "
+        "coverage in 2012, T2); flagged once with coverage; NotTestableError if the column is missing or coverage "
+        "< 50% of the PIT universe; "
         "Engle-Granger (indicators.engle_granger, MacKinnon p) on log total-return prices over the trailing "
         "`formation` sessions, y = alphabetically first symbol",
         "Monthly review at month-end close: open pairs re-tested (p >= threshold -> closed, 'coint_fail'); new "
@@ -274,7 +277,8 @@ class S107(_PairBase):
         p = self.params
         W = int(p["formation"])
         syms = self.symbols(ctx)
-        self.sm.refresh(ctx)
+        self.sm.refresh(ctx, uses_sector=False)
+        self.sm.require_industry(ctx, syms, p["industry_map"], "S107")
         px = close_panel(ctx, sorted(set(syms) | self.legs()), W)
         if px.empty or px.index[-1] != ctx.session_date():
             self.active = self.active or {}
@@ -292,7 +296,7 @@ class S107(_PairBase):
         ind: dict[str, list[str]] = {}
         for s in px.columns:
             if s in set(syms) and px[s].notna().all():
-                k = self.sm.industry(s, "GICS")
+                k = self.sm.industry(s, p["industry_map"])
                 if k:
                     ind.setdefault(k, []).append(s)
         cands = []
@@ -435,8 +439,9 @@ class S109(_PairBase):
         "held until the next weekly rebalance (5 sessions) - the rebalance replaces the book",
         "Residual of day d = daily total return minus fit on SPY + the stock's sector SPDR with betas fit on the "
         "252 sessions through d-1 (indicators.rolling_ols resid_oos); score = sum over the last resid_days",
-        "Stocks without a sector SPDR at the date (unknown sector, XLRE before 2015-10, XLC before 2018-06) excluded",
-        "Selection: bottom/top `select` fraction of the whole universe; longs and shorts matched inside each sector "
+        "The sector SPDR regressor is used only if it has >= reg_window returns before the residual window; "
+        "otherwise (XLRE before ~2016-10, XLC before ~2019-06, no SPDR for the sector) the stock gets a "
+        "market-only regression; stocks without a sector (needed for sector-neutral pairing) are excluded",
         "(most negative with most positive) -> sector-neutral pairs; pairs ranked by residual spread, at most "
         "max_pairs=10 (100% NAV gross), each 5%/5% dollar neutral",
         "Beta neutral: net market beta of the book (univariate 252d beta vs SPY) hedged with SPY (beta_hedge)",
@@ -464,18 +469,20 @@ class S109(_PairBase):
         if px.empty or "SPY" not in px or px.index[-1] != today:
             return
         r = daily_returns(px)
+        usable = {e for e in etfs if e in r and int(r[e].iloc[:-L].notna().sum()) >= W}
         score, beta, sector = {}, {}, {}
         for s in syms:
-            e = etf_of.get(s)
-            if not e or e not in r or s not in r:
+            sec = self.sm.sector(s)
+            if not sec or s not in r:
                 continue
-            o = rolling_ols(r[s], r[["SPY", e]], W)
+            e = etf_of.get(s)
+            o = rolling_ols(r[s], r[["SPY"] + ([e] if e in usable else [])], W)
             res = o["resid_oos"].iloc[-L:]
             if res.notna().sum() < L:
                 continue
             score[s] = float(res.sum())
             beta[s] = ols_beta(r[s].iloc[-W:], r["SPY"].iloc[-W:], int(0.9 * W))
-            sector[s] = self.sm.sector(s)
+            sector[s] = sec
         if len(score) < 2:
             return
         sc = pd.Series(score)
@@ -614,8 +621,9 @@ class S112(_PairBase):
         "already held; matched as pairs (most negative with most positive), at most max_pairs=10 open pairs "
         "(100% NAV gross), each 5%/5% dollar neutral",
         "Exit 5 sessions after entry or when the pair's residual spread (score short - score long) crosses 0",
-        "Net beta neutral: SPY overlay = -sum(position notional x 252d beta), rebalanced when it moves by more "
-        "than hedge_band=0.5% NAV",
+        "Net beta neutral: SPY overlay = -sum((position + working-order quantity) x price x 252d beta) over all "
+        "stock holdings, rebalanced when it moves by more than hedge_band=0.5% NAV; leftover stock positions not "
+        "in an open pair (partial fills, rejected legs) are flattened at the next close",
     ]
     spec = ("For PIT universe top 100 liquid stocks run PCA on 252d covariance through t-1; reconstruct daily "
             "returns using first 5 PCs; cumulate residual over 5d; buy bottom decile sell top. || Exit 5 trading "
@@ -674,25 +682,36 @@ class S112(_PairBase):
                     if not rr.empty and not spy.empty:
                         self.betas[s] = ols_beta(rr[s], spy["SPY"], int(0.9 * W))
                 self.open_pair(ctx, (l, h, ctx.session_date()), l, h)
+        self.flatten_orphans(ctx)
         if p["beta_hedge"]:
             self.hedge(ctx)
 
+    @staticmethod
+    def exposure(ctx, sym: str) -> float:
+        """Position plus the remaining quantity of working orders (what the book will be)."""
+        return ctx.position(sym) + sum(o.quantity - o.filled_qty for o in ctx.open_orders(sym))
+
     def hedge(self, ctx):
         nb = 0.0
-        for o in self.open.values():
-            for s, q in ((o["long"], o["qty_long"]), (o["short"], o["qty_short"])):
-                b = self.betas.get(s, float("nan"))
-                px = ctx.mark(s)
-                if b == b and px == px:
-                    nb += q * px * b
+        syms = (self.legs() | {x for x, q in ctx.positions().items() if q}) - set(self.overlay_symbols)
+        for s in sorted(syms):
+            q = self.exposure(ctx, s)
+            if not q:
+                continue
+            b = self.betas.get(s, float("nan"))
+            px = ctx.mark(s)
+            if b == b and px == px:
+                nb += q * px * b
         spx = ctx.mark("SPY")
         if not (spx == spx and spx > 0):
             return
         tgt = -math.trunc(nb / spx)
-        cur = ctx.position("SPY")
+        cur = self.exposure(ctx, "SPY")
         if abs(tgt - cur) * spx > self.params["hedge_band"] * ctx.nav:
             ctx.cancel_all("SPY")
-            ctx.order("SPY", tgt - cur, tag="beta_hedge")
+            d = tgt - ctx.position("SPY")
+            if d:
+                ctx.order("SPY", d, tag="beta_hedge")
 
 
 # =====================================================================================
@@ -703,13 +722,16 @@ class S113(_PairBase):
     asset = "STK"
     bar_freq = "1mo"
     universe_name = "SP500"
-    params = {"mom_diff": 0.20, "beta_window": 126, "mom_months": 3, "max_pairs": 10, "pair_gross": 0.10}
+    params = {"mom_diff": 0.20, "beta_window": 126, "mom_months": 3, "max_pairs": 10, "pair_gross": 0.10,
+              "industry_map": "SIC"}
     grid = {"mom_diff": [0.10, 0.20, 0.30], "beta_window": [126, 252]}
     requires = [Requirement("bars", "1d", note="daily bars for the PIT SP500 universe"),
                 Requirement("bars", "1d", symbols=("SPY",), note="beta regressor")]
     deviations = COMMON_PAIR_DEVIATIONS[:1] + [
         SURVIVORSHIP_NOTE,
-        "Matching industry pairs = same GICS sub-industry (fallback gics_industry) among PIT SP500 members",
+        "Matching industry pairs = same 3-digit SIC industry group among PIT SP500 members (baseline; latest SEC "
+        "SIC, T2) or same GICS sub-industry with industry_map='GICS' (gics_sub_industry_current, current members "
+        "only, T2); flagged once with coverage; NotTestableError if the column is missing or coverage < 50%",
         "3m momentum = total return over the last 3 calendar month-ends P(M0)/P(M3)-1; pairs with |difference| "
         "> mom_diff qualify, ranked by difference, non-overlapping, at most max_pairs=10 (sheet gives no count)",
         "'beta-adjusted' (strategy text overrides the dollar-neutral PAIRS default): betas = OLS of daily returns "
@@ -736,7 +758,8 @@ class S113(_PairBase):
         Bw = int(p["beta_window"])
         n = max(n_sessions_between(cal, me[-1], ctx.session_date()) + 1, Bw + 1)
         syms = self.symbols(ctx)
-        self.sm.refresh(ctx)
+        self.sm.refresh(ctx, uses_sector=False)
+        self.sm.require_industry(ctx, syms, p["industry_map"], "S113")
         px = close_panel(ctx, list(syms) + ["SPY"], n)
         if px.empty or "SPY" not in px or px.index[-1] != ctx.session_date() or me[-1] not in px.index:
             return
@@ -745,7 +768,7 @@ class S113(_PairBase):
         ind: dict[str, list[str]] = {}
         for s in syms:
             if s in mom.index and mom[s] == mom[s]:
-                k = self.sm.industry(s, "GICS")
+                k = self.sm.industry(s, p["industry_map"])
                 if k:
                     ind.setdefault(k, []).append(s)
         cands = []
@@ -797,13 +820,19 @@ class S114(_PairBase):
         SURVIVORSHIP_NOTE,
         "Shock: sector SPDR daily total return > shock_sigma x stdev of its returns over the 60 prior sessions "
         "(t-60..t-1); literal reading 'return > 2 sigma' (up-shocks only); two_sided=True also uses |r|",
-        "Members = PIT SP500 stocks whose GICS sector maps to that SPDR; beta-residual return of the shock day = "
+        "Members = PIT SP500 stocks whose sector (SIC->GICS-like, current snapshot, T2) maps to that SPDR; a SPDR "
+        "is only traded once it has beta_window=252 sessions of returns (XLRE from ~2016-10, XLC from ~2019-06; "
+        "before that rolling_ols has no full window); beta-residual return of the shock day = "
         "r_i - (alpha + beta r_ETF) with alpha/beta fit on the 252 sessions through t-1 (rolling_ols resid_oos)",
         "Long the bottom `select`=20% residuals (underperformers), short the top 20% (overperformers), matched as "
         "pairs (most under with most over), at most max_pairs=10 open pairs, each 5%/5% dollar neutral",
         "Hard-to-borrow screen: short leg only if portal.borrow says shortable and fee <= 1% p.a.",
         "'Exit next close or 3d' = MOC exit at the close of the hold_days-th session after the signal; for "
-        "hold_days=1 the MOC exit is submitted together with the entry at the signal close",
+        "hold_days=1 the MOC exit must be submitted together with the entry at the signal close (the 15:50 MOC "
+        "cutoff of the next session precedes any daily-bar callback; a bracket time_exit child fills at the open "
+        "AFTER the next close in daily mode, which would not be 'next close'). To keep that MOC equal to the "
+        "position actually acquired, the pair is skipped unless each leg is <= participation_cap (10%) x the "
+        "minimum daily volume of the last 20 sessions (the entry then cannot be volume-capped)",
         "Positions left by unfilled/partial orders are flattened at the next close (orphan cleanup)",
     ]
     spec = ("At day close a sector ETF daily return>2σ, rank member stock beta-residual return; long member "
@@ -870,10 +899,24 @@ class S114(_PairBase):
                 if len(self.open) >= int(p["max_pairs"]):
                     return
                 pid = (l, h, today)
+                if H == 1 and not self._fully_fillable(ctx, l, h):
+                    ctx.log("S114 pair skipped: entry could be volume-capped", long=l, short=h)
+                    continue
                 if self.open_pair(ctx, pid, l, h, etf=e) and H == 1:
                     o = self.open[pid]
                     ctx.order(l, -o["qty_long"], OrderType.MOC, tag="exit:time_moc")
                     ctx.order(h, -o["qty_short"], OrderType.MOC, tag="exit:time_moc")
+
+    def _fully_fillable(self, ctx, l: str, h: str, cap: float = 0.10) -> bool:
+        pl, ps = float(ctx.mark(l)), float(ctx.mark(h))
+        if not (pl == pl and ps == ps and pl > 0 and ps > 0):
+            return False
+        ql, qs = size_pairs(ctx.nav, pl, ps)
+        for sym, q in ((l, ql), (h, qs)):
+            v = ctx.history(sym, 20, "1d", adjusted=False)
+            if v is None or len(v) < 20 or not abs(q) <= cap * float(v["volume"].min()):
+                return False
+        return True
 
     def _borrowable(self, ctx, s) -> bool:
         try:
