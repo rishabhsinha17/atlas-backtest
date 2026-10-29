@@ -304,8 +304,10 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
   not an error).
 * Universe coverage (`BacktestConfig.min_universe_coverage`, default 0.95): `portal.universe(name)` as seen by
   the strategy (and the `universe_name` used for requirement checks) contains only members with VERIFIED data
-  (`has` + fidelity for base-frequency bars and every critical requirement without explicit `symbols`; memoised
-  per symbol). Members are not each required: if coverage (kept / members) at the run start or at any session
+  (`has` for base-frequency bars, using the windowed `has(sym, "bars", freq, start=, end=, as_of=)` over the run
+  window when the portal supports it, and for every critical requirement without explicit `symbols`; fidelity
+  only tiers: an unknown tier (NA) does not drop a member, a known tier worse than `min_fidelity` does;
+  memoised per symbol; security keys such as `T~CIK...` work as symbols throughout). Members are not each required: if coverage (kept / members) at the run start or at any session
   where the universe is queried is below the minimum, the run is `NOT_TESTABLE` with the coverage figure and
   example members (1.0 = the old every-member rule). Coverage < 100% flags T2 "universe NAME coverage X%
   (members without verified data excluded)"; `meta["universe_coverage"]` holds the series (date, members,

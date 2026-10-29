@@ -359,6 +359,7 @@ class Backtester:
           portal must return bars of that session in the run's first sessions."""
         fidmap: dict[str, Optional[int]] = {}
         syms_default = list(self.strategy.universe)
+        verified_members: set = set()
         if self.strategy.universe_name and sessions is not None and len(sessions):
             members = None
             try:
@@ -373,10 +374,27 @@ class Backtester:
                 if self._coverage_fail:
                     return False, self._coverage_fail, fidmap
                 syms_default = kept
+                verified_members = set(kept)
         for r in self.strategy.requires:
             syms = list(r.symbols) if r.symbols else syms_default
             for s_ in syms:
                 key = f"{r.kind}:{s_}:{r.freq or ''}"
+                if not r.symbols and s_ in verified_members:
+                    # already verified by the coverage rule (availability; fidelity only tiers)
+                    try:
+                        f = self.portal.fidelity_of(s_, r.kind, r.freq)
+                        fidmap[key] = int(f) if f is not None else int(Fidelity.NA)
+                    except Exception:
+                        fidmap[key] = int(Fidelity.NA)
+                    has, f = True, Fidelity.T3_MODELED
+                    ext = [x for x in r.sessions if x in ("PRE", "POST")]
+                    if r.kind in ("bars", "quotes", "options") and ext and r.critical \
+                            and sessions is not None and len(sessions):
+                        missing = self._probe_sessions(s_, r.freq or self.base_freq, ext, sessions, kind=r.kind)
+                        if missing:
+                            return False, (f"required {'/'.join(missing)} {r.kind} for {s_} not "
+                                           f"available in the backtest window"), fidmap
+                    continue
                 try:
                     has = bool(self.portal.has(s_, r.kind, r.freq))
                     f = self.portal.fidelity_of(s_, r.kind, r.freq) if has else Fidelity.NA
@@ -411,17 +429,36 @@ class Backtester:
         checks += [(r.kind, r.freq, r.min_fidelity) for r in self.strategy.requires if r.critical and not r.symbols]
         v = (True, "")
         for kind, freq, mf in checks:
-            try:
-                has = bool(self.portal.has(sym, kind, freq))
-                f = self.portal.fidelity_of(sym, kind, freq) if has else Fidelity.NA
+            has = self._portal_has(sym, kind, freq)
+            if not has:
+                v = (False, f"{kind} {freq or ''} unavailable".replace("  ", " "))
+                break
+            try:                         # fidelity only tiers; an unknown tier (NA) does not drop
+                f = self.portal.fidelity_of(sym, kind, freq)
                 f = Fidelity(int(f)) if f is not None else Fidelity.NA
             except Exception:
-                has, f = False, Fidelity.NA
-            if not has or f == Fidelity.NA or f > mf:
-                v = (False, f"{kind} {freq or ''} unavailable (fidelity {f.name})".replace("  ", " "))
+                f = Fidelity.NA
+            if f != Fidelity.NA and f > mf:
+                v = (False, f"{kind} {freq or ''} fidelity {f.name} worse than {Fidelity(int(mf)).name}"
+                     .replace("  ", " "))
                 break
         self._verified[sym] = v
         return v
+
+    def _portal_has(self, sym: str, kind: str, freq) -> bool:
+        """Availability; for bars, the windowed form ``has(sym, 'bars', freq, start=, end=,
+        as_of=)`` over the run window when the portal supports it (a historical ticker is
+        then judged for this run's dates), else the plain form."""
+        win = getattr(self, "_run_window", None)
+        try:
+            if kind == "bars" and win is not None:
+                try:
+                    return bool(self.portal.has(sym, kind, freq, start=win[0], end=win[1], as_of=win[1]))
+                except TypeError:
+                    pass
+            return bool(self.portal.has(sym, kind, freq))
+        except Exception:
+            return False
 
     def _coverage_check(self, name: str, as_of, members: list, raise_: bool = True) -> list:
         kept, dropped = [], []
@@ -522,6 +559,7 @@ class Backtester:
         params = dict(self.strategy.params)
         if len(sessions) == 0:
             return self._result(RunStatus.FAILED, params, "no sessions in range", t0, {})
+        self._run_window = (self.cal.open_close(sessions[0])[0], self.cal.open_close(sessions[-1])[1])
         ok, why, reqfid = self._check_requirements(sessions)
         if not ok:
             return self._result(RunStatus.NOT_TESTABLE, params, why, t0, reqfid)

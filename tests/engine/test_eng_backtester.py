@@ -1171,3 +1171,35 @@ def test_spy_round_trip_2019_calibrated_spread_is_bp_not_tens_of_bp():
     r2 = Backtester(S(script), portal, legacy).run("2019-06-03", "2019-06-28", raise_errors=True)
     f2 = r2.fills
     assert 2 * ((f2.spread_cost + f2.impact_cost) / f2.notional.abs()).mean() * 1e4 > 5 * rt_bp
+
+
+def test_security_key_symbols_work_end_to_end():
+    """Strategy symbols that are security keys ('T~CIK...') work in requirement checks,
+    universe coverage, instrument lookup and every result table."""
+    key = "T~CIK0000732717"
+    ss = sessions("2024-03-04", 3)
+    df = synthetic_bars_from_rows([(100, 101, 99, 100), (101, 102, 100, 101), (102, 103, 101, 102)], "1d",
+                                  session_dates=ss)
+
+    class KeyPortal(InMemoryPortal):          # windowed has(); fidelity unknown for keys
+        def has(self, symbol, kind, freq=None, sessions=None, *, start=None, end=None, as_of=None):
+            return super().has(symbol, kind, freq)
+
+        def fidelity_of(self, symbol, kind, freq=None):
+            return Fidelity.NA if "~" in symbol else super().fidelity_of(symbol, kind, freq)
+    portal = KeyPortal(bars={(key, "1d"): df}, universes={"SP500": [key]})
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket(key, 10, stop=90.0)
+        if ctx.session_date() == ss[1]:
+            st.seen.append(list(ctx.portal().universe("SP500")))
+            ctx.flatten(key)
+    S = make(universe=[], universe_name="SP500", requires=[Requirement("bars", "1d")])
+    st = S(script)
+    bt = Backtester(st, portal, zero_cost())
+    r = bt.run(ss[0], ss[-1], raise_errors=True)
+    assert r.status == RunStatus.OK and st.seen == [[key]]
+    assert set(r.fills.symbol) == {key} and list(r.trades.symbol) == [key]
+    assert key in set(r.positions.symbol) and bt.instrument(key).symbol == key
+    assert (r.diagnostics["orders"].symbol == key).all()
