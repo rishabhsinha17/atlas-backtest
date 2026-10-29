@@ -151,9 +151,10 @@ _DEFAULT_SIGMA_PRIOR = [[1.0, 0.08], [5.0, 0.045], [10.0, 0.03], [20.0, 0.024], 
 
 
 def normalize_calibration(cal: dict, source: str = "<dict>") -> dict:
-    """Accept calibration schema v1 ('era_anchors' [[t, a, b], ...]) and v2 ('era' {large, small,
-    small_below_adv}, 'sigma_prior', optional 'liquid_etf' profile). Raises ValueError naming the
-    missing keys otherwise."""
+    """Accept calibration schema v1 ('era_anchors' [[t, a, b], ...]), v2 ('era' {large, small, ...}) and
+    v3 ('era' {surfaces: [[[t, a, b], ...], ...]}, 'market_volume' for relative liquidity, 'sigma_prior',
+    'sigma_ref_etf', 'liquid_etf' profile). v1/v2 load with nominal ADV$ (no 'market_volume').
+    Raises ValueError naming the missing keys otherwise."""
     cal = dict(cal)
     need = ("terms", "beta", "center", "clip_log", "c_d", "q", "tod_profile", "effective_ratio", "calib_range")
     missing = [k for k in need if k not in cal]
@@ -161,10 +162,12 @@ def normalize_calibration(cal: dict, source: str = "<dict>") -> dict:
         missing.append("era (v2) or era_anchors (v1)")
     if missing:
         raise ValueError(f"spread calibration {source}: unsupported schema, missing {missing}")
-    if "era" not in cal:          # v1 -> v2: no small-cap slope, no monotone constraint data needed
-        cal["era"] = {"large": [list(map(float, a)) for a in cal["era_anchors"]],
-                      "small": [[1990.0, 0.0], [2100.0, 0.0]], "small_below_adv": 2.17e6}
+    if "era" not in cal:          # v1 -> v3: one surface, nominal ADV$
+        cal["era"] = {"surfaces": [[list(map(float, a)) for a in cal["era_anchors"]]]}
+    elif "surfaces" not in cal["era"]:   # v2 -> v3: the large-cap surface (v2's small-cap slope is dropped)
+        cal["era"] = {"surfaces": [[list(map(float, a)) for a in cal["era"]["large"]]]}
     cal.setdefault("sigma_prior", _DEFAULT_SIGMA_PRIOR)
+    cal.setdefault("sigma_ref_etf", 0.012)
     cal.setdefault("version", 1)
     return cal
 
@@ -181,7 +184,9 @@ class CalibratedSpreadConfig:
     cs_cap: bool = True                # cap by CS/AR where ADV$ is below the calibration range
     cs_fallback: bool = True           # CS/AR when there is no volume (stale / halted) instead of the default
     era_adjust: bool = True
-    era_monotone: bool = True          # era(t, ADV$) non-increasing in t (backward cumulative max)
+    era_monotone: bool = True          # era(t, relative ADV$) non-increasing in t (backward cumulative max)
+    relative_liquidity: bool = True    # deflate ADV$ by market dollar volume (calibration 'market_volume')
+    stress_sigma_mult: float = 3.0     # 'stress regime' qualifier when sigma >= mult x reference sigma
     etf_monotone: bool = True          # ETF branch: running minimum over ADV$
     tod: bool = True
     extended_hours_mult: float = 3.0
@@ -198,7 +203,7 @@ class CalibratedSpreadModel:
     using sessions <= i-1; ``full_spread`` applies time of day and the fill-price tick floor)
     plus a scalar :meth:`half_spread` API. ``calibration`` (dict) overrides the json file."""
 
-    _GRID = 48
+    _GRID = 32
 
     def __init__(self, cfg: Optional[CalibratedSpreadConfig] = None, calibration: Optional[dict] = None):
         self.cfg = cfg or CalibratedSpreadConfig()
@@ -218,14 +223,27 @@ class CalibratedSpreadModel:
                       (cl["log_adv"][1], cl["log_sigma"][1], cl["log_price"][1]))
         self._cd = float(cal["c_d"])
         self._q = float(cal["q"])
-        era = cal["era"]
-        la = sorted(era["large"])
-        self._eL = (np.array([a[0] for a in la], float), np.array([a[1] for a in la], float),
-                    np.array([a[2] for a in la], float))
-        sm = sorted(era["small"])
-        self._eS = (np.array([a[0] for a in sm], float), np.array([a[1] for a in sm], float))
-        self._la_q5 = math.log(era["small_below_adv"]) - self._c[0]
-        self._era_times = np.unique(np.concatenate([self._eL[0], self._eS[0]]))
+        self._surf = []
+        for sf in cal["era"]["surfaces"]:
+            a = sorted(sf)
+            self._surf.append((np.array([x[0] for x in a], float), np.array([x[1] for x in a], float),
+                               np.array([x[2] for x in a], float),
+                               np.array([x[3] if len(x) > 3 else 1e9 for x in a], float)))
+        self._fade = float(cal["era"].get("fade_slope", -2.0))
+        # cumulative-max evaluation times: anchors plus a 0.25-year grid up to the last finite anchor
+        # (the kinked surfaces are not linear between anchors, so endpoints alone are not enough)
+        t_all = np.concatenate([x[0] for x in self._surf])
+        t_end = float(np.max(t_all[t_all < 2099])) if np.any(t_all < 2099) else 2010.0
+        self._era_times = np.unique(np.concatenate([t_all[t_all <= t_end], np.arange(1990.0, t_end + 1e-9, 0.25)]))
+        # pre-computed surface coefficients on the cumulative-max grid
+        self._era_grid = [(np.interp(self._era_times, t_, a_), np.interp(self._era_times, t_, b_),
+                           np.interp(self._era_times, t_, k_)) for t_, a_, b_, k_ in self._surf]
+        mv = cal.get("market_volume")
+        if mv and self.cfg.relative_liquidity:
+            self._mv = (np.array(mv["t"], float), np.array(mv["log_usd"], float), float(mv["ref_log_usd"]))
+        else:
+            self._mv = None
+        self._sig_etf = float(cal["sigma_ref_etf"])
         self._adv_lo = float(cal["calib_range"]["adv_min"])
         tod = cal["tod_profile"]
         self._tod = {k: np.array(tod[k], float) for k in ("liquid", "illiquid", "liquid_etf") if k in tod}
@@ -241,36 +259,56 @@ class CalibratedSpreadModel:
 
     # ------------------------------------------------------------------ era
     def _log_era_raw(self, yf: np.ndarray, la: np.ndarray) -> np.ndarray:
-        tL, aL, bL = self._eL
-        a = np.interp(yf, tL, aL)
-        b = np.interp(yf, tL, bL)
-        big = a + b * la
-        bs = np.interp(yf, *self._eS)
-        small = a + b * self._la_q5 + np.minimum(bs, 0.0) * (la - self._la_q5)
-        return np.where(la >= self._la_q5, big, small)
+        """Upper envelope (pessimistic) of the literature surfaces a(t) + b(t)·la_rel."""
+        v = None
+        for t_, a_, b_, k_ in self._surf:
+            kk = np.interp(yf, t_, k_)          # above the kink (the most liquid name the source informs) fade out
+            x = np.interp(yf, t_, a_) + np.interp(yf, t_, b_) * np.minimum(la, kk) + self._fade * np.maximum(la - kk, 0.0)
+            v = x if v is None else np.maximum(v, x)
+        return v
 
-    def era_multiplier(self, dates, adv_dollars=None) -> np.ndarray:
-        """Multiplier on the latent (non-tick) spread relative to the 2026 NBBO fit. Piecewise-linear in
-        time between literature anchors; above HJM's smallest quintile exp(a(t) + b(t)·la), below it
-        a slope b_s(t) <= 0 matched to Hasbrouck (2009); with ``era_monotone`` the backward cumulative
-        maximum over later dates (non-increasing in t at fixed ADV$, >= 1 before 2010)."""
+    def log_deflator(self, dates) -> np.ndarray:
+        """ln(market $ volume at the fit date / market $ volume at ``dates``) (0 without a series):
+        added to ln ADV$ to express liquidity relative to the market (2026 dollars of volume)."""
+        d = pd.DatetimeIndex(np.atleast_1d(np.asarray(dates, dtype="datetime64[ns]")))
+        if self._mv is None:
+            return np.zeros(len(d))
+        yf = np.asarray(d.year + (d.dayofyear - 1) / 365.25, float)
+        t_, lv, ref = self._mv
+        return ref - np.interp(yf, t_, lv)
+
+    def era_multiplier(self, dates, adv_dollars=None, relative_adv=None) -> np.ndarray:
+        """Multiplier on the latent (non-tick) spread relative to the 2026 NBBO fit, as a function of
+        RELATIVE liquidity la_rel = ln(ADV$ x MV(fit)/MV(t)) (or ``relative_adv`` given directly):
+        upper envelope of the HJM/Furfine and Hasbrouck surfaces, piecewise-linear in time; with
+        ``era_monotone`` the backward cumulative maximum over later dates (non-increasing in t at fixed
+        relative ADV$, >= 1 before 2010)."""
         d = pd.DatetimeIndex(np.atleast_1d(np.asarray(dates, dtype="datetime64[ns]")))
         n = len(d)
         if not self.cfg.era_adjust:
             return np.ones(n)
         yf = np.asarray(d.year + (d.dayofyear - 1) / 365.25, float)
-        if adv_dollars is None:
-            la = np.zeros(n)
+        lo, hi = self._clip
+        if relative_adv is not None:
+            lr = np.log(np.maximum(np.asarray(relative_adv, float), 1.0)) * np.ones(n)
+        elif adv_dollars is None:
+            lr = np.full(n, self._c[0])
         else:
-            lo, hi = self._clip
-            la = np.clip(np.log(np.maximum(np.asarray(adv_dollars, float), 1.0)), lo[0], hi[0]) - self._c[0]
-            la = la * np.ones(n)
+            lr = np.log(np.maximum(np.asarray(adv_dollars, float), 1.0)) + self.log_deflator(d.to_numpy())
+        la = np.clip(lr, lo[0], hi[0]) - self._c[0]
         v = self._log_era_raw(yf, la)
         if self.cfg.era_monotone:
-            for T in self._era_times:
-                later = T > yf
-                if later.any():
-                    v = np.where(later, np.maximum(v, self._log_era_raw(np.full(n, T), la)), v)
+            T = self._era_times
+            rows = np.nonzero(yf < T.max())[0]
+            if len(rows):
+                # raw surface at every later grid time, vectorised: (rows, times)
+                R = None
+                for aj, bj, kj in self._era_grid:
+                    lr_ = la[rows, None]
+                    x = aj[None, :] + bj[None, :] * np.minimum(lr_, kj[None, :]) + self._fade * np.maximum(lr_ - kj[None, :], 0.0)
+                    R = x if R is None else np.maximum(R, x)
+                R = np.where(T[None, :] > yf[rows, None], R, -np.inf)
+                v[rows] = np.maximum(v[rows], R.max(axis=1))
         return np.exp(v)
 
     # ------------------------------------------------------------------ latent
@@ -280,16 +318,23 @@ class CalibratedSpreadModel:
         return np.exp(cols @ self._b)
 
     def _latent_frac(self, adv, sigma, price, etf, dates=None) -> np.ndarray:
-        """exp(x'b) * era: latent relative full spread (before tick). Inputs are clipped to the
-        calibration range; the ETF branch is made non-increasing in ADV$ by a running minimum."""
+        """exp(x'b) * era: latent relative full spread (before tick). With ``dates`` ADV$ is first
+        expressed relative to the market (deflator); inputs are clipped to the calibration range; the
+        ETF branch is made non-increasing in ADV$ by a running minimum."""
         lo, hi = self._clip
-        la = np.clip(np.log(np.maximum(np.asarray(adv, float), 1.0)), lo[0], hi[0])
+        la0 = np.log(np.maximum(np.asarray(adv, float), 1.0))
+        if dates is not None:
+            la0 = la0 + self.log_deflator(dates) * np.ones(len(la0))
+        la = np.clip(la0, lo[0], hi[0])
         ls = np.clip(np.log(np.maximum(np.asarray(sigma, float), 1e-6)), lo[1], hi[1])
         lp = np.clip(np.log(np.maximum(np.asarray(price, float), 1e-4)), lo[2], hi[2])
         e = np.asarray(etf, float) * np.ones(len(la))
         L = self._latent_raw(la, ls, lp, e)
         if dates is not None:
-            L = L * self.era_multiplier(dates, np.exp(la))
+            dd = np.asarray(dates, dtype="datetime64[ns]").reshape(-1)
+            if len(dd) != len(la):
+                dd = np.full(len(la), dd[0])
+            L = L * self.era_multiplier(dd, relative_adv=np.exp(la))
         if self.cfg.etf_monotone and (e > 0).any():
             idx = np.nonzero(e > 0)[0]
             G = self._GRID
@@ -298,11 +343,31 @@ class CalibratedSpreadModel:
             m = len(idx)
             Lg = self._latent_raw(lag.ravel(), np.repeat(ls[idx], G), np.repeat(lp[idx], G),
                                   np.repeat(e[idx], G)).reshape(m, G)
-            if dates is not None:
-                dd = np.repeat(np.asarray(dates, dtype="datetime64[ns]").reshape(-1)[idx], G)
-                Lg = Lg * self.era_multiplier(dd, np.exp(lag.ravel())).reshape(m, G)
+            if dates is not None and self.cfg.era_adjust:
+                # era multiplies the grid only where it is not identically 1 (before the last era anchor)
+                ddi = pd.DatetimeIndex(dd[idx])
+                pre = np.asarray(ddi.year + (ddi.dayofyear - 1) / 365.25, float) < self._era_times.max()
+                if pre.any():
+                    sub = np.nonzero(pre)[0]
+                    Gs = 8
+                    ws = np.linspace(0.0, 1.0, Gs)
+                    lgs = lo[0] + (la[idx][sub, None] - lo[0]) * ws[None, :]
+                    Ls = self._latent_raw(lgs.ravel(), np.repeat(ls[idx][sub], Gs), np.repeat(lp[idx][sub], Gs),
+                                          np.repeat(e[idx][sub], Gs)).reshape(len(sub), Gs)
+                    Ls = Ls * self.era_multiplier(np.repeat(dd[idx][sub], Gs), relative_adv=np.exp(lgs.ravel())).reshape(len(sub), Gs)
+                    Lg = Lg.copy()
+                    Lg[sub] = np.inf
+                    Lg[sub, 0] = Ls.min(axis=1)
             L[idx] = np.minimum(L[idx], Lg.min(axis=1))
         return L
+
+    def stress(self, daily_vol, price, etf) -> np.ndarray:
+        """True when sigma >= stress_sigma_mult x the fit-day reference sigma (stocks: price-bucket median;
+        ETFs: ETF median): spreads then move far more than the cross-sectional fit captures."""
+        sig = np.asarray(daily_vol, float)
+        ref = np.where(np.asarray(etf, float) > 0, self._sig_etf,
+                       self.sigma_prior(np.where(np.isfinite(price) & (np.asarray(price, float) > 0), price, 20.0)))
+        return np.isfinite(sig) & (sig >= self.cfg.stress_sigma_mult * ref)
 
     def _eff_ratio(self, adv) -> np.ndarray:
         a, b, c, lo, hi = self._eff
@@ -320,7 +385,7 @@ class CalibratedSpreadModel:
         """Vectorised model. Returns (half_spread_frac, reason_code): 0 ok, 1 ADV$ below the
         calibration range (CS-capped when available), 2 default (no inputs), 3 CS/AR fallback (no
         volume), +8 when sigma came (partly) from the price-bucket prior, +16 when the tick regime was
-        assumed (exchange unknown before 2001-04-09). ``dates`` naive ET session dates; all inputs PIT.
+        assumed (exchange unknown before 2001-04-09), +32 stress regime (sigma >= stress_sigma_mult x ref). ``dates`` naive ET session dates; all inputs PIT.
         ``n_sigma`` (optional) = number of returns behind ``daily_vol`` (shrinkage to the prior)."""
         price = np.asarray(price, float).reshape(-1)
         n = len(price)
@@ -354,6 +419,7 @@ class CalibratedSpreadModel:
         else:
             sig = np.where(bad, sp, sig)
             code[bad] |= 8
+        code[self.stress(sig, price, etf)] |= 32
         ok = np.isfinite(adv) & (adv > 0) & np.isfinite(price) & (price > 0)
         L = self._latent_frac(np.where(ok, adv, 1e7), sig, np.where(ok, price, 50.0), etf, dates)
         p = np.where(ok, price, 50.0)
@@ -377,7 +443,7 @@ class CalibratedSpreadModel:
             fl = np.where(np.isfinite(pp), _era_tick_vec(dates, np.nan_to_num(pp, nan=50.0),
                                                          ex or self.cfg.listing, symbol) / (2 * pp), 0.0)
             h = np.where(use, np.maximum(cs, np.nan_to_num(fl)), h)
-            code[use] = (code[use] & 16) | 3
+            code[use] = (code[use] & 48) | 3
             fb = fb & ~use
         h = np.where(fb, self.cfg.default_half_spread, h)
         code[fb] = 2
@@ -422,6 +488,8 @@ class CalibratedSpreadModel:
             parts.append("sigma prior")
         if code & 16:
             parts.append(f"listing assumed {self.cfg.listing}")
+        if code & 32:
+            parts.append("stress regime: spread uncertainty high")
         if ac_unknown:
             parts.append("asset class inferred STK")
         return ", ".join(parts)
@@ -521,6 +589,8 @@ class CalibratedSpreadModel:
                 parts.append("sigma prior")
             if code[i] & 16:
                 parts.append("listing assumed")
+            if code[i] & 32:
+                parts.append("stress regime: spread uncertainty high")
             if asset_class is None:
                 parts.append("asset class inferred")
             src[i] = ", ".join(parts)

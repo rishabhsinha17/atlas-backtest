@@ -147,15 +147,12 @@ def test_furfine_anchor_inputs_are_as_traded():
 
 
 def test_furfine_post_decimal_check_with_repaired_inputs(build):
-    """After the repair the 2001 level cannot be lowered to hit 7.0c: the monotone era floor (item 1) already
-    gives ~8.0c (+14%); the shipped era keeps the 2003 level for 2001 (no extra 2001 shift)."""
+    """With as-traded inputs and relative liquidity the 2001 level is refit to Furfine's 7.0c exactly."""
     _, cal, rep_ = build
     ck = rep_["historical_checks"]["furfine_2001_post_decimal"]
-    assert 7.0 <= ck["pred_full_cents_mean"] <= 7.0 * 1.25
-    assert rep_["furfine_2001_level"]["delta_vs_2003"] == pytest.approx(0.0, abs=1e-9)
+    assert ck["pred_full_cents_mean"] == pytest.approx(7.0, abs=0.05)
 
 
-# FIXED (was xfail strict)
 def test_small_cap_cost_should_not_rise_2003_to_2010_at_fixed_characteristics(model):
     for adv in (5e4, 2e5, 1e6):
         h03, _ = model.half_spread(None, "2003-04-01", 8.0, adv, 0.035, "STK")
@@ -164,15 +161,13 @@ def test_small_cap_cost_should_not_rise_2003_to_2010_at_fixed_characteristics(mo
 
 
 def test_era_multiplier_monotone_in_time_and_floored(model):
-    """FIXED (item 1): era(t, ADV$) is non-increasing in t at fixed ADV$ (backward cumulative max), so it is
-    >= 1 before 2010 for every size; below HJM Q5 the size slope is <= 0."""
-    m = lambda d, a: float(model.era_multiplier([d], [a])[0])
-    for adv in (5e4, 1e6, 2.17e6, 1e8, 1e10):
+    """FIXED (item 1, revised by the integrator): era is a function of RELATIVE liquidity (ADV$ x market $ volume
+    at the fit date / market $ volume at t); non-increasing in t at fixed relative ADV$, >= 1 before 2010."""
+    m = lambda d, a: float(model.era_multiplier([d], relative_adv=[a])[0])
+    for adv in (5e4, 1e6, 4e7, 1e8, 1e10):
         seq = [m(f"{y}-06-01", adv) for y in range(1993, 2027)]
         assert all(x >= y - 1e-12 for x, y in zip(seq, seq[1:]))
         assert min(seq) >= 1.0 - 1e-12
-    for y in ("1995-06-01", "2003-04-01", "2005-06-01"):
-        assert m(y, 5e4) >= m(y, 2.17e6) - 1e-12
 
 
 # ----------------------------------------------------------------------------- (4) tick regimes

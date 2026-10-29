@@ -137,12 +137,26 @@ def yearfrac(d) -> float:
     return d.year + (d.dayofyear - 1) / 365.25
 
 
-def make_cal(theta, center, clip, era, tod, eff, sigma_prior, calib_range, fit_day) -> dict:
-    return {"terms": TERMS, "knots": KNOTS, "beta": dict(zip(TERMS, [float(v) for v in theta[:NT]])),
-            "c_d": float(theta[NT]), "q": float(math.exp(theta[NT + 1])), "center": center,
-            "clip_log": {k: [float(v[0]), float(v[1])] for k, v in clip.items()}, "era": era,
-            "tod_profile": tod, "effective_ratio": eff, "sigma_prior": sigma_prior,
-            "calib_range": calib_range, "calib_years": ["2010-01-01", str(pd.Timestamp(fit_day).date())]}
+def make_cal(theta, center, clip, era, tod, eff, sigma_prior, calib_range, fit_day, market_volume=None,
+             sigma_ref_etf=0.012) -> dict:
+    cal = {"terms": TERMS, "knots": KNOTS, "beta": dict(zip(TERMS, [float(v) for v in theta[:NT]])),
+           "c_d": float(theta[NT]), "q": float(math.exp(theta[NT + 1])), "center": center,
+           "clip_log": {k: [float(v[0]), float(v[1])] for k, v in clip.items()}, "era": era,
+           "tod_profile": tod, "effective_ratio": eff, "sigma_prior": sigma_prior, "sigma_ref_etf": sigma_ref_etf,
+           "calib_range": calib_range, "calib_years": ["2010-01-01", str(pd.Timestamp(fit_day).date())]}
+    if market_volume is not None:
+        cal["market_volume"] = market_volume
+    return cal
+
+
+def market_volume_series(fit_day) -> dict:
+    """Median daily US listed $ volume by year (market_dollar_volume.csv), log-linear in time, held flat
+    outside 2000-2026; ref = value at the fit day."""
+    mv = pd.read_csv(HERE / "market_dollar_volume.csv")
+    t = (mv.year + 0.5).to_numpy(float); lv = np.log(mv.usd_per_day.to_numpy(float))
+    ref = float(np.interp(yearfrac(fit_day), t, lv))
+    return {"t": [round(float(x), 3) for x in t], "log_usd": [round(float(x), 6) for x in lv], "ref_log_usd": ref,
+            "source": "calibration/market_dollar_volume.csv (2000-2010 qlib/Yahoo, survivor-biased; 2011-2026 DoltHub)"}
 
 
 def model_pred_bp(cal: dict, df: pd.DataFrame, date, cfg=None, tick=None) -> np.ndarray:
@@ -209,14 +223,18 @@ def main(argv=None):
     th, _ = fit(tr, center)
     th_all, _ = fit(nb, center)
     print("theta", dict(zip(TERMS + ["c_d", "log_q"], np.round(th_all, 4))))
-    era0 = {"large": [[1990.0, 0.0, 0.0], [2100.0, 0.0, 0.0]], "small": [[1990.0, 0.0], [2100.0, 0.0]],
-            "small_below_adv": HJM_2003["dvol_musd"][-1] * 1e6}
+    ZERO = [[1990.0, 0.0, 0.0], [2100.0, 0.0, 0.0]]
+    era0 = {"surfaces": [ZERO]}
+    mvs = market_volume_series(fit_day)
+    sig_etf = float(np.median(nb.sigma[nb.etf == 1]))
     base = dict(center=center, clip=CLIP, tod=tod, eff=eff, sigma_prior=sigma_prior, calib_range=calib_range,
-                fit_day=fit_day)
+                fit_day=fit_day, market_volume=mvs, sigma_ref_etf=sig_etf)
     cal_tr = make_cal(th, era=era0, **base)
     cal0 = make_cal(th_all, era=era0, **base)
 
-    # ---- era: HJM 2003 (above Q5), Furfine 2001 (as-traded), Hasbrouck small-cap slopes; monotone in t
+    # ---- era in RELATIVE liquidity (ADV$ deflated by market $ volume), monotone in t at fixed relative ADV$.
+    # Surfaces: (A) HJM 2003 quintiles + Furfine 2001 level; (B) Hasbrouck annual median & p95 2000-2005.
+    # era = upper envelope of the surfaces (pessimistic where the sources conflict), then backward cummax.
     h = HJM_2003
     hx = pd.DataFrame({"adv_dollar": np.array(h["dvol_musd"]) * 1e6, "sigma": np.array(h["vol_pct"]) / 100,
                        "prev_close": h["price"], "etf": 0.0, "date": h["date"]})
@@ -224,59 +242,62 @@ def main(argv=None):
     hc = pd.read_csv(HERE / "historical_checks.csv"); hc["etf"] = hc.etf.astype(float)
     fpost = hc[hc.check == "furfine_2001_post_decimal"]
 
-    def with_era(large, small):
-        era = dict(era0); era["large"] = large; era["small"] = small
-        return make_cal(th_all, era=era, **base)
+    def with_era(*surfaces):
+        return make_cal(th_all, era={"surfaces": [list(sf) for sf in surfaces], "fade_slope": -2.0}, **base)
 
-    def hjm_err(ab, a01=None):
-        large = [[2003.25, ab[0], ab[1]], [2010.0, 0.0, 0.0], [2100.0, 0.0, 0.0]]
-        if a01 is not None:
-            large = [[2001.08, a01, ab[1]]] + large
-        return np.log(model_pred_bp(with_era(large, era0["small"]), hx, h["date"], tick=np.full(5, 0.01))) - hy
-    r03 = least_squares(hjm_err, np.array([0.0, 0.0]))
+    def hjm_surface(a03_, b03_, a01_=None):
+        sf = [[2003.25, a03_, b03_], [2010.0, 0.0, 0.0], [2100.0, 0.0, 0.0]]
+        a01_ = a03_ if a01_ is None else a01_
+        return [[1990.0, a01_, b03_], [2001.08, a01_, b03_]] + sf
+
+    r03 = least_squares(lambda ab: np.log(model_pred_bp(with_era(hjm_surface(ab[0], ab[1])), hx, h["date"],
+                                                        tick=np.full(5, 0.01))) - hy, np.array([0.0, 0.0]))
     a03, b03 = (float(v) for v in r03.x)
 
     def furf(d01):
-        large = [[2001.08, a03 + d01, b03], [2003.25, a03, b03], [2010.0, 0.0, 0.0], [2100.0, 0.0, 0.0]]
-        bp = model_pred_bp(with_era(large, era0["small"]), fpost.assign(date=fpost.date), None,
-                           tick=fpost.tick.to_numpy())
+        bp = model_pred_bp(with_era(hjm_surface(a03, b03, a03 + d01)), fpost, None, tick=fpost.tick.to_numpy())
         return float(np.mean(bp / 1e4 * 2 * fpost.prev_close.to_numpy() * 100)) - float(fpost.obs_value.iloc[0])
     try:
         d01 = brentq(furf, -3, 3)
     except ValueError:            # monotone floor already above 7.0c: keep the 2003 level
         d01 = 0.0
-    a01 = a03 + d01
-    large = [[1990.0, a01, b03], [2001.08, a01, b03], [2003.25, a03, b03], [2010.0, 0.0, 0.0], [2100.0, 0.0, 0.0]]
+    sA = hjm_surface(a03, b03, a03 + d01)
 
     xs = pd.read_csv(HERE / "hasbrouck_xs.csv.gz", parse_dates=["date"]); xs["etf"] = 0.0
-    dates = sorted(xs.date.unique(), reverse=True)
-    small = [[2010.0, 0.0], [2100.0, 0.0]]
-    hb = {}
     r_eq = HASBROUCK["eff_over_quoted"]
-    for D in dates:
-        g = xs[xs.date == D]; yf = yearfrac(D)
+    sB = [[2010.0, 0.0, 0.0, 1e9], [2100.0, 0.0, 0.0, 1e9]]
+    hb = {}
+    for D in sorted(xs.date.unique(), reverse=True):
+        g = xs[xs.date == D]; yf = round(yearfrac(D), 4)
         tm, tp = hasbrouck_target(yf, "median"), hasbrouck_target(yf, "p95")
+        dfl = mvs["ref_log_usd"] - float(np.interp(yf, mvs["t"], mvs["log_usd"]))
+        kink = float(np.median(np.log(g.adv_dollar)) + dfl - center["log_adv"])   # most liquid name informed: the median
 
-        def loss(bs):
-            # the small-cap slope only moves names below HJM Q5: match the 95th percentile (the median firm
-            # sits at ~Q5 and is governed by the HJM/monotone large-cap branch; reported, not fitted)
-            cal = with_era(large, sorted(small + [[round(yf, 4), float(bs)]]))
-            e_ = r_eq * model_pred_bp(cal, g, D, cfg=NOCAP) / 1e4
-            return (math.log(np.quantile(e_, 0.95) / tp)) ** 2
-        grid = np.linspace(-2.0, 0.0, 41)
-        ls_ = np.array([loss(b) for b in grid])
-        bs = float(grid[np.nonzero(ls_ <= ls_.min() + 1e-9)[0].max()])   # ties -> the slope closest to 0
-        small = sorted(small + [[round(yf, 4), bs]])
-        cal = with_era(large, small)
-        e_ = r_eq * model_pred_bp(cal, g, D, cfg=NOCAP) / 1e4
-        e_old = r_eq * model_pred_bp(with_era(large, era0["small"]), g, D, cfg=NOCAP) / 1e4
-        hb[str(pd.Timestamp(D).date())] = {"n": int(len(g)), "b_s": bs, "target_median": tm, "target_p95": tp,
+        def res(ab):
+            trial = sorted(sB + [[yf, ab[0], ab[1], kink]])
+            if len(trial) == 3:
+                trial = [x if x[0] < 2009 else [x[0], 0.0, 0.0, kink] for x in trial]
+            e_ = r_eq * model_pred_bp(with_era(sA, trial), g, D, cfg=NOCAP) / 1e4
+            return np.array([math.log(np.median(e_) / tm), math.log(np.quantile(e_, 0.95) / tp)])
+        best = None
+        a_last = max(x[1] for x in sB)
+        for x0 in ([0.5, -0.2], [1.5, -0.6], [a_last + 0.3, 0.0], [a_last + 1.0, -0.2], [a_last + 0.6, -0.1]):
+            rb_ = least_squares(res, np.array(x0), bounds=([-6.0, -1.5], [6.0, 0.0]), diff_step=1e-3)
+            if best is None or rb_.cost < best.cost:
+                best = rb_
+        rb = best
+        sB = sorted(sB + [[yf, float(rb.x[0]), float(rb.x[1]), kink]])
+        if len(sB) == 3:          # first (latest) Hasbrouck year: carry its kink to the 2010/2100 anchors
+            sB = [x if x[0] < 2009 else [x[0], 0.0, 0.0, kink] for x in sB]
+        e_ = r_eq * model_pred_bp(with_era(sA, sB), g, D, cfg=NOCAP) / 1e4
+        e_a = r_eq * model_pred_bp(with_era(sA), g, D, cfg=NOCAP) / 1e4
+        hb[str(pd.Timestamp(D).date())] = {"n": int(len(g)), "a_H": float(rb.x[0]), "b_H": float(rb.x[1]),
+                                          "target_median": tm, "target_p95": tp,
                                           "model_median": float(np.median(e_)), "model_p95": float(np.quantile(e_, 0.95)),
-                                          "no_small_slope_median": float(np.median(e_old)),
-                                          "no_small_slope_p95": float(np.quantile(e_old, 0.95))}
+                                          "hjm_only_median": float(np.median(e_a)), "hjm_only_p95": float(np.quantile(e_a, 0.95))}
         print("hasbrouck", hb[str(pd.Timestamp(D).date())])
-    era = {"large": large, "small": small, "small_below_adv": era0["small_below_adv"],
-           "hasbrouck_eff_over_quoted": r_eq}
+    era = {"surfaces": [sA, sB], "surface_names": ["hjm2003_furfine2001", "hasbrouck2009"], "fade_slope": -2.0,
+           "liquidity": "relative (ADV$ x MV(fit)/MV(t))", "hasbrouck_eff_over_quoted": r_eq}
     cal = make_cal(th_all, era=era, **base)
     cal_tr = make_cal(th, era=era, **base)
     report["era"] = era
@@ -284,8 +305,9 @@ def main(argv=None):
     hp = model_pred_bp(cal, hx, h["date"], tick=np.full(5, 0.01))
     report["hjm_2003"] = {"a": a03, "b": b03, "obs_bp": h["qhalf_bp"],
                           "pred_bp_2026_no_era": [round(float(v), 3) for v in model_pred_bp(cal0, hx, h["date"], tick=np.full(5, 0.01))],
+                          "pred_bp_hjm_surface_only": [round(float(v), 3) for v in model_pred_bp(with_era(sA), hx, h["date"], tick=np.full(5, 0.01))],
                           "pred_bp_final": [round(float(v), 3) for v in hp]}
-    report["furfine_2001_level"] = {"a": a01, "delta_vs_2003": d01}
+    report["furfine_2001_level"] = {"a": a03 + d01, "delta_vs_2003": d01}
     print("HJM", report["hjm_2003"])
 
     # ---- validation on the fit day (module predictions)
@@ -379,7 +401,7 @@ def main(argv=None):
 
     lr_all = np.log(nb.pred / nb.tw_hs_bp)
     out = dict(cal)
-    out.update({"version": 2, "description": "Calibrated half-spread model, see docs/SPREADS.md",
+    out.update({"version": 3, "description": "Calibrated half-spread model, see docs/SPREADS.md",
                 "fit_day": fit_day, "target": "RTH time-weighted mean NBBO quoted half-spread (fraction of mid)",
                 "fit_weight": "log10(ADV$) - 5 clipped to [0.5, 5]", "residual_sd_log": float(np.std(lr_all)),
                 "n_symbols": int(len(nb))})

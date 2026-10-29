@@ -20,7 +20,8 @@ def _hand(price, adv, sigma, etf, date, tick, mult=None):
     """Formula of the module docstring evaluated term by term from the json."""
     b, c, kn, cl = CAL["beta"], CAL["center"], CAL["knots"], CAL["clip_log"]
     clip = lambda v, k: min(max(math.log(v), cl[k][0]), cl[k][1])
-    la = clip(adv, "log_adv") - c["log_adv"]
+    dfl = float(M.log_deflator([np.datetime64(pd.Timestamp(date))])[0])     # relative liquidity (market $ volume)
+    la = clip(adv * math.exp(dfl), "log_adv") - c["log_adv"]
     ls = clip(sigma, "log_sigma") - c["log_sigma"]
     lp = clip(price, "log_price") - c["log_price"]
     ka = math.log(kn["adv_hi"]) - c["log_adv"]
@@ -32,7 +33,7 @@ def _hand(price, adv, sigma, etf, date, tick, mult=None):
              "e_hinge_vhi": etf * max(la - (math.log(kn["adv_vhi"]) - c["log_adv"]), 0.0)}
     x = sum(b[t] * terms[t] for t in CAL["terms"])
     if mult is None:
-        mult = float(M.era_multiplier([np.datetime64(pd.Timestamp(date))], [adv])[0])
+        mult = float(M.era_multiplier([np.datetime64(pd.Timestamp(date))], relative_adv=[math.exp(la + c["log_adv"])])[0])
     L = math.exp(x) * mult * price
     S = tick * (1 + (L / tick + CAL["c_d"]) ** CAL["q"]) ** (1 / CAL["q"])
     return S / (2 * price)
@@ -262,3 +263,16 @@ def test_split_day_and_prior_close():
 def test_asset_class_unknown_is_flagged():
     h, why = M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, None)
     assert "asset class inferred STK" in why and h == M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, "STK")[0]
+
+
+def test_relative_liquidity_and_stress_flag():
+    assert abs(M.log_deflator([np.datetime64(pd.Timestamp(CAL["fit_day"]))])[0]) < 1e-5
+    assert M.log_deflator([np.datetime64("2003-06-01")])[0] > 2.5          # market $ volume ~19x lower in 2003
+    # era non-increasing in t at fixed RELATIVE ADV$, >= 1 before 2010
+    for rel in (1e5, 3e6, 1e8, 1e10):
+        seq = [float(M.era_multiplier([np.datetime64(f"{y}-06-01")], relative_adv=[rel])[0]) for y in range(1993, 2027)]
+        assert all(x >= y - 1e-12 for x, y in zip(seq, seq[1:])) and min(seq) >= 1 - 1e-12
+    h, why = M.half_spread("SPY", "2020-03-18", 252.8, 6.8e10, 0.0517, "ETF")
+    assert why.endswith("stress regime: spread uncertainty high")
+    assert "stress" not in M.half_spread("SPY", "2020-01-15", 330.0, 2.5e10, 0.006, "ETF")[1]
+    assert "stress" not in M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, "STK")[1]

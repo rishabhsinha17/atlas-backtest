@@ -1,6 +1,6 @@
 # Calibrated bid-ask spreads (`atlasbt/execution/spread_calibrated.py`)
 
-Owner: SPREAD CALIBRATION agent. Calibration schema **v2** (2026-10-29, after the red-team review, section 9). The engine
+Owner: SPREAD CALIBRATION agent. Calibration schema **v3** (2026-10-29: red-team fixes, then relative liquidity and stress flag; section 9). The engine
 default is `BacktestConfig.spread_model='calibrated'`. Fidelity of every fill priced with it: **T2, "spread modelled
 (calibrated)"**.
 
@@ -125,14 +125,21 @@ pass `CalibratedSpreadConfig(decimal_dates={symbol: date})`. An unknown exchange
 ('NYSE') and is flagged (`listing assumed NYSE`). ARCA/BATS before 2001 are treated as Amex. The Tick Size Pilot is not
 modelled (pass `tick=`).
 
-**Era multiplier** `era(t, ADV$)` (latent spread relative to the 2026 fit):
-* At or above HJM's smallest quintile (ADV$ ≥ $2.17M): exp(a(t) + b(t)·la). The 2003 anchor is fitted to HJM Table I
-  (a = -0.638, b = 0.246), held back to 1990, and goes to 0 from 2010.
-* Below it: exp(a(t) + b(t)·la_Q5 + b_s(t)·(la − la_Q5)), with b_s(t) ≤ 0 chosen per Hasbrouck year to match his
-  95th-percentile annual effective cost (model effective = 0.72 × quoted, HJM's eff/quoted ratio) on the qlib cross-section.
-  Fitted b_s: +0.00 @ 2000.5, +0.00 @ 2001.0, +0.00 @ 2001.5, +0.00 @ 2002.0, +0.00 @ 2002.5, +0.00 @ 2003.0, +0.00 @ 2003.5, +0.00 @ 2004.0, +0.00 @ 2004.5, -0.20 @ 2005.0, -0.15 @ 2005.5.
-* **Monotone**: era(t, ADV$) = maximum over s ≥ t of the raw surface (backward cumulative max). It never rises with time at
-  fixed ADV$ and is ≥ 1 before 2010 (`era_monotone=True`).
+**Relative liquidity.** ADV$ enters the model (and the era term) relative to the market: la_rel = ln(ADV$ · MV(fit date) / MV(t)), where MV is
+the median daily US listed $ volume (2000 $67B, 2003 $57B, 2007 $180B, 2010 $209B, 2015 $232B, 2020 $455B, 2026 $1073B; `calibration/market_dollar_volume.csv`, 2000–2010 qlib/Yahoo all symbols,
+survivor-biased (low), 2011–2026 DoltHub; log-linear in time, held flat before 2000 and after 2026). Nominal ADV$ is not
+comparable across eras (MV grew ~19× 2003→2026). For 2010–2025 this makes a given nominal ADV$ cheaper than in 2026
+(e.g. $10M ADV, $20, σ 2.5%: 2010 6.2 bp, 2015 6.7 bp, 2026 17.6 bp half spread).
+
+**Era multiplier** `era(t, la_rel)` (latent spread relative to the 2026 fit) = upper envelope (pessimistic) of two literature
+surfaces, each linear in time between anchors, then the backward cumulative maximum over later dates (`era_monotone`; non-increasing
+in t at fixed RELATIVE ADV$, ≥ 1 before 2010):
+* **A, HJM 2003 + Furfine 2001**: exp(a + b·la_rel), 2003 fitted to the five HJM quintiles (a = 0.600, b = 0.212), 2001
+  level refitted to Furfine's 7.0¢ (as-traded inputs), held back to 1990, 0 from 2010.
+* **B, Hasbrouck 2009**: per year 2000.5–2005.5, exp(a_H + b_H·min(la_rel, k) − 2·max(la_rel − k, 0)) with b_H ≤ 0, fitted (least
+  squares on the log errors) to Hasbrouck's annual median and 95th-percentile effective cost on the qlib cross-section (model
+  effective = 0.72 × quoted); k = the cross-section's median name, above which Hasbrouck carries no information and the surface
+  fades out. 0 from 2010 (same kink), held back before 2000.
 
 **Time of day**: three 5-minute profiles (medians over symbols with complete buckets and ≥ 200 trades, normalised to mean 1):
 
@@ -154,6 +161,10 @@ selects the profile.
 * No volume (halted or stale): Corwin-Schultz/Abdi-Ranaldo, floored at half a tick, when available; otherwise the flagged
   10 bp default.
 * ADV$ below the 2nd percentile of the fit universe ($9,033/day): capped by CS/AR.
+* **Stress regime**: when σ ≥ 3 × the fit-day reference σ (stocks: price-bucket median above;
+  ETFs: ETF median 1.10%), the reason gets ", stress regime: spread uncertainty high" (code +32). The
+  bounded σ slope keeps stress-day spreads modest (SPY 2020-03-18: model 0.24 bp half; IEX upper bound 4.7 bp); use the atlas
+  cost-stress scenarios (+2/+5/+10/+25 bp per side) and the break-even cost solver for that uncertainty.
 * `measure='effective'`: effective/quoted ratio, median 0.50, clipped to [0.3, 1].
 
 ## 4. API (stable; new arguments are optional keywords)
@@ -169,14 +180,17 @@ full = m.full_spread(est, fill_price, tick, mso, mtc, adv_dollars=None, asset_cl
 m.tod_multiplier(mso, mtc, adv_dollars=None, asset_class=None); m.era_multiplier(dates, adv); era_tick(...)
 ```
 
-`code` bits: 0 ok, 1 ADV below range, 2 default, 3 CS/AR fallback; add 8 for the sigma prior and 16 when the listing was
-assumed.
+`code` bits: 0 ok, 1 ADV below range, 2 default, 3 CS/AR fallback; add 8 for the sigma prior, 16 when the listing was
+assumed and 32 in the stress regime. `m.log_deflator(dates)` gives ln MV(fit)/MV(t); `m.era_multiplier(dates, adv_dollars=None,
+relative_adv=None)`.
 
 Reasons start with "calibrated spread model (T2)" and may add ", era-extrapolated" (before 2010), ", ADV below calibration
-range", ", sigma prior", ", listing assumed NYSE" or ", asset class inferred STK" (asset_class None). The other two reasons are
+range", ", sigma prior", ", listing assumed NYSE", ", stress regime: spread uncertainty high" or ", asset class inferred STK"
+(asset_class None). The other two reasons are
 "Corwin-Schultz/Abdi-Ranaldo fallback (no volume) (T2)" and "default".
 
-The loader accepts schema v1 (`era_anchors`) and v2 (`era`, `sigma_prior`, `liquid_etf`); anything else raises ValueError.
+The loader accepts schema v1 (`era_anchors`), v2 (`era.large/small`) and v3 (`era.surfaces`, `market_volume`, `sigma_ref_etf`);
+v1/v2 load with nominal ADV$. Anything else raises ValueError.
 
 ## 5. Validation
 
@@ -186,7 +200,7 @@ Hold-out = a deterministic 30% of symbols (md5). A fit on the other 70% predicts
 |---|---|---|---|---|---|---|---|
 | in-sample (70% training symbols), 07-01 | 7704 | 17.49 | 4.10 | -0.03 | 0.64 | 0.35 | 76% |
 | **hold-out symbols, 07-01** | 3252 | 16.93 | 4.32 | -0.05 | 0.64 | 0.34 | 77% |
-| **true out-of-sample: hold-out symbols on 2026-07-02, train-only fit** | 3245 | 18.68 | 4.31 | -0.06 | 0.62 | 0.36 | 77% |
+| **true out-of-sample: hold-out symbols on 2026-07-02, train-only fit** | 3245 | 18.68 | 4.32 | -0.06 | 0.62 | 0.36 | 77% |
 | time stability, not out-of-sample: all symbols 2026-07-02, final fit (per-symbol residual correlation with 07-01 > 0.8) | 10940 | 17.95 | 4.15 | -0.06 | 0.62 | 0.35 | 77% |
 | Corwin-Schultz, hold-out rows 07-01 | 3194 | 38.40 | 20.30 | +0.45 | 1.72 | 1.05 | 34% |
 | Corwin-Schultz, 07-02 | 10762 | 38.06 | 19.54 | +0.46 | 1.59 | 1.00 | 37% |
@@ -231,32 +245,30 @@ When left out, the largest high-priced index ETFs are overstated by up to about 
 | check | observed | model |
 |---|---|---|
 | SPY 2013-10 (Lean minute NBBO) | 0.298 bp half | 0.296 bp |
-| SPY 2023-08-03 (Lean minute NBBO) | 0.114 bp half | 0.112 bp |
-| Furfine 2001 most-active NYSE, post-decimal (as-traded inputs, 7 names) | 7.0¢ | 8.0¢ (monotone floor, not fitted) |
-| Furfine 2001, pre-decimal (1/16 tick) | 11.3¢ | 9.9¢ |
-| HJM 2003 NYSE quintiles Q1..Q5, quoted half bp | 5.19, 6.82, 9.17, 11.68, 19.89 | 5.19, 8.69, 13.54, 20.53, 33.09 |
-| CRS 1992 NYSE median quoted (proxy: 2000-07 cross-section, P ≥ $5, re-dated to 1992) | $0.27 / 1.15% | $0.14 / 1.21% (proxy median price ≈ $12, so dollars are lower) |
-| Hasbrouck NYSE size deciles 1 / 5 / 10 (Gibbs, 1927–1998 average) vs model effective at 1998 on proxy ADV deciles | 0.023 / 0.007 / 0.003 | 0.0428 / 0.0085 / 0.0016 |
+| SPY 2023-08-03 (Lean minute NBBO) | 0.114 bp half | 0.111 bp |
+| Furfine 2001 most-active NYSE, post-decimal (as-traded inputs, 7 names) | 7.0¢ | 7.0¢ (monotone floor, not fitted) |
+| Furfine 2001, pre-decimal (1/16 tick) | 11.3¢ | 9.0¢ |
+| HJM 2003 NYSE quintiles Q1..Q5, quoted half bp | 5.19, 6.82, 9.17, 11.68, 19.89 | 4.65, 7.51, 9.74, 12.89, 65.16 |
+| CRS 1992 NYSE median quoted (proxy: 2000-07 cross-section, P ≥ $5, re-dated to 1992) | $0.27 / 1.15% | $0.20 / 1.58% (proxy median price ≈ $12, so dollars are lower) |
+| Hasbrouck NYSE size deciles 1 / 5 / 10 (Gibbs, 1927–1998 average) vs model effective at 1998 on proxy ADV deciles | 0.023 / 0.007 / 0.003 | 0.0644 / 0.0151 / 0.0016 |
 
 **Hasbrouck (2009) annual effective cost, cross-section 2000–2005** (bp; the target is the paper's text values, the model is 0.72 × quoted on the qlib cross-section):
 
-| date | n | b_s | target median | model median | target p95 | model p95 |
-|---|---|---|---|---|---|---|
-| 2000-07-03 | 1615 | +0.00 | 62 | 37 | 312 | 368 |
-| 2001-01-16 | 1703 | +0.00 | 60 | 41 | 299 | 483 |
-| 2001-07-02 | 1704 | +0.00 | 58 | 24 | 288 | 393 |
-| 2002-01-15 | 1793 | +0.00 | 55 | 23 | 274 | 349 |
-| 2002-07-01 | 1821 | +0.00 | 53 | 22 | 263 | 372 |
-| 2003-01-15 | 1871 | +0.00 | 50 | 22 | 249 | 407 |
-| 2003-07-01 | 1987 | +0.00 | 48 | 19 | 238 | 286 |
-| 2004-01-15 | 2088 | +0.00 | 45 | 16 | 224 | 237 |
-| 2004-07-01 | 2146 | +0.00 | 43 | 17 | 213 | 233 |
-| 2005-01-18 | 2258 | -0.20 | 40 | 15 | 200 | 198 |
-| 2005-07-01 | 2286 | -0.15 | 40 | 14 | 200 | 193 |
+| date | n | a_H | b_H | target median | model median | surface A only | target p95 | model p95 |
+|---|---|---|---|---|---|---|---|---|
+| 2000-07-03 | 1615 | +0.50 | -0.20 | 62 | 58 | 26 | 312 | 694 |
+| 2001-01-16 | 1703 | +0.50 | -0.20 | 60 | 65 | 28 | 299 | 897 |
+| 2001-07-02 | 1704 | +0.50 | -0.20 | 58 | 38 | 13 | 288 | 642 |
+| 2002-01-15 | 1793 | +0.50 | -0.20 | 55 | 38 | 12 | 274 | 565 |
+| 2002-07-01 | 1821 | +0.50 | -0.20 | 53 | 31 | 12 | 263 | 556 |
+| 2003-01-15 | 1871 | +0.50 | -0.20 | 50 | 36 | 11 | 249 | 619 |
+| 2003-07-01 | 1987 | +0.50 | -0.20 | 48 | 29 | 10 | 238 | 467 |
+| 2004-01-15 | 2088 | +2.53 | -0.00 | 45 | 24 | 8 | 224 | 423 |
+| 2004-07-01 | 2146 | +2.37 | -0.00 | 43 | 23 | 8 | 213 | 399 |
+| 2005-01-18 | 2258 | +2.37 | -0.00 | 40 | 22 | 7 | 200 | 363 |
+| 2005-07-01 | 2286 | +2.37 | -0.00 | 40 | 20 | 7 | 200 | 396 |
 
-* The 95th percentile (small caps) meets or exceeds the target every year. The monotone floor alone already lifts 2001–2004 above it.
-* The **median is 35–70% of Hasbrouck's**. The median firm sits at about HJM Q5 ADV, where the NYSE-only HJM anchor and the monotone floor govern, and the survivor-biased Yahoo cross-section is more liquid than Hasbrouck's CRSP draw.
-* HJM Q2–Q5 are now overstated 1.3–1.7×. The monotone constraint (era ≥ 1 before 2010) overrides HJM's multipliers below 1 for NYSE mid caps. The two published sources disagree at fixed ADV$, and the constraint sides with Hasbrouck.
+**Residual misfit (documented, not hidden).** With both surfaces and the pessimistic envelope, HJM Q1–Q4 are reproduced (4.65, 7.51, 9.74, 12.89 vs 5.19, 6.82, 9.17, 11.68 bp) but HJM Q5 is 65.2 vs 19.89 bp (3.3×): at Q5's relative liquidity the Hasbrouck surface is higher and wins (pessimistic). Against Hasbrouck the model median is 0.51–1.08× and the 95th percentile 1.82–3.00× the target: with b_H ≤ 0 the survivor-biased proxy cross-section is more dispersed than Hasbrouck's sample, so median and p95 cannot both be met; the fit balances the two log errors. Surface A alone would put the median at only 0.15–0.45× Hasbrouck (the NYSE-only HJM sample vs Hasbrouck's all-market, cap-stratified sample is the conflict).
 
 ## 6. IEX vs NBBO (why IEX is a diagnostic, not a calibration source)
 
@@ -286,7 +298,7 @@ COVID spike: SPY IEX median 4.7 bp, while the model with that day's PIT σ (5.2%
   error. NYSE's sample folders hold no free consolidated-NBBO day from another year.
 * Before 2010 the model rests on published aggregates (HJM 2003 NYSE quintiles, Furfine 2001, Hasbrouck 2009 text values) and
   on the monotone-in-time assumption, not on quotes we hold. 2003–2010 is interpolated under the monotone floor. The
-  median-firm effective cost for 2000–2005 is 35–70% of Hasbrouck's (section 5).
+  residual misfit against HJM Q5 and Hasbrouck is quantified in section 5. Market $ volume 2000–2010 is survivor-biased (low).
 * Pre-decimal odd-eighth avoidance (Christie & Schultz 1994) is not modelled; the Furfine pre-decimal check is −12%.
 * Not shipped:
   * decimal-pilot membership;
@@ -300,7 +312,7 @@ COVID spike: SPY IEX median 4.7 bp, while the model with that day's PIT σ (5.2%
 * Licensing: only derived per-symbol statistics are shipped (NYSE TAQ samples; IEX HIST, "Data provided by IEX").
   `hasbrouck_xs.csv.gz` holds Yahoo-derived features for research use.
 
-## 8. Integration (ENGINE owner): already wired; v2 additions
+## 8. Integration (ENGINE owner): already wired; v2/v3 additions
 
 The engine constructs `CalibratedSpreadModel(cfg.spread_calibrated)` when `spread_model='calibrated'` (the default). Using the
 v2 features needs only new keyword arguments; no signature breaks:
@@ -325,12 +337,12 @@ v2 features needs only new keyword arguments; no signature breaks:
      runs a `Backtester` with the default `BacktestConfig`;
    * `tests/redteam/spreads/`.
 
-## 9. Red-team review (v1 → v2)
+## 9. Red-team review and integrator decisions (v1 → v3)
 
 | item | change | before → after |
 |---|---|---|
 | 1 small caps pre-2010 | b_s ≤ 0 below HJM Q5, matched to Hasbrouck's 95th percentile; era non-increasing in t (backward cumulative max) | era(2003, $100k ADV) 0.27 → ≥ 1. For an $8 stock with $50k ADV and σ 3.5%, the 2003 half spread was 2–4× below 2010's; now 478 vs 369 bp |
-| 2 Furfine inputs | as-traded prices (XOM $82.8, KO $56.6); old AT&T unavailable, so T dropped | post-decimal 7.0¢ (fitted on halved prices) → 8.0¢ (not fitted; monotone floor) |
+| 2 Furfine inputs | as-traded prices (XOM $82.8, KO $56.6); old AT&T unavailable, so T dropped | post-decimal 7.0¢ (fitted on halved prices) → 7.0¢ (not fitted; monotone floor) |
 | 4 liquid-ETF σ slope | bounded by the stock slope in the fit (the bound binds) | σ elasticity 2.0 → 1.00. SOXL/SOXX/SMH/MUU model/obs 2.7–8.1× → 0.46/1.25/1.11/0.98×. Hold-out ETFs ≥ $100M: median abs log ratio 0.10 |
 | 5 tick schedules | per venue and per symbol (table in section 3), from `Instrument.exchange`; unknown → NYSE plus a flag | SPY 2000-02..2001-01 mean half spread 2.20 bp (1/16) → within 1.5× of the 1/64-bound value |
 | 6 Rule 612 | 2005-08-29 → 2006-01-31 | `era_tick('2005-10-03', 0.50)`: 0.0001 → 0.01 |
@@ -338,4 +350,6 @@ v2 features needs only new keyword arguments; no signature breaks:
 | 8 split / IPO / stale / ETF flag | prior_close in today's units; ADV needs 1 session; σ prior; CS/AR fallback; asset class None flagged | split day 33.4 bp vs 7.3 bp the next day → equal; IPO session 2 priced (was the 10 bp default) |
 | 9 ETF monotone in ADV | running minimum over ADV$ in the ETF branch | rising across the $100M knot → non-increasing (test) |
 | 11 docs | 07-02 all-symbol row relabelled "time stability"; true OOS = hold-out symbols × 07-02 | true OOS MAE 18.68 bp, SD log ratio 0.62 |
-| schema | loader accepts v1 and v2 (`normalize_calibration`); clear error otherwise | none |
+| schema | loader accepts v1, v2 and v3 (`normalize_calibration`); clear error otherwise | none |
+| v3: relative liquidity | ADV$ deflated by market $ volume in the model and the era; monotone constraint at fixed relative ADV$; HJM + Hasbrouck surfaces, upper envelope | HJM Q1–Q5 (v2) 5.2, 8.7, 13.5, 20.5, 33.1 → 4.7, 7.5, 9.7, 12.9, 65.2 bp (obs 5.19, 6.82, 9.17, 11.68, 19.89); Hasbrouck median 0.35–0.70× → 0.51–1.08×; Furfine post-decimal 8.0¢ → 7.0¢ (fitted) |
+| v3: stress | reason qualifier "stress regime: spread uncertainty high" when σ ≥ 3 × reference σ | SPY 2020-03-18 and 2008-10-15 flagged; normal days not |
