@@ -309,3 +309,37 @@ def test_cvna_2021_2022_history_not_cut(portal):
     b = portal.bars("CVNA", "1d", pd.Timestamp("2019-01-01"), pd.Timestamp("2023-01-01"), ASOF)
     assert len(b) > 900 and b.index[0] < pd.Timestamp("2019-01-10", tz="UTC")
     assert not any("trim" in x for x in b.attrs.get("identity_log", []))
+
+
+def test_has_agrees_with_bars_for_sp500_sample(portal):
+    """Coordinator: has() must reflect identity-verified availability. Over a deterministic sample
+    of S&P 500 members at several dates, the windowed has() equals 'bars() serves >= 1 bar', and
+    universe(require_bars=True) keeps exactly those members."""
+    from atlasbt.core.types import DataUnavailableError
+    for day in ("1998-06-30", "2005-06-30", "2012-06-29", "2019-06-28", "2026-10-27"):
+        a = pd.Timestamp(day + " 21:00", tz="UTC")
+        mem = portal.universe("SP500", a)
+        sample = mem[::25]
+        s0 = a - pd.Timedelta(days=8)
+        served = set()
+        for s in sample:
+            try:
+                ok = len(portal.bars(s, "1d", s0, a, a)) > 0
+            except DataUnavailableError:
+                ok = False
+            assert portal.has(s, "bars", "1d", start=s0, end=a, as_of=a) == ok, (day, s)
+            if ok:
+                served.add(s)
+        req = set(portal.universe("SP500", a, require_bars=True))
+        assert served == req & set(sample), day
+
+
+@pytest.mark.parametrize("sym,day,sid,lo,hi", [
+    ("FI", "2024-01-02", "CIK0000798354", 110, 160),     # Fiserv as FI (FISV -> FI -> FISV while in the index)
+    ("BALL", "2024-01-02", "CIK0000009389", 45, 70),     # BLL -> BALL 2022-05-10 (ZipLime as-of ticker lags)
+    ("QRVO", "2020-06-01", "CIK0001604778", 80, 130),    # a 1-bar Yahoo stub must not evict DoltHub history
+])
+def test_membership_continuity_and_stub_cases(portal, sym, day, sid, lo, hi):
+    b = portal.bars(sym, "1d", pd.Timestamp(day), pd.Timestamp(day) + pd.Timedelta(days=1), ASOF)
+    assert len(b) == 1 and b.attrs["security_id"] == sid and lo < float(b["close"].iloc[0]) < hi, \
+        (float(b["close"].iloc[0]) if len(b) else None, b.attrs.get("security_id"))

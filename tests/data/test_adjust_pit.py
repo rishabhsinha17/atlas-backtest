@@ -297,10 +297,14 @@ def test_chain_annotation_last_trading_day():
     assert list(a["settlement_date"]) == list(pd.to_datetime(["2025-04-17", "2019-08-16", "2019-08-16", "2024-01-17"]))
     assert list(a["kind"]) == ["MONTHLY", "MONTHLY", "MONTHLY", "WEEKLY"]
     assert list(a["root"]) == ["SPY", "SPX", "SPXW", "SPY"]
+    # symbols re-keyed to the internal convention (date = last trading day), vendor symbol kept
+    assert list(a["symbol"]) == ["SPY   250417C00500000", "SPX   190815C02900000", "SPXW  190816C02900000",
+                                 "SPY   240117C00469000"]
+    assert list(a["vendor_symbol"]) == list(df["symbol"])
 
 
 def test_instrument_parse_spx_am(portal):
-    i = portal.instrument("SPX   190816C02900000")
+    i = portal.instrument("SPX   190815C02900000")            # internal: date = last trading day
     assert i.expiry == pd.Timestamp("2019-08-15") and i.settlement.value == "CASH_AM" and i.exercise.value == "EUROPEAN"
     assert portal.instrument("SPXW  190819P02800000").settlement.value == "CASH_PM"
     assert portal.instrument("SPY   240117C00469000").expiry == pd.Timestamp("2024-01-17")
@@ -428,3 +432,53 @@ def test_fundamentals_ignore_future_period_end(store, portal):
     store.write("fundamentals", "sec", "X", f, key=["field", "period_start", "period_end", "accn"])
     r = portal.fundamentals(["X"], ["shares_outstanding"], utc("2026-10-28"))
     assert r["value"].iloc[0] == 2.0 and r["period_end"].iloc[0] == pd.Timestamp("2026-09-30")
+
+
+# ---------------------------------------------------------------- option symbol convention
+@pytest.mark.parametrize("und,root,exp,right,k,ex,settle", [
+    ("SPX", "SPX", "2016-02-18", "P", 1920.0, "EUROPEAN", "CASH_AM"),     # AM monthly: Thursday last trading day
+    ("SPX", "SPXW", "2023-07-20", "C", 4550.0, "EUROPEAN", "CASH_PM"),    # Thursday PM weekly, coexists with SPX
+    ("SPY", "SPY", "2022-04-14", "C", 440.0, "AMERICAN", "PHYSICAL"),     # monthly shifted by Good Friday 04-15
+    ("AAPL", "AAPL", "2024-01-19", "P", 185.0, "AMERICAN", "PHYSICAL"),   # equity monthly
+])
+def test_option_symbol_round_trip_internal_convention(portal, und, root, exp, right, k, ex, settle):
+    from atlasbt.core.types import ExerciseStyle, Instrument, Right, SettlementType
+    a = Instrument.option(und, pd.Timestamp(exp), k, Right(right), exercise=ExerciseStyle[ex],
+                          settlement=SettlementType[settle], root=root)
+    b = portal.instrument(a.symbol)
+    assert (b.symbol, b.expiry, b.settlement, b.exercise, b.underlying, b.strike, b.right) == \
+        (a.symbol, a.expiry, a.settlement, a.exercise, a.underlying, a.strike, a.right)
+    assert b.symbol[:6].strip() == root
+
+
+def test_vendor_chain_converted_at_ingestion():
+    """synthetic_ vendor rows: SPX AM monthly listed on the settlement Friday 2016-02-19, an SPXW
+    Thursday, and a vendor Good-Friday SPY date -> internal symbols (last trading day)."""
+    from atlasbt.data.option_meta import settlement_for_internal, to_internal
+    from atlasbt.data.providers.dolthub_bulk import occ_symbols
+    v = pd.DataFrame({"root": ["SPX", "SPXW", "SPY"], "right": ["P", "C", "C"],
+                      "strike": [1920.0, 4550.0, 440.0],
+                      "expiry": pd.to_datetime(["2016-02-19", "2023-07-20", "2022-04-15"])})
+    v["symbol"] = occ_symbols(v["root"], v["expiry"], v["right"], v["strike"])
+    out = to_internal(v)
+    assert list(out["symbol"]) == ["SPX   160218P01920000", "SPXW  230720C04550000", "SPY   220414C00440000"]
+    assert list(out["vendor_symbol"]) == list(v["symbol"])
+    assert list(out["settlement_date"]) == list(pd.to_datetime(["2016-02-19", "2023-07-20", "2022-04-14"]))
+    assert settlement_for_internal("2016-02-18", "SPX") == pd.Timestamp("2016-02-19")
+    assert to_internal(out) is out                                   # idempotent
+
+
+def test_exchange_venue_pit(portal, store):
+    """Instrument.exchange from the Nasdaq Trader directory; mover table gives PIT venues."""
+    d = pd.DataFrame({"symbol": ["ORCL", "AAPL"], "name": ["Oracle", "Apple"], "exchange": ["NYSE", "Nasdaq"],
+                      "etf": [False, False], "test_issue": [False, False], "round_lot": [100, 100],
+                      "market_category": [None, None], "financial_status": [None, None],
+                      "snapshot_date": pd.Timestamp("2026-10-28"), "file_creation": ["x", "x"]})
+    store.write("reference", "nasdaqtrader", "directory", d, key=["symbol", "snapshot_date"], replace=True)
+    p = Portal(store)
+    assert p.instrument("AAPL").exchange == "NASDAQ"
+    assert p.exchange_at("ORCL", utc("2010-01-04")) == ("NASDAQ", "mover_table", False)
+    assert p.exchange_at("ORCL", utc("2020-01-02"))[0] == "NYSE"
+    v, src, inferred = p.exchange_at("AAPL", utc("1999-01-04"))
+    assert v == "NASDAQ" and src.startswith("nasdaqtrader") and inferred
+    assert p.exchange_at("SPY", utc("2000-01-03"))[0] == "AMEX"

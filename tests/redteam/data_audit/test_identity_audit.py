@@ -101,7 +101,13 @@ def test_member_with_as_traded_dolthub_is_served(portal, sym, day):
 # ------------------------------------------------------------------ spin-off / composite adjustments
 @pytest.mark.parametrize("sym,day,lo,hi", [
     ("DHR", "2016-07-05", -0.10, 0.10),   # Fortive: Yahoo dividend 27.70 AND split 1.319 both applied (+42 %)
-    ("DD", "2019-06-03", -0.10, 0.10),    # 1:3 reverse split + Corteva: factor 0.4725 -> negative amount (+149 %)
+    # DD bound relaxed (integrator, coordinator-approved): with the value-based amount the ex-date
+    # total return is (DD close / 3 + CTVA close / 3) / DWDP prev close - 1 = (76.10/3 + 24.81/3)
+    # / 30.52 - 1 = +10.2 %. DoltHub and Yahoo agree on every print (DD 2019-06-03 open 66.00,
+    # high = close 76.10; CTVA close 24.81; DWDP 2019-05-31 close 30.52); CTVA's first-morning fall
+    # to $24.89 (-7.7 %) is reported by contemporaneous news (feedstuffs.com, "Corteva separates
+    # from DowDuPont", 2019-06-03). DuPont's +15 % open-to-close move is not independently cited.
+    ("DD", "2019-06-03", -0.10, 0.12),    # 1:3 reverse split + Corteva: factor 0.4725 -> negative amount (+149 %)
     ("ITT", "2011-11-01", -0.10, 0.10),   # 1:2 reverse split + XYL/XLS: factor 3.0157 as one spin-off (+24 %)
     ("ABT", "2004-05-03", -0.06, 0.06),   # Hospira: dividend 2.846 AND 'stock dividend' 1.0688 both applied (+9.9 %)
     ("MRO", "2011-07-01", -0.10, 0.10),   # MPC spin-off (1 MPC per 2 MRO) absent from the DoltHub segment (-37.5 %)

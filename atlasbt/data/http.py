@@ -80,7 +80,7 @@ class HttpClient:
             ttl: Optional[float] = None, refresh: bool = False, headers: Optional[dict] = None,
             ok_statuses: tuple[int, ...] = (200,), allow_404: bool = False,
             timeout: Optional[float] = None, cache_extra: str = "",
-            validate=None) -> Optional[bytes]:
+            validate=None, cache_only: bool = False) -> Optional[bytes]:
         """Return response bytes. Cached on disk (keyed by URL+params) when `cache`.
 
         ttl: seconds after which a cached copy is considered stale (None = forever).
@@ -90,15 +90,21 @@ class HttpClient:
         """
         key = cache_key(url, params, cache_extra)
         body_p, meta_p = self._paths(url, key)
-        if cache and not refresh and meta_p.exists():
+        no_net = cache_only or config.offline()
+        if cache and (not refresh or no_net) and meta_p.exists():
             meta = json.loads(meta_p.read_text())
-            fresh = ttl is None or (time.time() - meta.get("fetched_epoch", 0)) < ttl
+            fresh = no_net or ttl is None or (time.time() - meta.get("fetched_epoch", 0)) < ttl
             if fresh:
                 if meta.get("status") == 404:
                     return None
                 b = self._read_body(body_p)
                 if b is not None:
                     return b
+        if no_net:
+            # ATLASBT_OFFLINE=1 (or a cache-only lookup made during Portal use): never touch the
+            # network; callers handle FetchError as a missing source
+            raise FetchError(url, None, "offline: not in the raw cache" +
+                             (" (ATLASBT_OFFLINE=1)" if config.offline() else " (cache-only lookup)"))
         host = urlparse(url).netloc
         if host in config.SEC_HOSTS and config.SEC_USER_AGENT:
             headers = {**(headers or {}), "User-Agent": config.SEC_USER_AGENT}

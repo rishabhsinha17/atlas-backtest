@@ -57,7 +57,9 @@ def canonical(df: pd.DataFrame) -> pd.DataFrame:
     out["multiplier"] = 100.0
     out["fidelity"] = int(Fidelity.T2_PROXY)
     out["root"] = root
-    return out
+    out["symbol"] = occ_symbols(root, exp, pd.Series(right, index=df.index), strike)   # vendor symbol, fixed root
+    from ..option_meta import to_internal
+    return to_internal(out)        # internal symbol convention at ingestion
 
 
 def load(symbols: Optional[Iterable[str]] = None, store: Optional[ParquetStore] = None) -> dict:

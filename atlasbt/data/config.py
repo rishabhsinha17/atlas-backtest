@@ -38,3 +38,9 @@ HOST_MIN_INTERVAL = {
 
 # Keep the cache comfortably below this (bytes). The fetch CLI checks it.
 CACHE_BUDGET_BYTES = int(float(os.environ.get("ATLASBT_CACHE_BUDGET_GB", "40")) * 1e9)
+
+
+def offline() -> bool:
+    """ATLASBT_OFFLINE=1: no network at all; atlasbt.data.http serves its disk cache (ignoring
+    ttl) and raises FetchError for anything not cached. Backtests / tests set it."""
+    return os.environ.get("ATLASBT_OFFLINE", "0").strip().lower() in ("1", "true", "yes", "on")

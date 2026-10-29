@@ -68,7 +68,8 @@ def canonical_chain(df: pd.DataFrame) -> pd.DataFrame:
     out["multiplier"] = 100.0
     out["fidelity"] = int(Fidelity.T2_PROXY)
     out["source_date"] = dates
-    return out
+    from ..option_meta import to_internal
+    return to_internal(out)        # internal symbol convention at ingestion
 
 
 N_BUCKETS = 64

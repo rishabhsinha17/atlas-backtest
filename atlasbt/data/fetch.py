@@ -208,30 +208,101 @@ def task_ohlcv_bulk(symbols=None):
 
 
 def task_identity(symbols=None):
-    """Build + persist identity-verified daily series for every S&P 500 member interval (resolved
-    at the interval's start, middle and end) and the megacaps."""
+    """Persist, for every S&P 500 membership ticker and the megacaps, the bar-date identity
+    timeline and the verified daily series of every security the ticker denotes (plus the
+    member security keys it maps to)."""
     from .portal import Portal
     p = Portal()
     m = default_store().read("reference", "sp500", "membership")
-    jobs = []
-    for r in m.to_dict("records"):
-        t = str(r["base"]).replace(".", "-")
-        s0 = max(pd.Timestamp(r["start"]), pd.Timestamp("1996-01-02"))
-        e0 = pd.Timestamp(r["end"]) if pd.notna(r["end"]) else pd.Timestamp.now().normalize()
-        for d in {s0, s0 + (e0 - s0) / 2, e0 - pd.Timedelta(days=1)}:
-            jobs.append((t, d))
-    jobs += [(s, None) for s in U.MEGACAPS]
+    tickers = sorted({str(b).replace(".", "-").upper() for b in m["base"]} | set(U.MEGACAPS))
     if symbols:
-        jobs = [j for j in jobs if j[0] in symbols]
+        tickers = [t for t in tickers if t in symbols]
     out = []
-    for i, (t, d) in enumerate(jobs):
+    for i, t in enumerate(tickers):
         try:
-            out.append(p.persist_identity(t, d))
+            out.append(p.persist_identity(t))
         except Exception as e:
-            log.error("identity %s %s: %s", t, d, e)
-        if i % 200 == 0:
-            log.info("identity %d/%d", i, len(jobs))
+            log.error("identity %s: %s", t, e)
+        if i % 50 == 0:
+            log.info("identity %d/%d", i, len(tickers))
     return out
+
+
+def task_sec_submissions(symbols=None):
+    """Precache data.sec.gov submissions JSON (registrant names + formerNames with dates) for
+    every CIK the identity layer may consult: all issuers evidenced under any S&P 500 membership
+    ticker, the SEC current owners of those tickers, the security master and Wikipedia's current
+    constituents. Portal use reads them cache-only (never fetches during a backtest)."""
+    from .http import FetchError, client
+    from .identity import IdentityIndex, norm
+    st = default_store()
+    idx = IdentityIndex(st)
+    m = st.read("reference", "sp500", "membership")
+    ciks: set = set()
+    tickers = {norm(str(b)) for b in m["base"]} | {norm(s) for s in U.MEGACAPS}
+    for src in ("yahoo", "dolthub"):
+        tickers |= {norm(s) for s in st.symbols("bars_1d", src)}
+    for t in tickers:
+        e = idx.by_ticker.get(t)
+        if e is not None and len(e):
+            ciks |= {int(c) for c in e["cik"].unique()}
+        c = idx.sec_now.get(t)
+        if c:
+            ciks.add(int(c))
+    sm = st.read("reference", "sec", "security_master")
+    if len(sm):
+        ciks |= {int(c) for c in pd.to_numeric(sm["cik"], errors="coerce").dropna()}
+    cur = st.read("reference", "sp500", "current_constituents")
+    if len(cur):
+        ciks |= {int(c) for c in pd.to_numeric(cur["cik"], errors="coerce").dropna()}
+    got = missing = 0
+    for i, c in enumerate(sorted(ciks)):
+        try:
+            b = client().get(f"https://data.sec.gov/submissions/CIK{c:010d}.json", allow_404=True, ttl=None)
+            got += b is not None
+            missing += b is None
+        except FetchError as e:
+            missing += 1
+            log.warning("sec submissions CIK %s: %s", c, e)
+        if i % 500 == 0:
+            log.info("sec submissions %d/%d", i, len(ciks))
+    return {"ciks": len(ciks), "cached": got, "missing": missing}
+
+
+def task_option_rekey(symbols=None):
+    """Re-key stored option chains to the INTERNAL symbol convention (date = last trading day,
+    ARCHITECTURE §3). Only files containing a symbol that differs between the vendor and the
+    internal convention (AM-settled index roots, holiday-listed dates) are rewritten; the vendor
+    symbol is kept in `vendor_symbol`. Idempotent."""
+    import pyarrow.parquet as pq
+    from .option_meta import internal_symbols, last_trading_day, to_internal
+    st = default_store()
+    done = {"files_checked": 0, "files_rekeyed": 0, "rows_rekeyed": 0}
+    for src in st.sources("option_chain"):
+        for sym in (symbols or st.symbols("option_chain", src)):
+            for path in st._files("option_chain", src, sym):
+                done["files_checked"] += 1
+                cols = pq.read_schema(path).names
+                if "vendor_symbol" in cols:
+                    continue
+                t = pq.read_table(path, columns=[c for c in ("symbol", "expiry", "root", "right", "strike") if c in cols])
+                f = t.to_pandas()
+                roots = f["root"] if "root" in f.columns else f["symbol"].astype(str).str[:6].str.strip()
+                exp, _ = last_trading_day(pd.to_datetime(f["expiry"]), roots)
+                new = internal_symbols(roots, exp, f["right"], f["strike"]).to_numpy()
+                n = int((new != f["symbol"].astype(str).to_numpy()).sum())
+                if not n:
+                    continue
+                full = pq.read_table(path).to_pandas()
+                meta = st._read_meta(path)
+                conv = to_internal(full)
+                st._upsert(path, conv, meta.get("key") or ["ts", "symbol"],
+                           {**meta, "symbol_convention": "internal", "rekeyed_at": pd.Timestamp.now(tz="UTC").isoformat()},
+                           replace=True)
+                done["files_rekeyed"] += 1
+                done["rows_rekeyed"] += n
+                log.info("option re-key %s %s %s: %d symbols changed", src, sym, path.name, n)
+    return done
 
 
 TASKS: dict[str, Callable] = {
@@ -241,13 +312,14 @@ TASKS: dict[str, Callable] = {
     "nasdaqtrader": task_nasdaqtrader, "borrow": task_borrow, "dukascopy": task_dukascopy,
     "dukascopy_backfill": task_dukascopy_backfill, "options_bulk": task_options_bulk,
     "ohlcv_bulk": task_ohlcv_bulk, "ziplime": task_ziplime, "dolthub_tables": task_dolthub_tables,
-    "iex_sample": task_iex_sample, "hod": task_hod, "identity": task_identity,
+    "iex_sample": task_iex_sample, "hod": task_hod, "identity": task_identity, "option_rekey": task_option_rekey,
+    "sec_submissions": task_sec_submissions,
 }
 SETS = {
     # time-sensitive first (Yahoo 1m keeps only ~30 days)
     "core": ["intraday", "daily_etf", "cboe", "fred", "french", "fomc", "nasdaqtrader", "sp500",
-             "daily_sp500", "ziplime", "dolthub_tables", "hod", "iex_sample", "sec", "borrow", "dukascopy",
-             "options"],
+             "daily_sp500", "ziplime", "dolthub_tables", "hod", "iex_sample", "sec", "sec_submissions",
+             "borrow", "dukascopy", "options", "identity"],
     # bulk mirrors: set ATLASBT_OPTION_CSV / ATLASBT_OHLCV_CSV / ATLASBT_EPS_ESTIMATE_CSV to the
     # downloaded HF CSVs (see docs/DATA.md), then run --set bulk
     "bulk": ["ohlcv_bulk", "options_bulk", "dolthub_tables"],

@@ -63,6 +63,21 @@ def actions_to_frame(actions: Iterable[CorporateAction]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _naive(ts) -> pd.Timestamp:
+    t = pd.Timestamp(ts)
+    return (t.tz_convert("America/New_York").tz_localize(None) if t.tzinfo else t).normalize()
+
+
+def _known_on_or_after(known_at, ex) -> bool:
+    """True when the action became known at/after the ex-date's close (value-based spin-offs);
+    earlier-known amounts use the previous close."""
+    if known_at is None or pd.isna(known_at):
+        return False
+    k = pd.Timestamp(known_at)
+    k = k.tz_convert("America/New_York").tz_localize(None) if k.tzinfo else k
+    return k >= pd.Timestamp(ex).normalize() + pd.Timedelta(hours=12, minutes=59)
+
+
 def adjustment_factors(dates: pd.DatetimeIndex, raw_close: pd.Series,
                        actions: Iterable[CorporateAction]) -> tuple[np.ndarray, np.ndarray]:
     """Return (price_factor, volume_factor) arrays aligned with `dates` (naive session dates).
@@ -71,6 +86,7 @@ def adjustment_factors(dates: pd.DatetimeIndex, raw_close: pd.Series,
     `actions` must already be filtered to those visible at as_of.
     """
     dates = pd.DatetimeIndex(dates)
+    actions = list(actions)
     n = len(dates)
     pf = np.ones(n)
     vf = np.ones(n)
@@ -84,6 +100,17 @@ def adjustment_factors(dates: pd.DatetimeIndex, raw_close: pd.Series,
         if a.type == ActionType.SPLIT and a.ratio and a.ratio > 0 and a.ratio != 1.0:
             pf[:k] /= a.ratio
             vf[:k] *= a.ratio
+        elif a.type == ActionType.SPINOFF and a.amount > 0 and _known_on_or_after(a.known_at, ex) and \
+                k < n and dates[k] == ex and np.isfinite(closes[k]):
+            # value-based spin-off (amount = children's first ex-date close x ratio, known at that
+            # close): factor = S / (S + D), S = parent ex-date close per PRE-ex share (same-day
+            # reverse split folded in). Using the previous close instead (1 - D/P_prev) inflates
+            # the ex-date return whenever the market moved that day (DD 2019-06-03, HPQ/HPE).
+            r_same = np.prod([b.ratio for b in actions if b.type == ActionType.SPLIT and b.ratio and
+                              _naive(b.ex_date) == ex])
+            S = closes[k] * (r_same if r_same else 1.0)
+            if S > 0:
+                pf[:k] *= S / (S + a.amount)
         elif a.type in DIVIDEND_TYPES and a.amount > 0:
             prev_close = closes[k - 1]
             if np.isfinite(prev_close) and prev_close > a.amount:

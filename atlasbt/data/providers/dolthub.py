@@ -157,7 +157,8 @@ def parse_option_rows(rows: list[dict], underlying_close: Optional[dict] = None)
     out["multiplier"] = 100.0
     out["fidelity"] = int(Fidelity.T2_PROXY)
     out["source_date"] = pd.to_datetime(df["date"])
-    return out
+    from ..option_meta import to_internal
+    return to_internal(out)        # internal symbol convention at ingestion
 
 
 def _fetch_date_symbols(date: str, symbols: list[str]) -> list[dict]:

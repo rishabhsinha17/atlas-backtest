@@ -126,6 +126,11 @@ summaries: `cache/logs/`. QA reports: `cache/qa/qa_<freq>_<date>.csv`.
 ## 4. Sources
 
 Rate limits are enforced in `config.HOST_MIN_INTERVAL` (+ exponential backoff, Retry-After honoured).
+**Offline / reproducibility**: `ATLASBT_OFFLINE=1` makes `atlasbt.data.http` serve only its disk
+cache (ttl ignored) and raise `FetchError` for anything else -- backtests and tests set it. Portal
+use never fetches in any mode: the identity layer's SEC registrant-name lookups are cache-only
+(`cache_only=True`); `fetch --only sec_submissions` (part of `--set core`) precaches the
+submissions JSON of every CIK it may consult (1,263 CIKs).
 User-Agent: `atlasbt-research/0.1` (override `ATLASBT_USER_AGENT`); **no personal data in code**.
 
 ### 4.1 Yahoo Finance (`providers/yahoo.py`) -- daily & intraday OHLCV, splits, dividends
@@ -255,16 +260,24 @@ User-Agent: `atlasbt-research/0.1` (override `ATLASBT_USER_AGENT`); **no persona
   2019-08-15 incl. SPX (AM, 3rd Friday) and SPXW (PM) -- SPXW is filed under underlying SPX --,
   QQQ, IWM, with volume and open interest. ts = 2019-08-15 close, T2. One day only: a reference /
   cross-check, not a backtest source.
+* **Symbol convention (ARCHITECTURE §3)**: the internal OCC-style symbol encodes
+  `Instrument.expiry` = the LAST TRADING DAY (SPX AM monthly Feb 2016 = `SPX   160218P01920000`,
+  Thursday; it settles at the next session's open SOQ); the root (SPX vs SPXW) tells the series.
+  `Portal.instrument(symbol)` decodes internal symbols only (date = expiry; settlement from the
+  root: SPX/NDX/RUT... CASH_AM, SPXW/XSP/NDXP/RUTW CASH_PM, others PHYSICAL) and round-trips
+  `Instrument.option(...)` exactly. Vendor symbols (vendor date = settlement Friday for SPX AM,
+  or a holiday Friday) are converted ONCE at ingestion by `option_meta.to_internal`
+  (DoltHub SQL / CSV mirror, historicaloptiondata): `symbol` = internal, `vendor_symbol` = the
+  vendor's. Stored files that held vendor-convention symbols were re-keyed
+  (`python -m atlasbt.data.fetch --only option_rekey`, idempotent); legacy frames are converted on
+  read with the same function, so one contract never appears under two symbols.
 * **Annotation** (`option_meta.annotate_chain`, applied when the Portal serves real chains):
   `expiry` = LAST TRADING DAY (holiday Fridays -> previous session; AM-settled index monthlies
   such as root SPX are listed by vendors on the settlement Friday -> expiry = Thursday,
   `settlement_date` = Friday); extra columns `root` (SPX vs SPXW), `settlement_date`, `kind`
   (MONTHLY / WEEKLY) and `underlying_price_source` (`vendor` for historicaloptiondata,
   `pit_bar_close_at_ts` for DoltHub: the raw Yahoo close of the snapshot session, known exactly at
-  ts). The `symbol` column keeps the vendor OCC symbol (its date is the settlement date for SPX
-  AM); `Portal.instrument(occ)` returns expiry = last trading day, and quote lookups match by
-  symbol or by (root, expiry, strike, right), so `Instrument.option(...)` built from the
-  annotated chain also matches.
+  ts). Quote lookups match by internal symbol or by (root, expiry, strike, right).
 * **Synthetic fallback**: `option_chain(u, as_of, ..., synthetic=True)` returns the real snapshot
   when one exists no older than 4 days; otherwise `Portal.synthetic_chain()` (built with
   `atlasbt.options.synthetic.SyntheticChainGenerator` from PIT inputs: last raw price, 3M T-bill
@@ -409,22 +422,41 @@ kept outside the cache (scratch) and can be deleted after loading.
   freq `1d`, `1m`, `5m`, `60m` native; other minute multiples resampled causally from 1m. Source
   priority: daily yahoo > dolthub > tiingo > cboe; intraday yahoo > alpaca > polygon > databento >
   alphavantage > tiingo (dukascopy only if opted in). `attrs`: source, fidelity, adjusted.
-  **Daily requests for stocks go through the security-identity layer (§8.1)**: the ticker is
-  resolved to an issuer (CIK) as of the request date, and only identity-verified segments are
-  served (`attrs['security_id']` = `CIK##########`, `attrs['identity_log']`, `attrs['source']`
-  e.g. `yahoo+dolthub`, fidelity T2 when another ticker's or DoltHub's history is used). If the
-  identity cannot be established the call raises `DataUnavailableError` ("security identity not
-  established ... (fail closed)"). ETFs, indices and Cboe series are served directly.
-  `security_id(symbol, as_of)` exposes the resolution.
+  **Daily requests for stocks go through the security-identity layer (§8.1). Identity is a
+  property of the BAR DATE, never of `as_of`**: each requested session is attributed to the issuer
+  (CIK) the ticker denoted on that date (`ticker_timeline`); `as_of` only filters knowledge
+  (known_at, adjustment actions). A bare ticker whose window spans two issuers raises
+  `DataUnavailableError` ("... never spliced -- request a security key"); a **security key**
+  `TICKER~CIK##########` (what `universe()` returns for reused or renamed tickers) serves exactly
+  that security's verified history, whatever ticker it traded under. `attrs`: `security_id`,
+  `identity_log`, `source` (e.g. `yahoo+dolthub`), fidelity T2 when a bar date's identity came
+  from pre-2006 / copied-ticker / membership evidence or another ticker's / DoltHub's history.
+  Unknown identity -> `DataUnavailableError` (fail closed). ETFs, indices and Cboe series are
+  served directly. `security_id(symbol, as_of)` = issuer on that bar date.
   Intraday: `sessions=('PRE','RTH','POST')` selects session parts (Yahoo has pre/post). Missing
   native frequencies are resampled causally from 1m: RTH buckets aligned to the 09:30 ET open,
   `known_at` = bucket end, capped at the actual close on half days (tested on 2023-11-24).
 * `quotes()` (alpaca > databento > iex > dukascopy).
+* `instrument(symbol).exchange` = primary listing venue (NYSE / NASDAQ / AMEX / ARCA / BATS) from
+  the Nasdaq Trader directory (current); `exchange_at(symbol, as_of)` -> (venue, source, inferred):
+  a PIT mover table (ORCL Nasdaq -> NYSE 2013-07-15, TXN NYSE -> Nasdaq 2012-12-12, PEP NYSE ->
+  Nasdaq 2017-12-20, SPY/MDY AMEX -> ARCA 2008-12-01, QQQ AMEX -> Nasdaq 2004-12-01; sector SPDRs
+  and DIA AMEX -> ARCA late 2008 marked approximate/inferred), else the current directory value
+  marked `inferred=True` for dates before its snapshot. `security_master()` carries
+  `exchange_pit`, `exchange_source`, `exchange_inferred`.
 * `has(symbol, kind, freq=None, sessions=None)`: symbol `'*'` = any data of that kind;
   `has('*', 'events', 'EARNINGS'|'INDEX_ADD'|'INDEX_DEL'|'FOMC'|'EARNINGS_RELEASE'|'EARNINGS_SCHEDULE')`
   True when the source is loaded (BUYBACK, HALT: False -- no source integrated);
   `has('*', 'fundamentals', field)`; `has(sym, 'bars', '1m', sessions=('PRE',))` checks session
-  availability. `has(sym, 'bars', '1d')` is identity-aware (False when the call would fail closed).
+  availability. **Bars availability for a date**: `has(sym, 'bars', freq, start=, end=, as_of=)`
+  is True iff `bars(sym, freq, start, end, as_of)` serves >= 1 bar -- it is computed by calling
+  bars() (`bars_coverage(sym, start, end, as_of)` returns available / first / last / sessions /
+  expected_sessions / coverage / security_id / fidelity / reason), so it can never disagree with
+  what bars() serves (identity, fail-closed). Without a window, `has(sym, 'bars', '1d')` means
+  "identity-verified bars exist for SOME date" (a historical ticker such as GENZ is servable only
+  for its own era) -- engines deciding a backtest window should use the window form.
+  `universe(name, as_of, require_bars=True)` keeps only members with a served bar in the last 5
+  sessions (same rule as the survivorship report).
   `fidelity_of()` mirrors it (NA when absent).
 * `corporate_actions()`: the actions of the identity-verified segments actually served (Yahoo
   actions classified as in §2, DoltHub actions for DoltHub segments, split-validated -- see
@@ -451,9 +483,16 @@ kept outside the cache (scratch) and can be deleted after loading.
   (fixed lists only include ETFs with a completed bar by as_of), and `SP500_TOP<N>_DV` (e.g.
   `SP500_TOP50_DV`): PIT S&P 500 members ranked by mean raw close x volume over the 20 sessions
   strictly before the session of as_of (first call ~12 s, then memoized per session).
-  **`universe('SP500', as_of)` returns the tickers as they were at as_of** (e.g. `FISV` in 2015,
-  `UTX` in 2010; `.` -> `-`), not the fja05680 "Updated" later tickers; `bars()` maps them to
-  the issuer.
+  **`universe('SP500', as_of)` returns SECURITY keys, not point-in-time tickers.** fja05680's
+  "Updated" file lists survivors under TODAY's ticker (CVX, CBRE, WELL, GOOGL, ES, JPM, SPGI, MO
+  ... before they traded under those symbols), so a member is identified by its membership
+  interval (S&P keeps a member through renames): open interval -> Wikipedia's CIK of the current
+  constituent; closed interval -> the issuer the ticker denoted on its last member session. The
+  bare ticker is returned when it denotes that same issuer on as_of and was never reused; else
+  `TICKER~CIK##########` (e.g. `BBT~CIK0000092230` for BB&T in 2019, `MO~CIK0000764180` for
+  Philip Morris in 1996). `universe(..., require_bars=True)` keeps members with a served bar in
+  the last 5 sessions. Events, fundamentals and instrument() accept keys (events filtered by the
+  issuer's CIK, XBRL facts of the key's registrant).
 * `universe_survivorship_bias(name, as_of)` (`survivorship.universe_bias_report`) -> members,
   with_data, coverage, missing, `stale` (last bar 1-3 sessions old), `member_session_coverage`
   (share of member x session pairs over the trailing 20 sessions with a bar), survivorship_bias
@@ -496,7 +535,7 @@ computed with the earlier 10x / 25 % detector):
 
 ## 8. Survivorship & known gaps (blunt)
 
-### 8.1 Security identity layer (`identity.py`; red-team #1-#4, #10)
+### 8.1 Security identity layer (`identity.py`, `Portal.ticker_timeline`; red-team #1-#4, #10, audit 2026-10-29)
 
 Tickers are reused and both price sources mis-attribute history: Yahoo serves TODAY's company
 under a ticker (BBT, IR, CPWR, EP, GENZ, SII, CCU ... would get another company's prices) and
@@ -505,87 +544,118 @@ FI 2014-2021 is Frank's International). Stock prices are therefore served only f
 **established security identity**; otherwise `bars()` raises `DataUnavailableError` and the
 member counts as missing (fail closed).
 
+**Identity is a property of the bar date.** (The first version resolved the ticker once, at
+`min(end, as_of)`: an engine run loading 2019-2026 with as_of = 2026 bought 'BBT' on 2019-12-02
+at Berkshire Hills' $31 instead of BB&T's $54 -- ~35k wrong-company member-sessions. Fixed.)
+`ticker_timeline(T)` = segments of NYSE sessions with the issuer T denoted, built from all of
+history like a security master (identical for every as_of). Inside a segment the date is
+attributed; after a segment the security is carried forward (it keeps trading, e.g. BB&T as TFC)
+until the next issuer's segment; before the first segment nothing is attributed (an earlier
+company may have used T). A bare ticker never splices two issuers (error with the keys to use);
+security keys (`T~CIK..`) serve one security.
+
 * **security_id** = `CIK##########` (SEC registrant). Evidence "ticker T denoted CIK c on date d":
   ZipLime's 8-K corpus (every 8-K item + 2.02 announcements, 1,477,443 evidence rows in
-  `reference/identity/evidence`). Only `as_of` evidence (ticker observed at filing; **2006+**)
-  labels dates (plus the SEC current ticker map as as-of evidence on its snapshot date, for
-  tickers that have 8-K evidence): bracketed by evidence of the same CIK <= 548 days apart, or within 120 days of
-  the nearest evidence. Carried tickers (a later ticker copied onto old filings, e.g. Clear Channel
-  'CCU' carried to 2018 while CCU was Cervecerias Unidas) count only within 120 days, only if the
-  S&P member's name matches the CIK's SEC names, and only if the issuer was not renamed in between.
+  `reference/identity/evidence`) plus the SEC current ticker map as evidence on its snapshot date.
+  Only `as_of` evidence (ticker observed at filing; **2006+**) labels dates directly: bracketed by
+  evidence of the same CIK <= 548 days apart, or within 120 days of the nearest evidence. Where two
+  issuers hand a ticker over, the switch is placed on the as-traded DoltHub identity break (> 20 %)
+  near the evidence midpoint (ARNC: Arconic Inc -> Arconic Corp on 2020-04-01).
+* **Copied (carried) ticker evidence** (a later ticker copied onto old filings) is used only
+  within 120 days, only when a member name is recorded AND matches the CIK's SEC name in force on
+  that date (CCI 1998 = Citicorp, not Crown Castle; UNM 1997 = UNUM, not Provident -> fail
+  closed), and only if the issuer was not renamed before its first as-of evidence.
 * **Before 2006** (`pre_evidence_cik`): the ticker's earliest evidenced issuer is accepted only if
-  the S&P member of that membership interval confirms it -- Wikipedia's CIK of a current
-  constituent, the recorded member name (Wikipedia add/remove rows), or a verified successor -- AND
-  the issuer's SEC name in force at the date equals its name at its first evidence (no rename:
-  SBC Communications was renamed AT&T Inc. and took 'T' in 2005-11, so 'T' in 2004 fails closed;
-  Philip Morris -> Altria 2003 'MO' fails closed too -- a known false negative). Served as T2 with an
-  `identity_log` note.
+  the member of that S&P membership interval (left-censored 1996 intervals extend back) confirms
+  it -- Wikipedia's CIK of a current constituent, the recorded member name, or a verified
+  successor -- AND the issuer's SEC name in force at the date equals its name at its first
+  evidence (no rename: SBC -> AT&T Inc. took 'T' in 2005-11, so bare 'T' in 2004 fails closed).
+* **Ticker hand-over inside one fja interval**: fja keeps a single open 'IR' interval from 2010
+  although Ingersoll-Rand plc became Trane ('TT') and Gardner Denver took 'IR' on 2020-03-02; the
+  member key then follows the bar-date issuer (`IR~CIK0001466258` in 2019, `IR~CIK0001699150` in
+  2021).
+* **Membership continuity**: a ticker renamed back and forth while in the index (FISV -> FI ->
+  FISV) or renamed in the index before ZipLime's as-of ticker caught up (BLL -> BALL 2022-05-10)
+  is attributed to the CIK the neighbouring interval's ticker denotes.
 * **Issuer succession on the same line** (`is_successor`, `_succession_ok`): holding-company
-  reorganizations / re-domiciliations (ORCL 777676->1341439 2006, DUK 30371->1326160 2006, MDT
-  64670->1613103 2015, DIS 1001039->1744489 2019) keep the Yahoo line: accepted when the ticker's
-  evidence passes from the old to the new CIK with no third issuer, names match, the Yahoo raw
-  close is continuous across the hand-over (no unexplained day > 25 %), DoltHub as-traded prices
-  of the predecessor agree, and the successor had **no ticker of its own before** (an acquirer
-  that adopts the target's ticker carries its own price line: ACE -> CB 2016, SBC -> T 2005 are
-  rejected). Successors with an earlier ticker (MRK/Schering-Plough 2009, APA 2021 holdco name
-  change) fail closed for the predecessor's dates.
+  reorganizations / re-domiciliations (ORCL 2006, DUK 2006, MDT 2015, DIS 2019, XOM 2025) keep the
+  Yahoo line: accepted when the evidence passes from the old to the new CIK with no third issuer,
+  names match, the Yahoo raw close is continuous across the hand-over, DoltHub as-traded prices of
+  the predecessor agree, and the successor had no ticker of its own before (an acquirer that
+  adopts the target's ticker carries its own price line: ACE -> CB 2016, SBC -> T 2005).
+  Member keys (open S&P intervals map to today's registrant) serve e.g. MRK, APA, SPGI, DXC, MO,
+  NEE, GOOGL, AON over their whole Yahoo line.
 * **Lineage**: the CIK's ZipLime tickers; a share-class ticker without evidence (FOXA, BRK-B) is
   its own lineage; SEC current tickers of the CIK only by price agreement.
 * **Segment acceptance**: Yahoo under a lineage ticker whose CURRENT owner (SEC ticker map) is the
   CIK (or its verified successor) and median price > $1; DoltHub rows on dates labelled with the
   CIK; unlabelled DoltHub rows only by price agreement with an accepted segment (median |log
-  ratio| <= 1.5 %, 99th pct <= 5 %, >= 20 common sessions) or as renamed history (the run precedes
-  the CIK's own use of the ticker, the CIK is evidenced under another ticker meanwhile, the next
-  verified segment continues the price within 10 % within 10 sessions: CBS 2011-2017 from DoltHub
-  VIAC). **QA feeds identity**: for DoltHub, clustered spike-and-revert days (>= 3 in 20 sessions,
-  or more than max(3, 1 %)) reject the segment as two securities interleaved and isolated glitches
-  are dropped; for Yahoo the history up to the last cluster is cut (thin, tick-quantized 1970s-90s
-  data: COO before 1994-02, NVR 1993-07, MNST 1993-05, FICO 1992-10, ODFL 2000-01, CVNA 2022-01)
-  and a cluster within the last 2 years rejects the ticker; isolated Yahoo flags are kept and
-  logged. Names are compared on tokens and on squeezed strings ('ExxonMobil' = 'Exxon Mobil'). Cross-source disagreement rejects the lower-priority source.
+  ratio| <= 1.5 %, 99th pct <= 5 %, >= 20 common sessions) or as renamed history (CBS 2011-2017
+  from DoltHub VIAC). **QA feeds identity**: for DoltHub, clustered spike-and-revert days (>= 3 in
+  20 sessions, or more than max(3, 1 %)) reject the segment and isolated glitches are dropped; for
+  Yahoo only TRUE glitches count -- the price returns to the same print the next session
+  (|r_t + r_t+1| < 0.5 %) in a window without a sustained move (|net| < 15 %); >= 3 in 20 sessions
+  cut the history up to the cluster (thin tick-quantized 1970s-90s data: COO before 1994-01, NVR
+  1993-07, MNST 1993-05, COHR 1993-06, WM 1990-02, FICO 1988-05); genuine volatile regimes are
+  never cut (CVNA 2021-2022 regression test). Names compare on tokens and squeezed strings.
 * **Splice validation**: a source change with an unexplained close-to-close move > 20 % (or > 6
-  MADs) drops the lower-priority chunk; single-day fills must lie within 10 % of both neighbours.
+  MADs) drops the lower-priority chunk -- unless that chunk is >= 20x longer (a 1-bar Yahoo stub
+  never evicts years of DoltHub: QRVO); across a data gap the allowed move scales with sqrt(gap).
 * **Actions follow the segments** actually served (Yahoo actions of the Yahoo ticker used, DoltHub
-  splits/dividends for DoltHub chunks). Every split is validated against the raw open / previous
-  close; unexplained DoltHub jumps become inferred splits only for 2,3,4,5,10 and 1/2..1/20 with a
-  matching volume change (FISV 2013-12-17 and 2018-03-20, COG 2012-01-26 and 2013-08-15).
-* **Explicit identity end**: the series ends at the last verified bar; DELIST is emitted at the
-  next session if the issuer no longer trades.
-* Persisted per CIK/lineage in `identity/series` + `identity/actions` (`--only identity`, ~5.5 min,
-  3,835 builds; rebuilt on the fly when `BUILD_VERSION` changes). `attrs['identity_log']` lists
-  every accept / reject / drop / inference.
+  splits/dividends for DoltHub chunks, plus known spin-offs for DoltHub chunks: MRO/MPC 2011).
+  Every split is validated against the raw open / previous close, allowing for same-day
+  distributions (EXPE 2011 1:2 reverse split + TRIP); unexplained DoltHub jumps become inferred
+  splits only for 2,3,4,5,10 and 1/2..1/20 with a matching volume change.
+* **Spin-offs are value-based** (`actions_classify`, audit): SPINOFF `amount` = the children's
+  first ex-date close x distribution ratio (known at that close); the adjustment factor is
+  S / (S + D) with S = parent ex-date close per pre-ex share, i.e. the true total return. Yahoo's
+  double encodings (dividend AND fractional split: DHR/FTV 2016, ABT/HSP 2004) collapse to one
+  event; composite reverse split + spin-off events carry both (DD/CTVA 2019, ITT 2011, EXPE 2011).
+  Without a child price: a cited close (Exelis 2011-11-01 $11.70, Rochester Business Journal),
+  else Yahoo's dividend amount, else the value implied by the ex-date open.
+  Ex-date adjusted returns now: HPQ 2015 +5.0 %, DHR 2016 +2.3 %, ABT 2004 +2.8 %, MRO 2011 +2.6 %,
+  EXPE 2011 -2.7 %, DISCA 2014 -2.7 %, ITT 2011 +6.2 %; DD 2019-06-03 +10.2 % follows from the
+  prints (DoltHub and Yahoo agree: DD open 66.00 -> close 76.10, CTVA close 24.81), not
+  independently cited.
+* **Explicit identity end**: a security's series ends at its last verified bar; DELIST is emitted
+  at the next session if the issuer no longer trades (amount = last close: merger consideration
+  is not in any free source, T2).
+* Persisted per ticker (`identity/timeline`) and per CIK/lineage (`identity/series`,
+  `identity/actions`) by `--only identity`; rebuilt on the fly when `BUILD_VERSION` changes.
+  `attrs['identity_log']` lists every accept / reject / drop / inference.
 
-**Known cases (regression tests `tests/redteam/data`, `tests/data/test_qa_survivorship.py`)**
+**Known cases (regression tests `tests/redteam/data`, `tests/redteam/data_audit`, `tests/data`)**
 
 | Ticker / date | Outcome |
 |---|---|
-| BBT 2019-12 | served from Yahoo TFC (same CIK 92230), equals DoltHub as-traded BBT |
+| BBT 2019-12, run 2019-2026 (engine path) | key `BBT~CIK0000092230` fills at BB&T's as-traded price; bare 'BBT' over 2019-2026 is never spliced |
+| IR 2019 (engine path), CB 2010, CCU 2005, AIT 1998 with as_of 2026 | PIT issuer or fail closed -- never the later owner |
 | PARA / VIAC / CBS | CIK 813828 lineage; CBS 2011-2017 from DoltHub VIAC rows accepted as renamed history |
-| IR 2019, UTX 2019, HRS 2019, SYMC 2018, MMC 2015 | renamed history from Yahoo TT, RTX, LHX, GEN, MRSH |
-| COG 2015 / CTRA 2022, FISV 2018 | DoltHub as-traded, inferred splits validated |
-| FI 2018 | Frank's International (not Fiserv); `universe('SP500')` returns FISV for Fiserv |
-| ORCL 2005, DIS 2012, MDT 2010, DUK 2005 | holdco succession accepted |
+| UTX 2019, HRS 2019, SYMC 2018, MMC 2015 | renamed history from Yahoo RTX, LHX, GEN, MRSH |
+| COG 2015 / CTRA 2022, FISV 2018, FI 2024, BALL 2024, QRVO 2020 | as-traded / membership continuity / stub-safe splice |
+| FI 2018 | Frank's International (not Fiserv) |
+| ORCL 2005, DIS 2012, MDT 2010, DUK 2005, XOM 1996 (Exxon) | holdco succession / Yahoo line |
 | KO / GE / MSFT 1996 | pre-evidence, confirmed by member CIK, T2 |
-| XOM 1996 | Exxon Corp (CIK 34088; traded as XON, fja member 'XOM'), Yahoo XOM line = Exxon, T2 |
-| XOM 2026, ECHO 2026 | new holdco 2115436 (recent succession) / EchoStar via SEC ticker-map evidence |
-| CPWR, EP, GENZ, WEN 2005, AIT 1998, MCIC, CCU 2005, CNC 2000, SII 2005, CB (old Chubb), FOXA 2019-03-12, BK 1998, T 2004, MO 1996 | **fail closed** (no verified segment, name veto, rename, or acquirer-adopted ticker) |
+| CCI 1998 (Citicorp), UNM 1998 (UNUM), CPWR, EP, GENZ, WEN 2005, MCIC, CNC 2000, SII 2005, FOXA 2019-03-12, BK 1998, bare T 2004, bare MO 1996 | **fail closed** (member keys serve SBC as `T~CIK0000732717` and Philip Morris as `MO~CIK0000764180`, the fja members) |
 
 ### 8.2 S&P 500 price coverage after fail-closed
 
-`universe_survivorship_bias('SP500', date)` (member has an identity-verified bar on the session or
-within the 3 previous sessions; recomputed 2026-10-29):
+`universe_survivorship_bias('SP500', date)` over the member SECURITY keys (member has an
+identity-verified bar on the session or within the 3 previous sessions; recomputed 2026-10-29
+after the bar-date identity redesign):
 
 | date | 1996-06 | 2000-06 | 2005-06 | 2008-06 | 2010-06 | 2012-06 | 2015-06 | 2018-06 | 2020-06 | 2022-06 | 2024-06 | 2026-10 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | members | 487 | 492 | 496 | 497 | 499 | 497 | 499 | 506 | 505 | 503 | 503 | 503 |
-| with verified prices | 136 | 192 | 233 | 287 | 312 | 373 | 407 | 486 | 501 | 497 | 501 | 502 |
-| coverage | **27.9 %** | **39.0 %** | **47.0 %** | 57.8 % | 62.5 % | 75.0 % | 81.6 % | 96.1 % | 99.2 % | 98.8 % | 99.6 % | 99.8 % |
+| with verified prices | 171 | 222 | 259 | 299 | 328 | 389 | 419 | 489 | 503 | 500 | 503 | 502 |
+| coverage | **35.1 %** | **45.1 %** | **52.2 %** | 60.2 % | 65.7 % | 78.3 % | 84.0 % | 96.6 % | 99.6 % | 99.4 % | 100 % | 99.8 % |
 
-(2021-06 99.2 %, 2023-06 99.4 % with 21 members' last bar 1-3 sessions old; member-session coverage
-over the trailing 20 sessions equals the point coverage within 0.3 pp everywhere.)
+(2021-06 99.6 %, 2023-06 100 % with 22 members' last bar 1-3 sessions old; member-session coverage
+over the trailing 20 sessions equals the point coverage within 0.3 pp.)
 
-* Coverage FELL versus the previous spliced build (1996 40 %, 2000 48 %, 2005 55 %, 2008 63 %,
-  2010 68 %, 2012 78 %, 2015 85 %): those extra names were partly the WRONG company's prices.
+* Coverage is below the first, end-anchored build (1996 40 %, 2000 48 %, 2005 55 %, 2008 63 %,
+  2010 68 %, 2012 78 %, 2015 85 %): those extra names were partly the WRONG company's prices; the
+  remaining gap is delisted members absent from every free source.
   **Cross-sectional S&P 500 backtests before ~2018 are survivorship-biased** (missing names are
   disproportionately acquired or failed) -- reports must print `universe_survivorship_bias` and treat
   pre-2018 cross-sectional results as T2 at best. No free fix exists (CRSP / Norgate are paid).
@@ -629,6 +699,7 @@ over the trailing 20 sessions equals the point coverage within 0.3 pp everywhere
   disappears after ~30 days). Daily refresh: `--set daily` (cron, after 20:30 ET).
 * Bulk mirrors: download the HF CSVs (see §4.2) into a fresh directory, then
   `ATLASBT_OHLCV_CSV=... ATLASBT_OPTION_CSV=... ATLASBT_EPS_ESTIMATE_CSV=... python -m atlasbt.data.fetch --set bulk`.
+* SEC registrant names: `--only sec_submissions` (in `--set core`) before `--only identity`.
 * Identity series: `--only identity` after any bars refresh (persists verified series per CIK for
   every S&P membership interval + megacaps; otherwise they are built on the fly, ~0.1-2 s each).
 * Long backfills: `--only dukascopy_backfill` (CFD 1m since 2017, hours per symbol),

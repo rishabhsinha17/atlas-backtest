@@ -79,10 +79,12 @@ def membership_coverage(portal) -> pd.DataFrame:
     sch = frames.schedule()
     latest = _latest_market_session(portal)
     for r in m.to_dict("records"):
-        sym = r.get("yahoo") or str(r["base"]).replace(".", "-")
         start = pd.Timestamp(r["start"])
         end = pd.Timestamp(r["end"]) if pd.notna(r["end"]) else latest
-        b = portal._daily_frame(sym, min(end, latest) if end is not None and latest is not None else start)
+        # the member's security key (bar-date identity / membership mapping), as universe() returns
+        sym = portal._member_key(str(r["base"]).upper().replace(".", "-"), max(start, pd.Timestamp("1996-01-02")))
+        b = portal._daily_frame(sym, min(end, latest) if end is not None and latest is not None else start,
+                                start=max(start, pd.Timestamp("1996-01-02")))
         src = b.attrs.get("source")
         first = last = None
         cov = 0.0

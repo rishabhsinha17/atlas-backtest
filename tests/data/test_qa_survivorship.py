@@ -143,7 +143,7 @@ def test_identity_pre_evidence_confirmed_by_member_cik(store, monkeypatch):
     _sp500_refs(store, [("OLDCO", "1990-01-02", None)], current=[("OLDCO", "Oldco Inc", 4242)])
     b = Portal(store).bars("OLDCO", "1d", "1996-06-03", "1996-06-10", as_of=utc("2026-01-02"))
     assert len(b) and b.attrs["security_id"] == "CIK0000004242" and b.attrs["fidelity"] == 2
-    assert "pre-evidence" in b.attrs["identity_log"][-1]
+    assert "'pre'" in b.attrs["identity_log"][-1]
 
 
 def test_identity_pre_evidence_reused_ticker_fails_closed(store, monkeypatch):
@@ -178,6 +178,102 @@ def test_identity_pre_evidence_renamed_issuer_fails_closed(store, monkeypatch):
     _sp500_refs(store, [("TT", "1990-01-02", None)], current=[("TT", "Telco", 6161)])
     with pytest.raises(DataUnavailableError):
         Portal(store).bars("TT", "1d", "2004-06-01", "2004-06-10", as_of=utc("2026-01-02"))
+
+
+def _yahoo_only(store, sym, cik, px, start="2010-01-04"):
+    _evidence(store, [(sym, cik, "2006-01-01", "2026-10-01")])
+    store.write("reference", "sec", "ticker_map", pd.DataFrame({"cik": [cik], "name": [sym], "ticker": [sym],
+                                                                "exchange": ["X"]}), key=["ticker", "cik"], replace=True)
+    store.write("bars_1d", "yahoo", sym, _bars(start, len(px), px))
+    return Portal(store).bars(sym, "1d", "2009-01-01", "2026-01-01", as_of=utc("2026-01-02"))
+
+
+def test_yahoo_volatile_crash_not_cut(store):
+    """synthetic_ (CVNA 2021-12 .. 2022 pattern): alternating -10 % / +9 % days inside a sustained
+    98 % decline are real -> the history before them must NOT be cut."""
+    n = 1500
+    px = np.full(n, 300.0)
+    px[1000:1250] = 300.0 * np.exp(np.linspace(0, np.log(0.02), 250))     # sustained crash
+    for i in (1010, 1012, 1014, 1016):                                      # -10 % then +9 % next day
+        px[i] = px[i - 1] * 0.90
+        px[i + 1] = px[i] * 1.09 * (px[i + 1] / px[i - 1])
+    px[1250:] = px[1249]
+    b = _yahoo_only(store, "CVX1", 910001, px)
+    assert len(b) == n and not any("trim" in x for x in b.attrs["identity_log"])
+
+
+def test_yahoo_quantized_glitch_cluster_cut(store):
+    """synthetic_ thin early data: exact one-tick flips (price returns to the same print) clustered
+    in a flat stretch -> the history up to the cluster is cut; later history served."""
+    n = 1500
+    px = np.full(n, 0.625 * 16)
+    for i in (100, 105, 110, 115):
+        px[i] = 0.5 * 16
+    b = _yahoo_only(store, "QNT", 910002, px)
+    assert len(b) < n - 100 and any("trim" in x for x in b.attrs["identity_log"])
+
+
+def test_has_window_agrees_with_bars(store):
+    """synthetic_: reused ticker REU (111 until 2010, 222 from 2015). Windowed has() must answer
+    exactly what bars() serves: False where bars() fails closed, True where it serves."""
+    _evidence(store, [("REU", 111, "2000-01-01", "2010-06-01"), ("REU", 222, "2015-01-01", "2026-10-01")])
+    store.write("reference", "sec", "ticker_map", pd.DataFrame({"cik": [222], "name": ["Two"], "ticker": ["REU"],
+                                                                "exchange": ["X"]}), key=["ticker", "cik"], replace=True)
+    store.write("bars_1d", "yahoo", "REU", _bars("2005-01-03", 5000, 5.0))
+    p = Portal(store)
+    A = utc("2026-01-02")
+    assert not p.has("REU", "bars", "1d", start=utc("2008-03-01"), end=utc("2008-03-10"), as_of=A)
+    assert p.has("REU", "bars", "1d", start=utc("2020-03-01"), end=utc("2020-03-10"), as_of=A)
+    cov = p.bars_coverage("REU", utc("2020-03-02"), utc("2020-03-07"), A)
+    assert cov["available"] and cov["sessions"] == cov["expected_sessions"] == 5 and cov["coverage"] == 1.0
+    assert "fail closed" in p.bars_coverage("REU", utc("2008-03-01"), utc("2008-03-10"), A)["reason"]
+
+
+def test_membership_rename_back_and_forth(store):
+    """synthetic_ (FISV -> FI -> FISV pattern): no 8-K evidence for the middle ticker, but the S&P
+    intervals of the other ticker bracket it and denote the same CIK -> served from that CIK's
+    Yahoo history (T2, note); a ticker whose neighbours denote different CIKs fails closed."""
+    _evidence(store, [("FSV", 7171, "2006-01-01", "2023-06-01"), ("FSV", 7171, "2025-12-01", "2026-10-01"),
+                      ("FRK", 8181, "2014-01-01", "2021-05-01")])
+    store.write("reference", "sec", "ticker_map", pd.DataFrame({"cik": [7171], "name": ["Fsv"], "ticker": ["FSV"],
+                                                                "exchange": ["X"]}), key=["ticker", "cik"], replace=True)
+    store.write("bars_1d", "yahoo", "FSV", _bars("2010-01-04", 4200, 100.0))
+    _sp500_refs(store, [("FSV", "2010-01-04", "2023-06-07"), ("FRK", "2023-06-07", "2025-11-11"),
+                        ("FSV", "2025-11-11", None)])
+    b = Portal(store).bars("FRK", "1d", "2024-01-02", "2024-01-10", as_of=utc("2026-01-02"))
+    assert len(b) and b.attrs["security_id"] == "CIK0000007171" and b.attrs["fidelity"] == 2
+    assert "'membership'" in b.attrs["identity_log"][-1]
+
+
+def test_identity_is_property_of_bar_date_not_as_of(store):
+    """synthetic_ BBT pattern: 'RU' = issuer 111 (2006-2015, as-traded DoltHub rows) and later
+    issuer 222 (2020+, Yahoo 'RU' = 222). (1) a bar on 2012-03-01 is the same whatever the run's
+    end / as_of; (2) a plain-ticker window spanning both issuers is never spliced (error naming
+    the security keys); (3) universe() returns security keys for the reused ticker and a key
+    serves only that security."""
+    from atlasbt.core.types import DataUnavailableError
+    _evidence(store, [("RU", 111, "2006-01-01", "2015-06-01"), ("RU", 222, "2020-01-01", "2026-10-01")])
+    store.write("reference", "sec", "ticker_map", pd.DataFrame({"cik": [222], "name": ["Two"], "ticker": ["RU"],
+                                                                "exchange": ["X"]}), key=["ticker", "cik"], replace=True)
+    store.write("bars_1d", "dolthub", "RU", _bars("2011-01-03", 1100, 50.0))
+    store.write("bars_1d", "yahoo", "RU", _bars("2019-06-03", 1500, 7.0))
+    _sp500_refs(store, [("RU", "2011-01-03", "2015-06-01"), ("RU", "2021-01-04", None)])
+    p = Portal(store)
+    day = (utc("2012-03-01"), utc("2012-03-02"))
+    early = p.bars("RU", "1d", *day, as_of=utc("2012-03-02"))
+    with pytest.raises(DataUnavailableError, match="never spliced"):
+        p.bars("RU", "1d", utc("2012-03-01"), utc("2026-01-01"), as_of=utc("2026-01-02"))
+    late = p.bars("RU", "1d", *day, as_of=utc("2026-01-02"))
+    assert len(early) == len(late) == 1 and float(early["close"].iloc[0]) == float(late["close"].iloc[0]) == 50.0
+    assert early.attrs["security_id"] == late.attrs["security_id"] == "CIK0000000111"
+    k_old = p.universe("SP500", utc("2012-03-01"))
+    k_new = p.universe("SP500", utc("2023-03-01"))
+    assert k_old == ["RU~CIK0000000111"] and k_new == ["RU~CIK0000000222"]
+    b = p.bars(k_old[0], "1d", utc("2011-01-01"), utc("2026-01-01"), as_of=utc("2026-01-02"))
+    assert len(b) and (b["close"] == 50.0).all() and b.attrs["security_id"] == "CIK0000000111"
+    assert p.instrument(k_old[0]).symbol == k_old[0]
+    assert p.security_id("RU", utc("2012-03-01")) == "CIK0000000111"
+    assert p.security_id("RU", utc("2023-03-01")) == "CIK0000000222"
 
 
 def test_dolthub_collision_segment_rejected(store):
@@ -219,7 +315,11 @@ def test_spinoff_reclassified_and_adjusted(store):
                           "ratio": 2.202, "amount": 0.0, "pay_date": pd.NaT, "new_symbol": None, "fidelity": 2}])
     c = classify("HPQ", acts, raw)
     assert c["type"].iloc[0] == "SPINOFF" and c["new_symbol"].iloc[0] == "HPE"
-    assert c["amount"].iloc[0] == pytest.approx(29.36 * (1 - 1 / 2.202))
+    # no child price available -> value implied by the ex-date open (P_prev - open_ex)
+    assert c["amount"].iloc[0] == pytest.approx(29.36 - 13.32)
+    # value-based: HPE's first ex-date close x 1 HPE per HPQ, known at that close
+    cv = classify("HPQ", acts, raw, child_close=lambda s_, e: 15.5 if s_ == "HPE" else np.nan)
+    assert cv["amount"].iloc[0] == pytest.approx(15.5) and cv["known_at"].iloc[0] == raw["known_at"].iloc[22]
     acts["type"], acts["ex_date"] = "SPLIT", ex
     _evidence(store, [("HPQ", 47217, "2000-01-01", "2026-10-01")])
     store.write("reference", "sec", "ticker_map", pd.DataFrame({"cik": [47217], "name": ["HP"], "ticker": ["HPQ"],
@@ -232,6 +332,39 @@ def test_spinoff_reclassified_and_adjusted(store):
     adj = p.bars("HPQ", "1d", d[0], d[-1], utc("2016-01-01"), adjusted=True)
     r = adj["close"].pct_change().dropna()
     assert r.abs().max() < 2e-3            # the spin-off does not show up as a -55 % return
+
+
+def test_spinoff_duplicate_encoding_and_value_factor():
+    """synthetic_ DHR-2016-like: Yahoo encodes ONE distribution both as a 'dividend' and as a
+    fractional split. One SPINOFF must remain; with a value-based amount the adjusted ex-date
+    return equals the true total return (S + D) / P_prev - 1, not S / (P_prev - D) - 1."""
+    from atlasbt.data import adjust
+    from atlasbt.data.actions_classify import classify
+    d = frames.schedule().loc["2016-06-01":].index[:30]
+    ex = pd.Timestamp("2016-07-05")                     # DHR / Fortive ex-date (known spin-off table)
+    i = d.get_loc(ex)
+    px = np.where(d < ex, 100.0, 80.0)
+    px[i] = 84.0                                       # ex-date close after an intraday rally
+    o = px.copy()
+    o[i] = 76.0
+    raw = frames.daily_bars(pd.DataFrame({"open": o, "high": px, "low": o, "close": px, "volume": 1e6}, index=d))[0]
+    k0 = raw["known_at"].iloc[i - 1]
+    acts = pd.DataFrame([{"symbol": "DHR", "type": "CASH_DIVIDEND", "ex_date": ex, "known_at": k0, "ratio": 1.0,
+                          "amount": 24.0, "pay_date": pd.NaT, "new_symbol": None, "fidelity": 2},
+                         {"symbol": "DHR", "type": "SPLIT", "ex_date": ex, "known_at": k0, "ratio": 1.319,
+                          "amount": 0.0, "pay_date": pd.NaT, "new_symbol": None, "fidelity": 2}])
+    c = classify("DHR", acts, raw, child_close=lambda s_, e: 48.0 if s_ == "FTV" else np.nan)
+    assert list(c["type"]) == ["SPINOFF"] and c["amount"].iloc[0] == pytest.approx(24.0)   # 0.5 x 48
+    from atlasbt.core.types import ActionType, CorporateAction
+    ca = [CorporateAction(symbol="DHR", type=ActionType.SPINOFF, ex_date=ex, known_at=c["known_at"].iloc[0],
+                          amount=24.0, ratio=0.5)]
+    dd = frames.to_naive_date(raw.index)
+    pf, _ = adjust.adjustment_factors(dd, pd.Series(px, index=dd), ca)
+    adj = px * pf
+    assert adj[i] / adj[i - 1] - 1 == pytest.approx((84.0 + 24.0) / 100.0 - 1)
+    # an UNKNOWN event with the same double encoding collapses to one SPINOFF too
+    u = classify("ZZZ", acts.assign(symbol="ZZZ"), raw)
+    assert list(u["type"]) == ["SPINOFF"]
 
 
 def test_round_stock_dividend_stays_split():

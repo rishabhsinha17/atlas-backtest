@@ -183,3 +183,26 @@ def test_iex_tops_parse():
     assert len(hit) and hit.index[0].floor("s") == utc("2019-12-24 13:34:55")
     assert spy.loc[spy["ask"].notna(), "ask"].iloc[0] == 321.61
     assert spy["ask"].isna().any()                    # zero price = no quote -> NaN
+
+
+def test_offline_flag_serves_cache_and_never_fetches(tmp_path, monkeypatch):
+    """ATLASBT_OFFLINE=1: cached responses are served (even past ttl); anything else raises
+    FetchError without touching the network. cache_only=True does the same per call."""
+    import pytest
+    from atlasbt.data.http import FetchError, HttpClient, cache_key
+
+    c = HttpClient(raw_root=tmp_path)
+
+    def boom(*a, **k):
+        raise AssertionError("network used")
+    monkeypatch.setattr(c, "_get_follow", boom)
+    url = "https://data.sec.gov/submissions/CIK0000000001.json"
+    body_p, meta_p = c._paths(url, cache_key(url, None, ""))
+    c._store(body_p, meta_p, url, None, 200, b'{"name": "X"}')
+    monkeypatch.setenv("ATLASBT_OFFLINE", "1")
+    assert c.get(url, ttl=0.0) == b'{"name": "X"}'
+    with pytest.raises(FetchError):
+        c.get("https://data.sec.gov/submissions/CIK0000000002.json")
+    monkeypatch.setenv("ATLASBT_OFFLINE", "0")
+    with pytest.raises(FetchError):
+        c.get("https://data.sec.gov/submissions/CIK0000000003.json", cache_only=True)

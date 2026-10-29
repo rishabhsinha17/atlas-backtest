@@ -34,3 +34,14 @@ def test_read_range_and_attrs(tmp_path):
     assert r.attrs["source"] == "src" and r.attrs["fidelity"] == 1 and r.attrs["adjusted"] is False
     assert st.read("bars_1d", "src", "NOPE").empty
     assert st.symbols("bars_1d", "src") == ["BBB"]
+
+
+def test_read_year_range_without_partitions_is_empty(tmp_path):
+    """Year filter removing every partition (e.g. a 2012 read of a 2019+ option chain) -> empty
+    frame with the symbol's meta, not IndexError."""
+    st = ParquetStore(tmp_path)
+    df = synthetic_bars(400, "2019-06-01")
+    st.write("option_chain", "src", "CCC", df, partition="year", fidelity=2)
+    r = st.read("option_chain", "src", "CCC", start=pd.Timestamp("2012-01-01", tz="UTC"),
+                end=pd.Timestamp("2013-01-01", tz="UTC"))
+    assert r.empty and r.attrs["source"] == "src" and r.attrs["fidelity"] == 2

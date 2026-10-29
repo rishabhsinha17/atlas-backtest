@@ -116,24 +116,82 @@ class Portal:
         s = symbol.upper()
         m = _OCC.match(s)
         if m and len(s) >= 15:
-            from .option_meta import AM_INDEX_ROOTS, last_trading_day
+            # INTERNAL convention (ARCHITECTURE §3): the date in the symbol IS the last trading
+            # day; root decides the series (SPX = AM-settled monthly, settles at the next
+            # session's open SOQ; SPXW = PM). Vendor symbols are converted at ingestion.
+            from .option_meta import AM_INDEX_ROOTS
             root = m.group("root").strip()
-            vendor = pd.Timestamp("20" + m.group("d"))
-            exp, settle_d = last_trading_day([vendor], [root])
+            exp = pd.Timestamp("20" + m.group("d"))
             strike = int(m.group("k")) / 1000.0
             right = Right(m.group("r"))
-            und = {"SPXW": "SPX", "NDXP": "NDX", "RUTW": "RUT"}.get(root, root)
+            und = {"SPXW": "SPX", "NDXP": "NDX", "RUTW": "RUT", "XSP": "XSP"}.get(root, root)
             if root in AM_INDEX_ROOTS | {"SPXW", "XSP", "NDXP", "RUTW"}:
                 settle = SettlementType.CASH_AM if root in AM_INDEX_ROOTS else SettlementType.CASH_PM
                 ex = ExerciseStyle.EUROPEAN
             else:
                 settle, ex = SettlementType.PHYSICAL, ExerciseStyle.AMERICAN
-            # keep the vendor OCC symbol; expiry = last trading day (may differ from the symbol date)
-            return Instrument(symbol=s, asset_class=AssetClass.OPTION, multiplier=100.0, underlying=und,
-                              expiry=exp[0], strike=strike, right=right, exercise=ex, settlement=settle)
+            return Instrument.option(und, exp, strike, right, exercise=ex, settlement=settle, root=root)
         if s in INDEX_SYMBOLS:
             return Instrument(s, AssetClass.INDEX)
-        return Instrument(s, AssetClass.ETF if self._is_etf(s) else AssetClass.STOCK)
+        t, kc = self._split_key(s)
+        venue = self.exchange_at(t, None)[0]
+        if kc is not None and self.identity_index().cik_now(t) not in (kc, None):
+            venue = None                     # the key's security is not the ticker's current issuer
+        return Instrument(s, AssetClass.ETF if self._is_etf(t) else AssetClass.STOCK, exchange=venue)
+
+    # primary-listing moves (PIT venue evidence): symbol -> [(effective date, venue)] ascending.
+    # Public exchange announcements; dates are the first session on the new venue.
+    EXCHANGE_MOVES = {
+        "ORCL": [(pd.Timestamp("1986-03-12"), "NASDAQ"), (pd.Timestamp("2013-07-15"), "NYSE")],
+        "TXN": [(pd.Timestamp("1953-10-01"), "NYSE"), (pd.Timestamp("2012-12-12"), "NASDAQ")],
+        "PEP": [(pd.Timestamp("1950-01-01"), "NYSE"), (pd.Timestamp("2017-12-20"), "NASDAQ")],
+        "SPY": [(pd.Timestamp("1993-01-29"), "AMEX"), (pd.Timestamp("2008-12-01"), "ARCA")],
+        "MDY": [(pd.Timestamp("1995-05-04"), "AMEX"), (pd.Timestamp("2008-12-01"), "ARCA")],
+        "QQQ": [(pd.Timestamp("1999-03-10"), "AMEX"), (pd.Timestamp("2004-12-01"), "NASDAQ")],
+    }
+    # listed on the AMEX at launch, primary listing later NYSE Arca; the move date is approximate
+    # (late 2008, SPDR family) -> source 'mover_table_approx', inferred=True
+    EXCHANGE_MOVES_APPROX = {s_: [(pd.Timestamp("1998-01-01"), "AMEX"), (pd.Timestamp("2008-12-01"), "ARCA")]
+                             for s_ in ("DIA", "XLB", "XLE", "XLF", "XLI", "XLK", "XLP", "XLU", "XLV", "XLY")}
+    _VENUE = {"NYSE": "NYSE", "Nasdaq": "NASDAQ", "NASDAQ": "NASDAQ", "NYSE Arca": "ARCA",
+              "NYSE American": "AMEX", "Cboe BZX": "BATS", "IEX": "IEX"}
+
+    def exchange_at(self, symbol: str, as_of=None) -> tuple[Optional[str], Optional[str], bool]:
+        """(venue, source, inferred) of the primary listing of `symbol` at as_of (None = now).
+        source 'mover_table' (PIT, public announcements) or 'nasdaqtrader_<snapshot>' (current
+        directory); inferred=True when the directory value is applied to a date before its snapshot
+        (a venue move in between would be missed)."""
+        t = self._split_key(symbol)[0]
+        d = None if as_of is None else _session_date(_utc(as_of))
+        mv = self.EXCHANGE_MOVES.get(t)
+        for table, src, inf in ((mv, "mover_table", False), (self.EXCHANGE_MOVES_APPROX.get(t), "mover_table_approx", True)):
+            if table and d is not None:
+                cur = None
+                for eff, v in table:
+                    if eff <= d:
+                        cur = v
+                if cur:
+                    return cur, src, inf
+        key = ("venues",)
+        if key not in self._cache:
+            dr = self._directory()
+            vm, snap = {}, None
+            if len(dr):
+                snap = pd.Timestamp(dr["snapshot_date"].max())
+                last = dr[dr["snapshot_date"] == dr["snapshot_date"].max()]
+                for sym_, ex_ in zip(last["symbol"].astype(str), last["exchange"].astype(str)):
+                    v = self._VENUE.get(ex_)
+                    if v:
+                        vm[sym_.upper().replace(".", "-")] = v
+            self._cache[key] = (vm, snap)
+        vm, snap = self._cache[key]
+        v = vm.get(t)
+        if v is None:
+            return None, None, False
+        if mv and d is None:
+            return v, "nasdaqtrader", False
+        inferred = d is not None and snap is not None and d < snap.normalize() - pd.Timedelta(days=7)
+        return v, f"nasdaqtrader_{snap.date() if snap is not None else ''}", bool(inferred)
 
     def _is_etf(self, symbol: str) -> bool:
         s = symbol.upper()
@@ -180,8 +238,15 @@ class Portal:
         df["asset_class"] = [("ETF" if self._is_etf(s) else "STK") for s in df["symbol"]]
         df["sector_etf"] = [U.sector_etf_for(sec, as_of) if isinstance(sec, str) else None
                             for sec in df.get("sector", pd.Series([None] * len(df)))]
-        members = set(self.universe("SP500", as_of)) if self.store.exists("reference", "sp500", "membership") else set()
+        members = {k.split("~")[0] for k in self.universe("SP500", as_of)} \
+            if self.store.exists("reference", "sp500", "membership") else set()
         df["in_sp500"] = df["symbol"].isin(members)
+        # primary listing venue at as_of: mover table (PIT) where known, else the current Nasdaq
+        # Trader directory -- flagged inferred when as_of precedes the directory snapshot
+        ven = [self.exchange_at(sym, as_of) for sym in df["symbol"]]
+        df["exchange_pit"] = [v[0] for v in ven]
+        df["exchange_source"] = [v[1] for v in ven]
+        df["exchange_inferred"] = [v[2] for v in ven]
         firsts, lasts = [], []
         for s in df["symbol"]:
             src = self._bar_source(s, "1d")
@@ -199,7 +264,17 @@ class Portal:
                          "pit_note": "SIC/GICS are current classifications, not point-in-time"})
         return df.sort_values("symbol").reset_index(drop=True)
 
-    def universe(self, name: str, as_of) -> list[str]:
+    def universe(self, name: str, as_of, require_bars: bool = False) -> list[str]:
+        """Members at as_of. require_bars=True keeps only members for which bars(sym, '1d', ...,
+        as_of) serves a bar within the last 5 sessions (the same check has(..., as_of=) and the
+        survivorship report use), so universe and engine data checks agree."""
+        names = self._universe(name, as_of)
+        if not require_bars:
+            return names
+        a = _utc(as_of)
+        return [x for x in names if self.has(x, "bars", "1d", start=a - pd.Timedelta(days=8), end=a, as_of=a)]
+
+    def _universe(self, name: str, as_of) -> list[str]:
         as_of = _utc(as_of)
         n = name.upper()
         if n in ("SP500", "S&P500", "SPX_MEMBERS"):
@@ -209,9 +284,13 @@ class Portal:
             d = _session_date(as_of)
             # a member is in the index for sessions in [start, end)
             cur = m[(m["start"] <= d) & (m["end"].isna() | (m["end"] > d))]
-            # PIT tickers (the symbol as it traded then, '.' -> '-'), never today's Yahoo ticker;
-            # Portal.bars / security_id resolve them to the security they denoted at the date
-            return sorted({str(b).upper().replace(".", "-") for b in cur["base"]})
+            # fja05680 tickers are NOT reliably point-in-time (survivors appear under today's
+            # ticker: CVX, CBRE, WELL, GOOGL, ES, JPM ...). Each member is mapped to its SECURITY
+            # by the bar-date identity timeline (CIK); a ticker that denotes more than one issuer
+            # over history is returned as a security key 'TICKER~CIK##########' so bars / actions
+            # never splice two companies. Unresolvable members keep the bare ticker (bars() fails
+            # closed -> counted missing by the survivorship report).
+            return sorted({self._member_key(str(b).upper().replace(".", "-"), d) for b in cur["base"]})
         mt = re.fullmatch(r"SP500_TOP(\d+)_DV", n)
         if mt:
             return self._top_dollar_volume("SP500", int(mt.group(1)), as_of)
@@ -226,6 +305,57 @@ class Portal:
                     out.append(s)
             return out
         raise KeyError(f"unknown universe {name!r}; known: SP500, {', '.join(U.STATIC_UNIVERSES)}")
+
+    def _member_key(self, ticker: str, date) -> str:
+        """Security key of the S&P member listed as `ticker` on `date`. fja05680 lists survivors
+        under TODAY's ticker (SPGI for McGraw-Hill 2010, MO for Philip Morris 1996, DXC for CSC),
+        so the member is identified by its membership interval, which S&P keeps through renames:
+        open interval -> the current constituent's CIK (Wikipedia) or the ticker's current
+        issuer; closed interval -> the issuer the ticker denoted on the interval's last session.
+        Returns the bare ticker when it denotes that same issuer on `date` and was never reused,
+        else 'TICKER~CIK##########' (bars/actions of that security only)."""
+        if self._is_plain(ticker):
+            return ticker
+        d = pd.Timestamp(date).normalize()
+        ck = ("member_key", ticker, d)
+        if ck in self._cache:
+            return self._cache[ck]
+        iv = self._member_interval(ticker, d)
+        c_m = 0
+        if iv is not None:
+            if pd.isna(iv[1]):
+                _, wcik = self._member_name(ticker, d)
+                if wcik:
+                    c_m = int(wcik)
+                else:
+                    c, _, _ = self._identity_by_date(ticker, [pd.Timestamp.now().normalize()])
+                    c_m = int(c[0])
+            else:
+                c, _, _ = self._identity_by_date(ticker, [pd.Timestamp(iv[1]) - pd.Timedelta(days=1)])
+                c_m = int(c[0])
+        c_d, _, _ = self._identity_by_date(ticker, [d])
+        c_d = int(c_d[0])
+        if c_d and c_m and c_d != c_m and iv is not None:
+            # the ticker changed hands INSIDE this membership interval (fja keeps one 'IR' interval
+            # 2010-> although Ingersoll-Rand plc became Trane 'TT' and Gardner Denver took 'IR' on
+            # 2020-03-02): the member on `date` is the issuer the ticker denoted on `date`
+            tl0 = self.ticker_timeline(ticker)
+            hi = pd.Timestamp.now() if pd.isna(iv[1]) else pd.Timestamp(iv[1])
+            seg = tl0[(tl0["end"] > max(pd.Timestamp(iv[0]), d)) & (tl0["start"] < hi)] if len(tl0) else tl0
+            if len(seg) and seg["cik"].nunique() > 1:
+                c_m = c_d
+        if not c_m:
+            c_m = c_d
+        tl = self.ticker_timeline(ticker)
+        reused = len(tl) and tl["cik"].nunique() > 1
+        if not c_m:
+            key = ticker
+        elif c_d == c_m and not reused:
+            key = ticker
+        else:
+            key = f"{ticker}~CIK{c_m:010d}"
+        self._cache[ck] = key
+        return key
 
     def _top_dollar_volume(self, base: str, n: int, as_of: pd.Timestamp, lookback: int = 20) -> list[str]:
         """PIT top-n members of `base` by mean raw close x volume over the `lookback` sessions
@@ -264,13 +394,14 @@ class Portal:
         as_of, start, end = _utc(as_of), _utc(start), _utc(end)
         alias = None
         ident = None
+        allowed, vmap = None, {}
         if freq == "1d" and source is None:
-            rdate = _session_date(min(end - pd.Timedelta(microseconds=1), as_of))
-            ident = self._identity_frame(symbol, rdate)
+            # identity is a property of the BAR DATE (never of as_of): resolve the security over
+            # the requested sessions; as_of only filters knowledge (known_at) below
+            ident, allowed, vmap = self._window_identity(symbol, start, end)
             if not len(ident):
-                if not self._is_plain(symbol):
-                    raise DataUnavailableError(f"{symbol}: security identity not established at {rdate.date()} "
-                                               f"(fail closed); log: {ident.attrs.get('identity_log', [])[-1:]}")
+                if not self._is_plain(self._split_key(symbol)[0]):
+                    raise DataUnavailableError(f"{symbol}: security identity not established (fail closed)")
                 native = self._bar_source(symbol, freq, source)
                 ident = None
             else:
@@ -296,6 +427,8 @@ class Portal:
         if df.empty:
             return frames.empty_bars()
         sel = (df.index >= start) & (df.index < end) & (df["known_at"] <= as_of)
+        if allowed is not None:
+            sel &= frames.to_naive_date(df.index).isin(allowed)
         out = df.loc[sel]
         if freq != "1d" and sessions:
             out = out[out["session"].isin(tuple(sessions))]
@@ -314,11 +447,15 @@ class Portal:
         if ident is not None:
             out.attrs["security_id"] = ident.attrs.get("security_id")
             out.attrs["identity_log"] = ident.attrs.get("identity_log")
-            from .identity import norm as _norm
-            note = self._cache.get(("resolve_note", _norm(symbol), pd.Timestamp(rdate).normalize()))
-            if note:
-                out.attrs["fidelity"] = int(max(fid, Fidelity.T2_PROXY))
-                out.attrs["identity_log"] = list(out.attrs["identity_log"] or []) + [note]
+            if vmap and len(out):
+                used = {vmap[d] for d in frames.to_naive_date(out.index) if d in vmap}
+                if used:
+                    out.attrs["fidelity"] = int(max(fid, Fidelity.T2_PROXY))
+                    out.attrs["identity_log"] = list(out.attrs["identity_log"] or []) + [
+                        f"identity of some bar dates established via {sorted(used)} (T2): 'pre' = before 2006 "
+                        f"evidence (member-confirmed), 'carried' = copied ticker + name check, 'membership' = "
+                        f"S&P membership continuity, 'carry' = same security after its last evidence under "
+                        f"this ticker"]
         return out
 
     def _adjust(self, symbol: str, bars: pd.DataFrame, as_of: pd.Timestamp, src: str,
@@ -412,6 +549,85 @@ class Portal:
         best = min(h, key=lambda x: abs((x[0] - d).days))
         return best[1] if abs((best[0] - d).days) <= 3 * 365 else None
 
+    def _member_index(self):
+        """Python-level membership index: ticker -> sorted [(start, end|None, left_censored)],
+        plus all intervals as tuples (ticker, start, end) for boundary lookups."""
+        from .identity import norm
+        key = ("member_index",)
+        if key not in self._cache:
+            m = self._read("reference", "sp500", "membership")
+            by: dict = {}
+            allv = []
+            for r in (m.to_dict("records") if len(m) else []):
+                t = norm(str(r["base"]))
+                e = None if pd.isna(r["end"]) else pd.Timestamp(r["end"])
+                by.setdefault(t, []).append((pd.Timestamp(r["start"]), e, bool(r.get("left_censored", False))))
+                allv.append((t, pd.Timestamp(r["start"]), e))
+            for v in by.values():
+                v.sort(key=lambda x: x[0])
+            self._cache[key] = (by, allv)
+        return self._cache[key]
+
+    def _member_interval(self, symbol: str, date):
+        """(start, end) of the S&P membership interval of `symbol` containing `date`, else None.
+        A left-censored first interval (member on 1996-01-02, the file's first date) also covers
+        earlier dates."""
+        from .identity import norm
+        rows = self._member_index()[0].get(norm(symbol))
+        if not rows:
+            return None
+        d = pd.Timestamp(date).normalize()
+        for st, en, _ in rows:
+            if st <= d and (en is None or en > d):
+                return st, (pd.NaT if en is None else en)
+        st, en, lc = rows[0]
+        if lc and d < st:
+            return st, (pd.NaT if en is None else en)
+        return None
+
+    def _member_rows(self, symbol: str):
+        from .identity import norm
+        rows = self._member_index()[0].get(norm(symbol))
+        if not rows:
+            return None
+        return pd.DataFrame([{"start": a, "end": (pd.NaT if b is None else b), "left_censored": c} for a, b, c in rows])
+
+    def _membership_sandwich(self, symbol: str, date, idx):
+        """Ticker renamed back and forth while in the index (FISV -> FI 2023-06-07 -> FISV
+        2025-11-11): the interval of `symbol` containing `date` is immediately preceded AND
+        followed (+-5 days) by intervals of one other ticker that denotes the same CIK (as-of
+        evidence) on both boundaries -> (cik, other ticker), else None."""
+        from .identity import norm
+        iv = self._member_interval(symbol, date)
+        if iv is None:
+            return None
+        sym = norm(symbol)
+        _, allv = self._member_index()
+        tol = pd.Timedelta(days=5)
+        prev_t = {t for t, st, en in allv if en is not None and abs(en - iv[0]) <= tol and t != sym}
+        if not prev_t:
+            return None
+        if pd.notna(iv[1]):
+            nxt_t = {t for t, st, en in allv if abs(st - iv[1]) <= tol and t != sym}
+            for t in prev_t & nxt_t:
+                a = int(idx.label_dates(t, pd.DatetimeIndex([iv[0] - pd.Timedelta(days=1)]))[0])
+                b = int(idx.label_dates(t, pd.DatetimeIndex([iv[1] + pd.Timedelta(days=1)]))[0])
+                if a and a == b:
+                    return a, t
+        # plain rename while in the index (BLL -> BALL 2022-05-10; ZipLime's as-of ticker lags):
+        # the preceding interval's ticker denotes c just before the change AND the new ticker's
+        # own first as-of evidence after the change is c, with no other issuer on it since
+        e = idx.by_ticker.get(sym)
+        e = e[(e["conf"] == 0) & (e["date"] >= iv[0])] if e is not None else None
+        if e is None or not len(e) or e["cik"].nunique() != 1:
+            return None
+        c_new = int(e["cik"].iloc[0])
+        for t in prev_t:
+            a = int(idx.label_dates(t, pd.DatetimeIndex([iv[0] - pd.Timedelta(days=1)]))[0])
+            if a and a == c_new:
+                return a, t
+        return None
+
     def _member_name(self, symbol: str, date) -> tuple[Optional[str], Optional[int]]:
         """(name, wikipedia_cik) of the S&P 500 member `symbol` for the membership interval that
         contains `date`: current constituents (name + CIK) if the interval is still open, else the
@@ -419,39 +635,44 @@ class Portal:
         when `symbol` was not a member at `date` or no name is recorded for that interval."""
         from .identity import norm
         sym, d = norm(symbol), pd.Timestamp(date).normalize()
-        m = self._read("reference", "sp500", "membership")
-        if not len(m):
+        ivr = self._member_interval(sym, d)
+        if ivr is None:
             return None, None
-        keys = m["base"].astype(str).map(norm)
-        iv = m[(keys == sym) & (m["start"] <= d) & (m["end"].isna() | (m["end"] > d))]
-        if not len(iv):
-            return None, None
-        r = iv.iloc[0]
-        if pd.isna(r["end"]):
+        r = {"start": ivr[0], "end": ivr[1]}
+        key = ("member_name_tables",)
+        if key not in self._cache:
             cur = self._read("reference", "sp500", "current_constituents")
-            hit = cur[cur["symbol"].astype(str).map(norm) == sym] if len(cur) else cur
-            if len(hit):
-                ck = pd.to_numeric(hit["cik"].iloc[0], errors="coerce")
-                return str(hit["name"].iloc[0]), (int(ck) if pd.notna(ck) else None)
-            return None, None
-        w = self._read("reference", "sp500", "wiki_changes")
-        if not len(w):
-            return None, None
+            curd = {}
+            for row in (cur.to_dict("records") if len(cur) else []):
+                ck = pd.to_numeric(row.get("cik"), errors="coerce")
+                curd[norm(row["symbol"])] = (str(row["name"]), int(ck) if pd.notna(ck) else None)
+            w = self._read("reference", "sp500", "wiki_changes")
+            wd: dict = {}
+            for row in (w.to_dict("records") if len(w) else []):
+                for col, ncol in (("removed", "removed_name"), ("added", "added_name")):
+                    if isinstance(row.get(col), str) and isinstance(row.get(ncol), str):
+                        wd.setdefault((col, norm(row[col])), []).append((pd.Timestamp(row["effective_date"]), row[ncol]))
+            self._cache[key] = (curd, wd)
+        curd, wd = self._cache[key]
+        if pd.isna(r["end"]):
+            return curd.get(sym, (None, None))
         tol = pd.Timedelta(days=15)
-        for col, ncol, when in (("removed", "removed_name", r["end"]), ("added", "added_name", r["start"])):
-            hit = w[(w[col].astype(str).map(norm) == sym) & ((w["effective_date"] - pd.Timestamp(when)).abs() <= tol)]
-            hit = hit[hit[ncol].notna()]
-            if len(hit):
-                return str(hit[ncol].iloc[0]), None
+        for col, when in (("removed", r["end"]), ("added", r["start"])):
+            for eff, nm in wd.get((col, sym), []):
+                if abs(eff - pd.Timestamp(when)) <= tol:
+                    return str(nm), None
         return None, None
 
     def security_id(self, symbol: str, as_of) -> Optional[str]:
         """'CIK##########' for the security `symbol` denoted at as_of, 'TKR:<sym>' for ETFs/indices,
         None when the identity cannot be established (fail closed)."""
-        kind, key = self._resolve(symbol, _session_date(_utc(as_of)))
-        if kind == "cik":
-            return f"CIK{key:010d}"
-        return f"TKR:{key}" if kind == "plain" else None
+        t, kc = self._split_key(symbol)
+        if kc is not None:
+            return f"CIK{kc:010d}"
+        if self._is_plain(t):
+            return f"TKR:{t}"
+        c, _, _ = self._identity_by_date(t, [_session_date(_utc(as_of))])
+        return f"CIK{int(c[0]):010d}" if c[0] else None
 
     def _resolve(self, symbol: str, date) -> tuple[Optional[str], object]:
         from .identity import names_match, cik_names, cik_name_at, norm
@@ -479,13 +700,29 @@ class Portal:
                 n0, n1 = cik_name_at(cik_, d), cik_name_at(cik_, e["date"].iloc[0])
                 return n0 is None or n1 is None or not names_match(n1, [n0])
 
+            sw = None if c_asof else self._membership_sandwich(sym, d, idx)
+            if sw is not None:
+                c, nb = sw
+                res = ("cik", int(c))
+                self._cache[("resolve_lineage", sym, d)] = nb
+                self._cache[("resolve_note", sym, d)] = (
+                    f"membership continuity: {sym} {d.date()} lies in an S&P membership interval bracketed by "
+                    f"intervals of {nb}, which denote CIK {c} on both boundaries (T2)")
+                self._cache[ck] = res
+                return res
             if c:
                 hint = self._member_name(sym, d)[0] or self._name_hint(sym, d)
-                if not c_asof and hint and not names_match(hint, cik_names(c)):
-                    log.info("identity veto %s %s: CIK %s names %s do not match member name %r",
-                             sym, d.date(), c, cik_names(c)[:2], hint)
+                nat = cik_name_at(int(c), d) if not c_asof else None
+                if not c_asof and not hint:
+                    # copied (carried) ticker evidence alone never establishes identity: CCI 1998 was
+                    # Citicorp, not Crown Castle (whose later ticker was copied back)
+                    log.debug("identity veto %s %s: carried evidence for CIK %s and no recorded member name",
+                             sym, d.date(), c)
+                elif not c_asof and (nat is None or not names_match(hint, [nat])):
+                    log.debug("identity veto %s %s: CIK %s was named %r then, member name %r",
+                             sym, d.date(), c, nat, hint)
                 elif not c_asof and renamed_since(int(c)):
-                    log.info("identity veto %s %s: CIK %s was named %r then (renamed before its first as-of "
+                    log.debug("identity veto %s %s: CIK %s was named %r then (renamed before its first as-of "
                              "evidence under %s)", sym, d.date(), c, cik_name_at(int(c), d), sym)
                 else:
                     res = ("cik", int(c))
@@ -496,7 +733,8 @@ class Portal:
             else:
                 # before the ticker's first as-of evidence (2006+): accept the earliest evidenced
                 # issuer only if the S&P member of this membership interval confirms it
-                pc = idx.pre_evidence_cik(sym, d)
+                iv = self._member_interval(sym, d)
+                pc = idx.pre_evidence_cik(sym, d, renamed_before=None if iv is None else iv[0])
                 if pc:
                     name, wcik = self._member_name(sym, d)
                     ok = (wcik is not None and int(wcik) == pc) or (name is not None and names_match(name, cik_names(pc)))
@@ -504,7 +742,7 @@ class Portal:
                         # member's CIK is the successor issuer on the same ticker (holdco reorganization)
                         ok = any(names_match(a, cik_names(int(wcik))) for a in cik_names(pc))
                     if ok and renamed_since(pc):
-                        log.info("identity pre-evidence %s %s: CIK %s was named %r then (renamed before 2006 "
+                        log.debug("identity pre-evidence %s %s: CIK %s was named %r then (renamed before 2006 "
                                  "evidence; fail closed)", sym, d.date(), pc, cik_name_at(pc, d))
                         ok = False
                     if ok:
@@ -514,38 +752,231 @@ class Portal:
                             f"CIK {pc} confirmed by S&P member {'CIK' if wcik is not None and int(wcik) == pc else 'name'}"
                             f" {name!r}, no rename since (T2)")
                     else:
-                        log.info("identity pre-evidence %s %s: CIK %s not confirmed (member %r; fail closed)",
+                        log.debug("identity pre-evidence %s %s: CIK %s not confirmed (member %r; fail closed)",
                                  sym, d.date(), pc, name)
         self._cache[ck] = res
         return res
 
-    def _identity_frame(self, symbol: str, date=None) -> pd.DataFrame:
-        """Verified RAW daily history of the security `symbol` denoted on `date` (default: latest
-        session). attrs: source, security_id, identity_log, actions (frame). Empty if the identity
-        cannot be established (fail closed)."""
+    # ---------------------------------------------------------------- identity by BAR DATE
+    @staticmethod
+    def _split_key(symbol: str) -> tuple[str, Optional[int]]:
+        """'BBT~CIK0000092230' -> ('BBT', 92230); 'BBT' -> ('BBT', None)."""
+        s = str(symbol).upper()
+        if "~CIK" in s:
+            t, c = s.split("~CIK", 1)
+            return t, int(c)
+        return s, None
+
+    def ticker_timeline(self, symbol: str) -> pd.DataFrame:
+        """Segments [start, end) of NYSE sessions on which the ticker is established to denote
+        an issuer: columns start, end, cik, via ('as_of' | 'carried' | 'pre' | 'membership'),
+        hint (lineage ticker). Independent of any as_of: identity is a property of the bar date
+        (security-master semantics; evidence from all of history is used, as a master would).
+        Dates between segments are unknown; `_identity_by_date` carries the last identity
+        forward (the security keeps trading under its next ticker) but never backward."""
+        from .identity import BUILD_VERSION, norm
+        sym = norm(self._split_key(symbol)[0])
+        ck = ("timeline", sym)
+        if ck in self._cache:
+            return self._cache[ck]
+        if self.store.exists("identity", "timeline", sym) and \
+                self.store.meta("identity", "timeline", sym).get("build_version") == BUILD_VERSION:
+            tl = self.store.read("identity", "timeline", sym).reset_index(drop=True)
+            tl = tl[tl["cik"] > 0].reset_index(drop=True) if len(tl) else tl
+            self._cache[ck] = tl
+            return tl
+        sch = frames.schedule().index
+        sch = sch[(sch >= pd.Timestamp("1962-01-02")) & (sch <= pd.Timestamp.now().normalize())]
+        idx = self.identity_index()
+        lab = idx.label_dates(sym, sch).astype(np.int64)
+        via = np.where(lab > 0, "as_of", "").astype(object)
+        hint = np.full(len(sch), None, dtype=object)
+        memo: dict = {}
+
+        def point(i: int):
+            if i not in memo:
+                d = sch[i]
+                kind, key = self._resolve(sym, d)
+                c = int(key) if kind == "cik" else 0
+                note = self._cache.get(("resolve_note", sym, d)) or ""
+                v = note.split(":")[0].split(" ")[0] if note else ("as_of" if c else "")
+                memo[i] = (c, {"pre-evidence": "pre", "carried": "carried", "membership": "membership"}.get(v, v),
+                           self._cache.get(("resolve_lineage", sym, d)))
+            return memo[i]
+
+        def fill(a: int, b: int):
+            ra, rb = point(a), point(b)
+            if b - a <= 1 or ra[0] == rb[0]:
+                lab[a:b], via[a:b], hint[a:b] = ra[0], ra[1], ra[2]
+                lab[b], via[b], hint[b] = rb
+                return
+            m = (a + b) // 2
+            fill(a, m)
+            fill(m, b)
+
+        un = lab == 0
+        if un.any():
+            mem = self._read("reference", "sp500", "membership")
+            bnd = set()
+            if len(mem):
+                mm = mem[mem["base"].astype(str).map(norm) == sym]
+                for x in list(mm["start"]) + list(mm["end"].dropna()):
+                    j = int(sch.searchsorted(pd.Timestamp(x)))
+                    bnd.update({j - 1, j})
+            edges = np.flatnonzero(np.diff(np.r_[0, un.astype(int), 0]))
+            for i0, i1 in zip(edges[::2], edges[1::2] - 1):
+                pts = sorted({i0, i1} | set(range(i0, i1, 504)) | {j for j in bnd if i0 <= j <= i1})
+                for a, b in zip(pts[:-1], pts[1:]):
+                    fill(a, b)
+                if len(pts) == 1:
+                    lab[i0], via[i0], hint[i0] = point(i0)
+        # compress into segments
+        rows = []
+        key = list(zip(lab, via, hint))
+        i = 0
+        while i < len(sch):
+            j = i
+            while j + 1 < len(sch) and key[j + 1] == key[i]:
+                j += 1
+            if lab[i] > 0:
+                rows.append({"start": sch[i], "end": sch[j] + pd.Timedelta(days=1), "cik": int(lab[i]),
+                             "via": via[i] or "as_of", "hint": hint[i]})
+            i = j + 1
+        # hand-over between two issuers: filings only bracket the switch (new Arconic filed as
+        # 'ARNC' on 2020-03-26, the spin-off was 2020-04-01). If the as-traded DoltHub series of
+        # the ticker shows an identity break (|move| > 20 %) within 90 days before / 30 days after
+        # the evidence midpoint, the switch is placed on that session.
+        if len(rows) > 1 and self.store.exists("bars_1d", "dolthub", sym):
+            db = self._read("bars_1d", "dolthub", sym)
+            if len(db):
+                dc = pd.Series(db["close"].to_numpy(), index=frames.to_naive_date(db.index))
+                lr = np.log(dc).diff().abs()
+                for a_, b_ in zip(rows[:-1], rows[1:]):
+                    if a_["cik"] == b_["cik"] or (b_["start"] - a_["end"]).days > 10:
+                        continue
+                    w = lr[(lr.index >= b_["start"] - pd.Timedelta(days=90)) &
+                           (lr.index <= b_["start"] + pd.Timedelta(days=30))]
+                    if len(w) and float(w.max()) > np.log(1.2):
+                        k = w.idxmax()
+                        a_["end"], b_["start"] = k, k
+        tl = pd.DataFrame(rows, columns=["start", "end", "cik", "via", "hint"])
+        if getattr(self, "_persist_timelines", False):
+            store_tl = tl if len(tl) else pd.DataFrame({"start": [pd.Timestamp("1900-01-01")],
+                                                        "end": [pd.Timestamp("1900-01-02")], "cik": [0],
+                                                        "via": [""], "hint": [None]})
+            self.store.write("identity", "timeline", sym, store_tl.astype({"hint": object}), key=["start"],
+                             replace=True, extra={"build_version": BUILD_VERSION})
+        self._cache[ck] = tl
+        return tl
+
+    def _identity_by_date(self, symbol: str, dates) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per date: (cik or 0, via, lineage hint). Inside a timeline segment -> that issuer; in a
+        gap AFTER a segment -> the previous issuer carried forward (via 'carry'); before the first
+        segment -> 0 (unknown: an earlier company may have used the ticker)."""
+        tl = self.ticker_timeline(symbol)
+        d = pd.DatetimeIndex(dates)
+        n = len(d)
+        cik = np.zeros(n, dtype=np.int64)
+        via = np.full(n, "", dtype=object)
+        hint = np.full(n, None, dtype=object)
+        if not len(tl) or not n:
+            return cik, via, hint
+        st = pd.DatetimeIndex(tl["start"]).values
+        en = pd.DatetimeIndex(tl["end"]).values
+        pos = np.searchsorted(st, d.values, side="right") - 1
+        ok = pos >= 0
+        p = np.clip(pos, 0, len(tl) - 1)
+        inside = ok & (d.values < en[p])
+        cik[ok] = tl["cik"].to_numpy()[p[ok]]
+        via[ok] = np.where(inside[ok], tl["via"].to_numpy()[p[ok]], "carry")
+        hint[ok] = tl["hint"].to_numpy()[p[ok]]
+        return cik, via, hint
+
+    def _cik_series(self, cik: int, symbol: str, hint: Optional[str] = None) -> pd.DataFrame:
+        """Verified RAW daily history of issuer `cik` (lineage from `symbol`, or `hint`'s lineage
+        plus `symbol` for membership continuity). attrs: source, security_id, identity_log, actions."""
         from .identity import build_series, norm
+        idx = self.identity_index()
+        sym = norm(symbol)
+        main, _ = idx.lineage(cik, sym)
+        if hint:
+            main = list(dict.fromkeys(idx.lineage(cik, hint)[0] + [sym]))
+        ck = ("identity_series", cik, tuple(main))
+        if ck not in self._cache:
+            got = self._load_identity(cik, main)
+            if got is None:
+                m, acts, lg = build_series(self, idx, cik, sym, lineage_hint=hint)
+                m.attrs.update({"source": "+".join(sorted(set(m["src"]))) if len(m) else None,
+                                "security_id": f"CIK{cik:010d}", "identity_log": lg, "actions": acts})
+                got = m
+            self._cache[ck] = got
+        return self._cache[ck]
+
+    def _identity_frame(self, symbol: str, date=None) -> pd.DataFrame:
+        """Verified RAW daily history of the security `symbol` denotes on `date` (default: latest
+        session) -- per-date identity with carry-forward; a security key 'T~CIK..' names it
+        directly. Empty frame (fail closed) when unknown."""
         if date is None:
             date = frames.schedule().index[frames.schedule().index <= pd.Timestamp.now().normalize()][-1]
-        kind, key = self._resolve(symbol, date)
-        if kind == "plain":
-            return self._plain_frame(key)
-        if kind != "cik":
+        t, kc = self._split_key(symbol)
+        if kc is None and self._is_plain(t):
+            return self._plain_frame(t)
+        if kc is None:
+            c, via, hint = self._identity_by_date(t, [pd.Timestamp(date).normalize()])
+            kc, hint = int(c[0]), hint[0]
+        else:
+            hint = self._key_hint(t, kc)
+        if not kc:
             out = frames.empty_bars()
             out.attrs.update({"source": None, "security_id": None, "identity_log": ["FAIL CLOSED: identity unknown"]})
             return out
-        idx = self.identity_index()
-        main, _ = idx.lineage(key, norm(symbol))
-        ck = ("identity_series", key, tuple(main))
-        if ck not in self._cache:
-            got = self._load_identity(key, main)
-            if got is not None:
-                self._cache[ck] = got
-                return got
-            m, acts, lg = build_series(self, idx, key, norm(symbol))
-            m.attrs.update({"source": "+".join(sorted(set(m["src"]))) if len(m) else None,
-                            "security_id": f"CIK{key:010d}", "identity_log": lg, "actions": acts})
-            self._cache[ck] = m
-        return self._cache[ck]
+        return self._cik_series(kc, t, hint)
+
+    def _key_hint(self, ticker: str, cik: int) -> Optional[str]:
+        tl = self.ticker_timeline(ticker)
+        h = tl.loc[(tl["cik"] == cik) & tl["hint"].notna(), "hint"] if len(tl) else []
+        return h.iloc[0] if len(h) else None
+
+    def _window_identity(self, symbol: str, start, end):
+        """(frame, allowed session dates or None, via-by-date dict) of the ONE security `symbol`
+        denotes on the sessions in [s0, e0). A plain ticker denoting two issuers inside the window
+        raises DataUnavailableError (never spliced): use the security key 'T~CIK##########' that
+        universe() returns for reused tickers. Unknown identity -> DataUnavailableError."""
+        t, kc = self._split_key(symbol)
+        if kc is None and self._is_plain(t):
+            return self._plain_frame(t), None, {}
+        if kc is not None:
+            f = self._cik_series(kc, t, self._key_hint(t, kc))
+            if not len(f):
+                raise DataUnavailableError(f"{symbol}: no verified history for this security (fail closed)")
+            return f, None, {}
+        sc = frames.schedule()
+        start, end = _utc(start), _utc(end)
+        dates = sc.index[(sc["open"] >= start) & (sc["open"] < end)]
+        if not len(dates):
+            dates = sc.index[sc["open"] < end][-1:]
+        cik, via, hint = self._identity_by_date(t, dates)
+        u = sorted(set(cik[cik > 0].tolist()))
+        if len(u) > 1:
+            segs = []
+            for c in u:
+                dd = dates[cik == c]
+                segs.append(f"CIK{c:010d} {dd[0].date()}..{dd[-1].date()}")
+            raise DataUnavailableError(
+                f"{t}: the ticker denotes {len(u)} different securities in this window ({'; '.join(segs)}); "
+                f"never spliced -- request a security key, e.g. '{t}~CIK{u[0]:010d}'")
+        if not u:
+            raise DataUnavailableError(f"{t}: security identity not established in "
+                                       f"{dates[0].date()}..{dates[-1].date()} (fail closed)")
+        c = u[0]
+        h = next((x for x in hint[cik == c] if x), None)
+        f = self._cik_series(c, t, h)
+        if not len(f):
+            raise DataUnavailableError(f"{t}: security identity CIK{c:010d} has no verified segment (fail closed); "
+                                       f"log: {f.attrs.get('identity_log', [])[-1:]}")
+        allowed = dates[cik == c]
+        vmap = {d: v for d, v in zip(allowed, via[cik == c]) if v != "as_of"}
+        return f, allowed, vmap
 
     @staticmethod
     def _identity_store_key(cik: int, main) -> str:
@@ -571,20 +1002,42 @@ class Portal:
         return m
 
     def persist_identity(self, symbol: str, date=None) -> dict:
-        """Build and store the verified series of the security `symbol` denotes on `date`."""
+        """Persist the ticker's identity timeline and the verified series of every security it
+        denotes (and of the S&P member keys it maps to). `date` is ignored (kept for API)."""
+        from .identity import norm
+        t = norm(self._split_key(symbol)[0])
+        if self._is_plain(t):
+            return {"symbol": t, "identity": "plain"}
+        self._persist_timelines = True
+        try:
+            self._cache.pop(("timeline", t), None)
+            tl = self.ticker_timeline(t)
+        finally:
+            self._persist_timelines = False
+        jobs = {(int(r.cik), r.hint if isinstance(r.hint, str) else None) for r in tl.itertuples()}
+        rows = self._member_index()[0].get(t, [])
+        for st, en, _ in rows:
+            k = self._member_key(t, st)
+            if "~CIK" in k:
+                c = self._split_key(k)[1]
+                jobs.add((c, self._key_hint(t, c)))
+        out = []
+        for c, h in sorted(jobs, key=lambda x: x[0]):
+            out.append(self.persist_cik_series(c, t, h))
+        return {"symbol": t, "segments": len(tl), "series": out}
+
+    def persist_cik_series(self, cik: int, symbol: str, hint: Optional[str] = None) -> dict:
         from .identity import BUILD_VERSION, build_series, norm
-        if date is None:
-            date = frames.schedule().index[frames.schedule().index <= pd.Timestamp.now().normalize()][-1]
-        kind, key = self._resolve(symbol, date)
-        if kind != "cik":
-            return {"symbol": symbol, "date": str(pd.Timestamp(date).date()), "identity": kind}
         idx = self.identity_index()
-        main, _ = idx.lineage(key, norm(symbol))
-        k = self._identity_store_key(key, main)
+        sym = norm(symbol)
+        main, _ = idx.lineage(cik, sym)
+        if hint:
+            main = list(dict.fromkeys(idx.lineage(cik, hint)[0] + [sym]))
+        k = self._identity_store_key(cik, main)
         if self.store.exists("identity", "series", k) and \
                 self.store.meta("identity", "series", k).get("build_version") == BUILD_VERSION:
-            return {"symbol": symbol, "key": k, "cached": True}
-        m, acts, lg = build_series(self, idx, key, norm(symbol))
+            return {"key": k, "cached": True}
+        m, acts, lg = build_series(self, idx, cik, sym, lineage_hint=hint)
         extra = {"build_version": BUILD_VERSION, "identity_log": lg[:200], "empty": not len(m),
                  "served_sources": "+".join(sorted(set(m["src"]))) if len(m) else None}
         store_m = m if len(m) else pd.DataFrame({"close": [np.nan]}, index=pd.DatetimeIndex(
@@ -597,7 +1050,7 @@ class Portal:
                     a[c] = a[c].astype(str).where(a[c].notna(), None)
             self.store.write("identity", "actions", k, a.reset_index(drop=True), replace=True,
                              key=["ex_date", "type", "src_ticker"])
-        return {"symbol": symbol, "key": k, "rows": len(m), "actions": len(acts)}
+        return {"key": k, "rows": len(m), "actions": len(acts)}
 
     def _plain_frame(self, sym: str) -> pd.DataFrame:
         key = ("plain_frame", sym)
@@ -615,23 +1068,59 @@ class Portal:
         if key not in self._cache:
             from .actions_classify import classify
             a = self._read("actions", "yahoo", sym)
-            self._cache[key] = classify(sym, a, self._read("bars_1d", "yahoo", sym)) if len(a) else a
+            self._cache[key] = classify(sym, a, self._read("bars_1d", "yahoo", sym), self._child_close) if len(a) else a
         return self._cache[key]
 
-    def _daily_frame(self, symbol: str, date=None) -> pd.DataFrame:
-        return self._identity_frame(symbol, date)
+    def _child_close(self, sym: str, ex) -> float:
+        """First raw close of a spun-off child on/after its ex-date (within 7 days): DoltHub
+        as-traded rows first (the ticker as it traded then), else Yahoo raw. NaN if unknown."""
+        ex = pd.Timestamp(ex).normalize()
+        for src in ("dolthub", "yahoo"):
+            if not self.store.exists("bars_1d", src, sym):
+                continue
+            b = self._read("bars_1d", src, sym)
+            if not len(b):
+                continue
+            d = frames.to_naive_date(b.index)
+            m = (d >= ex) & (d <= ex + pd.Timedelta(days=7))
+            if m.any():
+                return float(b["close"].to_numpy()[np.argmax(m)])
+        return float("nan")
+
+    def _daily_frame(self, symbol: str, date=None, start=None) -> pd.DataFrame:
+        """Raw daily bars bars() would serve for `symbol` on sessions in [start, date] (default
+        start = date - 120 days): bar-date identity, never spliced; empty when it would fail."""
+        if date is None:
+            date = frames.schedule().index[frames.schedule().index <= pd.Timestamp.now().normalize()][-1]
+        d = pd.Timestamp(date).normalize()
+        s0 = pd.Timestamp(start).normalize() if start is not None else d - pd.Timedelta(days=120)
+        try:
+            f, allowed, _ = self._window_identity(symbol, pd.Timestamp(s0, tz="UTC"),
+                                                  pd.Timestamp(d, tz="UTC") + pd.Timedelta(days=1))
+        except DataUnavailableError:
+            return frames.empty_bars()
+        if len(f):
+            dd = frames.to_naive_date(f.index)
+            m = (dd >= s0) & (dd <= d)
+            if allowed is not None:
+                m &= dd.isin(allowed)
+            f2 = f[m]
+            f2.attrs.update(f.attrs)
+            return f2
+        return f
 
     def _identity_any(self, symbol: str) -> pd.DataFrame:
-        """Identity frame at the latest session, else at the ticker's last as-of evidence date
-        (historical tickers such as GENZ)."""
-        f = self._identity_frame(symbol)
-        if len(f) or self._is_plain(symbol):
-            return f
-        from .identity import norm
-        e = self.identity_index().by_ticker.get(norm(symbol))
-        if e is not None and len(e):
-            return self._identity_frame(symbol, e["date"].iloc[-1])
-        return f
+        """A verified series of ANY security the ticker (or key) denotes at some date (latest
+        first); empty if none (e.g. GENZ's era only, or fail closed everywhere)."""
+        t, kc = self._split_key(symbol)
+        if kc is not None or self._is_plain(t):
+            return self._identity_frame(symbol)
+        tl = self.ticker_timeline(t)
+        for i in range(len(tl) - 1, -1, -1):
+            f = self._cik_series(int(tl["cik"].iloc[i]), t, tl["hint"].iloc[i])
+            if len(f):
+                return f
+        return frames.empty_bars()
 
     def quotes(self, symbol: str, start, end, as_of, source: Optional[str] = None) -> pd.DataFrame:
         as_of, start, end = _utc(as_of), _utc(start), _utc(end)
@@ -676,9 +1165,37 @@ class Portal:
         f = self._read("fundamentals", "sec", symbol, columns=["field"])
         return set(f["field"]) if len(f) else set()
 
+    def bars_coverage(self, symbol: str, start, end, as_of, freq: str = "1d") -> dict:
+        """What bars(symbol, freq, start, end, as_of) will serve, computed BY bars() itself so the
+        answer can never disagree with it: {available, first, last, sessions, expected_sessions,
+        coverage, security_id, fidelity, reason}. expected_sessions = NYSE sessions in [start, end)
+        whose close is known at as_of."""
+        as_of, start, end = _utc(as_of), _utc(start), _utc(end)
+        sch = frames.schedule()
+        exp = sch[(sch["open"] >= start) & (sch["open"] < end) & (sch["close"] <= as_of)] if freq == "1d" else sch.iloc[:0]
+        out = {"available": False, "first": None, "last": None, "sessions": 0, "expected_sessions": int(len(exp)),
+               "coverage": 0.0, "security_id": None, "fidelity": int(Fidelity.NA), "reason": None}
+        try:
+            b = self.bars(symbol, freq, start, end, as_of)
+        except DataUnavailableError as e:
+            out["reason"] = str(e)
+            return out
+        if not len(b):
+            out["reason"] = "no bars in window"
+            return out
+        d = frames.to_naive_date(b.index).unique() if freq == "1d" else b.index
+        out.update({"available": True, "first": b.index[0], "last": b.index[-1], "sessions": int(len(d)),
+                    "coverage": float(len(d) / len(exp)) if len(exp) else 1.0,
+                    "security_id": b.attrs.get("security_id"), "fidelity": int(b.attrs.get("fidelity", 1))})
+        return out
+
     def has(self, symbol: str, kind: str, freq: Optional[str] = None,
-            sessions: Optional[Sequence[str]] = None) -> bool:
+            sessions: Optional[Sequence[str]] = None, *, start=None, end=None, as_of=None) -> bool:
         """kind in {'bars','quotes','options','actions','borrow','fundamentals','events'}.
+        bars with a window (start / end / as_of given): True iff bars(symbol, freq, start, end,
+        as_of) serves at least one bar (identity-verified, fail-closed aware; via bars_coverage).
+        Without a window: True iff identity-verified bars exist for SOME date (a historical ticker
+        such as GENZ is servable for its own era only) -- use the window form to decide a date.
         symbol '*' asks whether ANY data of that kind exists (events: freq = event kind such as
         EARNINGS / INDEX_ADD / INDEX_DEL / FOMC / BUYBACK / HALT; fundamentals: freq = field).
         Symbols as returned by universe() (Yahoo style, renamed tickers) resolve through the
@@ -709,6 +1226,14 @@ class Portal:
             if kind == "actions":
                 return bool(self.store.symbols("actions", "yahoo"))
             return kind == "borrow" and bool(self.store.symbols("borrow", "iborrowdesk"))
+        if kind == "bars" and (start is not None or end is not None or as_of is not None):
+            a = _utc(as_of) if as_of is not None else (_utc(end) if end is not None else pd.Timestamp.now(tz="UTC"))
+            e = _utc(end) if end is not None else a + pd.Timedelta(microseconds=1)
+            s0 = _utc(start) if start is not None else pd.Timestamp("1900-01-01", tz="UTC")
+            ok = self.bars_coverage(symbol, s0, e, a, freq or "1d")["available"]
+            if ok and sessions and (freq or "1d") != "1d":
+                return self.has(symbol, kind, freq, sessions)
+            return ok
         if kind == "bars":
             f = freq or "1d"
             if f == "1d":
@@ -832,11 +1357,26 @@ class Portal:
         syms = list(symbols) if symbols is not None else self.store.symbols("actions", "yahoo")
         out: list[CorporateAction] = []
         for sym in syms:
-            ident = _ident if _ident is not None else self._identity_frame(sym, rdate)
+            allowed = None
+            if _ident is not None:
+                ident = _ident
+            else:
+                # the security the ticker denotes on the ex-dates (bar-date identity); a window
+                # spanning two securities falls back to the one denoted at its last date
+                try:
+                    ident, allowed, _ = self._window_identity(
+                        sym, pd.Timestamp(s0, tz="UTC"), pd.Timestamp(min(e0, pd.Timestamp("2262-01-01")), tz="UTC")
+                        + pd.Timedelta(days=1))
+                except DataUnavailableError:
+                    ident = self._identity_frame(sym, rdate)
+                except OverflowError:
+                    ident = self._identity_frame(sym, rdate)
             a = self._actions_frame(sym, rdate, ident)
             if a is not None and len(a):
                 ex = pd.to_datetime(a["ex_date"])
                 m = (ex >= s0) & (ex <= e0) & (pd.to_datetime(a["known_at"], utc=True) <= as_of)
+                if allowed is not None and len(allowed):
+                    m &= (ex >= allowed[0]) & (ex <= allowed[-1] + pd.Timedelta(days=7))
                 for r in a[m].to_dict("records"):
                     ratio = r.get("ratio", 1.0)
                     out.append(CorporateAction(
@@ -864,9 +1404,39 @@ class Portal:
     def events(self, kind: str, symbols: Optional[Iterable[str]], start, end, as_of) -> list[MarketEvent]:
         """Events with known_at in [start, end] and known_at <= as_of."""
         from . import events as ev
+        keymap: dict = {}
+        if symbols is not None:
+            symbols = list(symbols)
+            for k in symbols:
+                t, kc = self._split_key(k)
+                keymap.setdefault(t, []).append((k, kc))
+            symbols = list(keymap)
         df = ev.load_events(self, kind, symbols, _utc(start), _utc(end))
         if df.empty:
             return []
+        if any(kc is not None for v in keymap.values() for _, kc in v) and "symbol" in df.columns:
+            # security keys: keep only the requested issuer's events (cik column when present,
+            # else the bar-date identity of the ticker at the event date) and relabel
+            keep, lab = [], []
+            for r in df[["symbol", "known_at"] + (["cik"] if "cik" in df.columns else [])].itertuples(index=False):
+                opts = keymap.get(str(r.symbol).upper(), [])
+                hit = None
+                for k, kc in opts:
+                    if kc is None:
+                        hit = k
+                    else:
+                        ec = getattr(r, "cik", None)
+                        if ec is None or pd.isna(ec):
+                            ci, _, _ = self._identity_by_date(str(r.symbol), [_session_date(_utc(r.known_at))])
+                            ec = ci[0]
+                        if int(ec) == kc:
+                            hit = k
+                keep.append(hit is not None)
+                lab.append(hit)
+            df = df[np.array(keep, dtype=bool)].copy()
+            df["symbol"] = [x for x in lab if x is not None]
+            if df.empty:
+                return []
         as_of = _utc(as_of)
         df = df[df["known_at"] <= as_of]
         out = []
@@ -936,7 +1506,8 @@ class Portal:
             snap.loc[miss, "underlying_price"] = px
             snap.loc[miss, "underlying_price_source"] = "pit_bar_close_at_ts"
         cols = [c for c in frames.CHAIN_COLS if c in snap.columns] + \
-            [c for c in ("root", "settlement_date", "kind", "underlying_price_source") if c in snap.columns]
+            [c for c in ("root", "settlement_date", "kind", "underlying_price_source", "vendor_symbol")
+             if c in snap.columns]
         snap = snap[cols].reset_index(drop=True)
         snap.attrs.update({"source": src, "fidelity": int(Fidelity.T2_PROXY), "synthetic": False, "snapshot_ts": ts,
                            "stale_days": (as_of - ts).total_seconds() / 86400,
@@ -1019,9 +1590,8 @@ class Portal:
 
     @staticmethod
     def _match_instrument(df: pd.DataFrame, instrument: Instrument) -> pd.DataFrame:
-        """Rows of `df` for `instrument`: by OCC symbol, else by (root, expiry=last trading day,
-        strike, right) so instruments built with Instrument.option(...) from the annotated
-        chain match vendor OCC symbols (which carry the settlement date for SPX AM)."""
+        """Rows of `df` for `instrument`: by internal OCC symbol (chains are converted to the
+        internal convention), else by (root, expiry=last trading day, strike, right)."""
         hit = df[df["symbol"] == instrument.symbol]
         if len(hit) or instrument.expiry is None:
             return hit
@@ -1202,9 +1772,11 @@ class Portal:
         syms = list(symbols) if symbols is not None else self.store.symbols("fundamentals", "sec")
         parts = []
         for s in syms:
-            f = self._read("fundamentals", "sec", s)
+            f = self._read("fundamentals", "sec", self._fund_symbol(s) or "")
             if not len(f):
                 continue
+            if self._split_key(s)[1] is not None:
+                f = f.assign(symbol=s)
             ka = pd.to_datetime(f["known_at"], utc=True)
             f = f[f["field"].isin(list(fields)) & (ka <= as_of)]
             # a fact cannot describe a period ending after it was filed (mis-tagged XBRL contexts,
@@ -1225,6 +1797,21 @@ class Portal:
         out.attrs.update({"source": "sec", "fidelity": int(Fidelity.T1_BAR)})
         return out
 
+    def _fund_symbol(self, symbol: str) -> Optional[str]:
+        """Store symbol of the XBRL facts for `symbol`: a security key 'T~CIK..' maps to the
+        ticker whose SEC registrant is that CIK (facts are stored per registrant ticker: BB&T's
+        are under TFC, while 'BBT' now holds another registrant's)."""
+        t, kc = self._split_key(symbol)
+        if kc is None:
+            return t
+        key = ("fund_by_cik",)
+        if key not in self._cache:
+            sm = self._read("reference", "sec", "security_master")
+            self._cache[key] = {} if not len(sm) else {int(c): str(x) for x, c in zip(sm["symbol"], sm["cik"])
+                                                       if pd.notna(c)}
+        hit = self._cache[key].get(int(kc))
+        return hit
+
     def fundamentals_history(self, symbols: Optional[Iterable[str]], fields: Sequence[str], as_of,
                              start=None) -> pd.DataFrame:
         """EVERY filed value (all periods, all filings incl. restatements and prior-year
@@ -1240,7 +1827,9 @@ class Portal:
             st = st.tz_convert(ET).tz_localize(None)
         parts = []
         for s in syms:
-            f = self._read("fundamentals", "sec", s)
+            f = self._read("fundamentals", "sec", self._fund_symbol(s) or "")
+            if len(f) and self._split_key(s)[1] is not None:
+                f = f.assign(symbol=s)
             if not len(f):
                 continue
             m = f["field"].isin(list(fields)) & (pd.to_datetime(f["known_at"], utc=True) <= as_of)

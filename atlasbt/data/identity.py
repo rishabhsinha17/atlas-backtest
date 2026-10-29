@@ -49,7 +49,7 @@ from . import config, frames, qa
 
 log = logging.getLogger("atlasbt.data.identity")
 ZL = config.DATA_RAW / "hf_ziplime_earnings_calendar" / "data"
-BUILD_VERSION = "2026-10-29.4"     # bump when the series construction rules change
+BUILD_VERSION = "2026-10-29.10"     # bump when the series construction rules change
 MAX_EVIDENCE_GAP_DAYS = 548
 EDGE_DAYS = 120
 COMMON_SPLITS = np.array([2, 3, 4, 5, 6, 7, 8, 10, 15, 20, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 8, 1 / 10, 1 / 15,
@@ -202,7 +202,7 @@ class IdentityIndex:
         pick = np.where(near_prev & (~near_next | (dprev <= dnext)), ck[pi], np.where(near_next, ck[ni], 0))
         return np.where(out == 0, pick, out)
 
-    def pre_evidence_cik(self, ticker: str, date) -> Optional[int]:
+    def pre_evidence_cik(self, ticker: str, date, renamed_before=None) -> Optional[int]:
         """Candidate issuer of `ticker` on a date BEFORE its first as-of evidence (ZipLime's as-of
         ticker resolution starts in 2006): the CIK of the ticker's earliest as-of evidence, unless
         that CIK was evidenced under another ticker before (renamed INTO the ticker -> at `date` it
@@ -224,6 +224,10 @@ class IdentityIndex:
         ec = self.by_cik.get(c)
         if ec is not None and len(ec):
             before = ec[(ec["conf"] == 0) & (ec["date"] < first) & (ec["ticker"] != t)]
+            # evidence under another ticker blocks, unless it all predates `renamed_before` (the
+            # start of the S&P membership interval under this ticker: BLL -> BALL 2022-05)
+            if renamed_before is not None:
+                before = before[before["date"] > pd.Timestamp(renamed_before) + pd.Timedelta(days=30)]
             if len(before):
                 return None
         return c
@@ -407,12 +411,15 @@ def _succession_ok(portal, pred: int, succ: int, ticker: str, yb: pd.DataFrame, 
     return True, f"names match, continuous price across {last_p.date()}..{first_s.date()}"
 
 
-def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = None
-                 ) -> tuple[pd.DataFrame, pd.DataFrame, list]:
-    """-> (raw daily bars with columns 'src' / 'src_ticker', actions frame, log list)."""
+def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = None,
+                 lineage_hint: Optional[str] = None) -> tuple[pd.DataFrame, pd.DataFrame, list]:
+    """-> (raw daily bars with columns 'src' / 'src_ticker', actions frame, log list).
+    lineage_hint: a ticker of the CIK whose lineage `ticker` joins (membership continuity)."""
     st = portal.store
     lg: list = []
     main, extra = idx.lineage(cik, ticker or (idx.zl_tickers_of(cik) or [""])[-1])
+    if lineage_hint:
+        main = list(dict.fromkeys(idx.lineage(cik, lineage_hint)[0] + [norm(ticker or "")]))
     lg.append(f"lineage {main} (+ agreement-only {extra})")
     segs = []          # [rank, name, bars, ticker]
     pending = []       # candidates needing agreement / continuity
@@ -431,7 +438,16 @@ def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = N
         gl = _glitches(b["close"], portal)
         ng = int(gl.sum())
         if ng:
-            roll = gl.astype(int).rolling(20, min_periods=1).sum()
+            # a cluster counts only TRUE glitches: the price returns to the same print the next
+            # session (|r_t + r_t+1| < 0.5 %; bad prints, tick-quantized thin 1970s-90s data) and
+            # the 20-session window shows no sustained move (|net| < 15 %). Genuine volatile
+            # regimes (CVNA 2021-12 .. 2022 crash: alternating -10 % / +9 % days while falling
+            # 98 %) are never cut.
+            lr = np.log(b["close"]).diff()
+            exact = gl & ((lr + lr.shift(-1)).abs() < 0.005)
+            net = np.log(b["close"]).diff(20).abs()
+            roll = exact.astype(int).rolling(20, min_periods=1).sum()
+            roll = roll.where(net.fillna(0) < 0.15, 0)
             if int(roll.max()) >= 3:
                 # clustered flags: two securities interleaved, or (usual for Yahoo) thin, tick-
                 # quantized 1970s-90s history. Never serve the clustered stretch: cut the series
@@ -556,6 +572,17 @@ def _segment_actions(portal, m: pd.DataFrame, keep) -> pd.DataFrame:
         a = a[ex.isin(days)]
         if len(a):
             parts.append(a.assign(src=src, src_ticker=t))
+    # DoltHub segments carry no spin-offs: add known ones (value-based) on their days
+    from .actions_classify import known_spinoff_rows
+    have = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["type", "ex_date"])
+    for rank, name, b, t in keep:
+        src = name.split(":")[0].rstrip("?~")
+        if src != "dolthub":
+            continue
+        sel = m[(m["src_ticker"] == t) & (m["src"] == src)]
+        extra = known_spinoff_rows(t, have, sel, portal._child_close)
+        if len(extra):
+            parts.append(extra.assign(src="known_spinoff", src_ticker=t))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
 
@@ -589,7 +616,15 @@ def _validate(m: pd.DataFrame, acts: pd.DataFrame, lg: list) -> tuple[pd.DataFra
             if j == 0:
                 continue
             g = open_.iloc[j] / close.iloc[j - 1]
-            if np.isfinite(g) and abs(np.log(g * r["ratio"])) > 0.35 and abs(np.log(g)) < 0.15:
+            # same-day distributions (spin-offs encoded with a reverse split: EXPE 2011-12-21 1:2 +
+            # TRIP, ITT 2011, DD 2019) move the price too: compare against both hypotheses
+            q = 1.0
+            same = acts[(pd.to_datetime(acts["ex_date"]).dt.normalize() == ex) &
+                        acts["type"].isin(["SPINOFF", "SPECIAL_DIVIDEND", "CASH_DIVIDEND"])]
+            for amt in same["amount"].fillna(0):
+                if amt > 0:
+                    q *= max(1e-6, 1 - amt / close.iloc[j - 1])
+            if np.isfinite(g) and abs(np.log(g * r["ratio"] / q)) > 0.35 and abs(np.log(g / q)) < 0.15:
                 drop.append(i)
                 expect.loc[ex] = 1.0
                 lg.append(f"drop split {ex.date()} ratio {r['ratio']}: no price jump (gap {g:.3f})")
@@ -623,9 +658,18 @@ def _validate(m: pd.DataFrame, acts: pd.DataFrame, lg: list) -> tuple[pd.DataFra
             lg.append(f"infer split {d[j].date()} ratio {ratio:g} from DoltHub price jump {g:.3f}")
     # splice points: unexplained jump -> drop the lower-priority chunk
     chunk_id = np.cumsum(sw)
+    sch_idx = frames.schedule().index
     for j in np.where(big & sw)[0]:
         prev_rank, cur_rank = rank[j - 1], rank[j]
+        # a junction across a long data gap is not a splice: allow the move to scale with the gap
+        gap = int(((sch_idx > d[j - 1]) & (sch_idx < d[j])).sum())
+        if gap > 10 and abs(ret.iloc[j]) < np.log(1.2) * np.sqrt(gap + 1):
+            continue
         cid = chunk_id[j] if cur_rank >= prev_rank else chunk_id[j - 1]
+        other = chunk_id[j - 1] if cid == chunk_id[j] else chunk_id[j]
+        n_c, n_o = int((chunk_id == cid).sum()), int((chunk_id == other).sum())
+        if n_c >= 250 and n_c >= 20 * n_o:
+            cid = other          # never let a stub (e.g. a 1-bar post-delisting quote) evict years of data
         dropmask |= chunk_id == cid
         lg.append(f"splice reject at {d[j].date()}: {src[j - 1]} -> {src[j]} move {ret.iloc[j]:+.3f} unexplained")
     # single-session fills from a lower-priority source must be within 10 % of both neighbours
@@ -691,7 +735,10 @@ def cik_name_at(cik: int, date) -> Optional[str]:
     if cik not in _DATED_NAMES:
         rows = []
         try:
-            body = client().get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json", allow_404=True, ttl=None)
+            # cache-only: Portal use never fetches (precached by `fetch --set core`, task
+            # sec_submissions); a missing name = unknown = fail closed
+            body = client().get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json", allow_404=True, ttl=None,
+                                cache_only=True)
             if body:
                 d = json.loads(body)
                 for f in d.get("formerNames", []) or []:
@@ -723,7 +770,7 @@ def cik_names(cik: int) -> list[str]:
     names: list[str] = []
     try:
         body = client().get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", allow_404=True,
-                            ttl=None)
+                            ttl=None, cache_only=True)
         if body:
             d = json.loads(body)
             names = [d.get("name") or ""] + [f.get("name", "") for f in d.get("formerNames", [])]

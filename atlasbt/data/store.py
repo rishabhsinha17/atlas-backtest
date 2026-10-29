@@ -146,7 +146,15 @@ class ParquetStore:
         if len(files) > 1 and (start is not None or end is not None):
             y0 = pd.Timestamp(start).year - 1 if start is not None else -10**9
             y1 = pd.Timestamp(end).year + 1 if end is not None else 10**9
-            files = [f for f in files if not f.stem.isdigit() or y0 <= int(f.stem) <= y1]
+            kept = [f for f in files if not f.stem.isdigit() or y0 <= int(f.stem) <= y1]
+            if not kept:
+                # no partition overlaps [start, end): empty frame, but keep the symbol's meta
+                meta = self._read_meta(files[0])
+                out = pd.DataFrame()
+                out.attrs.update({"source": meta.get("source"), "fidelity": meta.get("fidelity"),
+                                  "adjusted": meta.get("adjusted", False), "kind": kind})
+                return out
+            files = kept
         meta = self._read_meta(files[0])
         idx = meta.get("index")
         frames = [pq.read_table(f, columns=(list(columns) + ([idx] if idx else [])) if columns else None).to_pandas()
