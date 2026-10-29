@@ -329,3 +329,30 @@ def test_combo_sell_package_credit():
     st, fills, net, _ = ComboFillModel().evaluate(o, legs, 5)
     assert st == "FILL" and net == pytest.approx(2.0 - 0.9)
     assert fills[0][1] == -1 and fills[1][1] == 1 and fills[0][4] == Fidelity.T3_MODELED
+
+
+def test_bar_fill_tier_mapping_is_deterministic():
+    from atlasbt.core.types import Fidelity
+    from atlasbt.execution import bar_fill_tier, retier_fill
+    t1 = ["market; spread modelled (calibrated); daily bar: next-open fill",
+          "stop; spread modelled (calibrated); spread: era-extrapolated; spread: ADV below calibration range",
+          "market; spread modelled (calibrated); spread: sigma prior; intrabar path resolved with 1m bars",
+          "limit; participation cap 10% of bar volume"]
+    t2 = ["market; spread default (no estimate)",
+          "market; spread estimated (Corwin-Schultz); daily bar: next-open fill",
+          "stop; spread modelled (calibrated); intrabar order assumed adverse-first (bar data)",
+          "market; spread modelled (calibrated); spread: Corwin-Schultz fallback",
+          "market; spread modelled (calibrated); spread: asset class inferred",
+          "market; spread modelled (calibrated); spread: listing assumed",
+          "market; spread modelled (calibrated); spread: stress regime",
+          "market; daily proxy for 15:45 decision"]
+    assert all(bar_fill_tier(r) == Fidelity.T1_BAR for r in t1)
+    assert all(bar_fill_tier(r) == Fidelity.T2_PROXY for r in t2)
+    assert bar_fill_tier(t2[1].split("; ")) == Fidelity.T2_PROXY        # list form == string form
+    # re-tiering recorded fills: quotes / auction / options keep their tier
+    assert retier_fill(2, "TAKER", t1[0], "STK") == Fidelity.T1_BAR
+    assert retier_fill(2, "TAKER", t1[0], "ETF") == Fidelity.T1_BAR
+    assert retier_fill(0, "TAKER", "NBBO quote fill; fill source: quotes", "STK") == Fidelity.T0_QUOTE
+    assert retier_fill(1, "AUCTION", "closing auction", "STK") == Fidelity.T1_BAR
+    assert retier_fill(3, "TAKER", "option quote snapshot", "OPT") == Fidelity.T3_MODELED
+    assert retier_fill(2, "ASSIGNMENT", "ASSIGNMENT: x", "STK") == Fidelity.T2_PROXY

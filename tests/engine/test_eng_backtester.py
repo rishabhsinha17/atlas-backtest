@@ -1166,7 +1166,7 @@ def test_spy_round_trip_2019_calibrated_spread_is_bp_not_tens_of_bp():
     assert len(f) >= 4 and r.meta["config"]["spread_model"] == "calibrated"
     rt_bp = 2 * ((f.spread_cost + f.impact_cost) / f.notional.abs()).mean() * 1e4
     assert 0.05 < rt_bp < 2.0
-    assert f.fidelity_reason.str.contains("spread modelled (calibrated)", regex=False).all() and (f.fidelity >= 2).all()
+    assert f.fidelity_reason.str.contains("spread modelled (calibrated)", regex=False).all() and (f.fidelity == 1).all()
     legacy = BacktestConfig(fees="NO_FEES", spread_model="corwin_schultz")
     r2 = Backtester(S(script), portal, legacy).run("2019-06-03", "2019-06-28", raise_errors=True)
     f2 = r2.fills

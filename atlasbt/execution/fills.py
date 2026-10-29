@@ -123,6 +123,60 @@ class FillDecision:
     partial: bool = False
 
 
+# --------------------------------------------------------------------------
+# Bar-mode fill tiers (deterministic: reason set -> tier)
+# --------------------------------------------------------------------------
+#: A bar-mode fill (liquidity TAKER/MAKER, filled from bars, not an option / quote /
+#: auction fill) is T1_BAR ("real bars at strategy resolution; next-bar fill + modelled
+#: spread") unless one of its reasons marks a TRUE proxy. Matching is on the individual
+#: reasons (fill ``fidelity_reason`` split on "; "): exact strings, then prefixes, then
+#: substrings. Everything else (calibrated spread incl. era / pessimistic-floor / ADV /
+#: sigma-prior qualifiers, "daily bar: next-open fill", finer-bar path resolution,
+#: participation cap, marketable-limit sizing) keeps T1 and its reasons.
+T2_REASONS_EXACT = frozenset({
+    "spread default (no estimate)",                       # no spread estimate at all
+    "intrabar order assumed adverse-first (bar data)",    # ordering assumed, no finer bars
+    "spread: Corwin-Schultz fallback",                    # calibrated model fell back to CS/AR
+    "spread: asset class inferred",                       # spread uncertainty high
+    "spread: listing assumed",
+    "spread: stress regime",
+})
+T2_REASON_PREFIXES = (
+    "spread estimated (",          # legacy Corwin-Schultz / Abdi-Ranaldo / Roll spread model
+    "spread: listing assumed",     # e.g. "spread: listing assumed NYSE"
+    "spread: stress regime",
+)
+T2_REASON_SUBSTRINGS = (
+    "daily proxy",                 # daily bar standing in for an intraday decision time
+)
+
+
+def bar_fill_tier(reasons) -> Fidelity:
+    """Tier of a bar-mode fill from its reasons (iterable of str, or the "; "-joined
+    ``fidelity_reason``). Deterministic; used by the engine at fill time and usable by
+    the runner to re-tier finished runs without re-running."""
+    if isinstance(reasons, str):
+        reasons = [r.strip() for r in reasons.split(";")]
+    for r in reasons:
+        r = str(r).strip()
+        if r in T2_REASONS_EXACT or r.startswith(T2_REASON_PREFIXES) or any(s in r for s in T2_REASON_SUBSTRINGS):
+            return Fidelity.T2_PROXY
+    return Fidelity.T1_BAR
+
+
+def retier_fill(fidelity, liquidity: str, reasons: str, asset_class: str = "STK") -> Fidelity:
+    """Re-tier one recorded fill (fills-frame columns ``fidelity``, ``liquidity``,
+    ``fidelity_reason``, ``asset_class``): bar-mode stock/ETF TAKER/MAKER fills get
+    :func:`bar_fill_tier`; quote (T0), auction, option/combo (data tier passes through) and
+    lifecycle fills keep their recorded tier."""
+    ac = str(getattr(asset_class, "value", asset_class))
+    text = str(reasons or "")
+    if ac == "OPT" or liquidity not in ("TAKER", "MAKER") or "fill source: quotes" in text \
+            or "NBBO quote fill" in text:
+        return Fidelity(int(fidelity))
+    return bar_fill_tier(text)
+
+
 @dataclass
 class SymbolMarket:
     """Per-symbol, per-step pricing context supplied by the engine."""
@@ -409,10 +463,8 @@ class BarFillModel:
                 reasons = list(tr.reasons) + preasons
                 if limit_bound:
                     reasons.append("marketable limit: only size whose modelled cost is within the limit taken")
-                fid = Fidelity.T1_BAR
                 if mkt.spread_source == "default" and tr.liquidity == "TAKER":
                     reasons.append("spread default (no estimate)")
-                    fid = Fidelity.T2_PROXY
                 elif tr.liquidity == "TAKER" and str(mkt.spread_source).startswith(
                         ("calibrated", "Corwin-Schultz fallback")):
                     reasons.append("spread modelled (calibrated)")
@@ -422,7 +474,6 @@ class BarFillModel:
                     # model qualifiers: era-extrapolated, listing assumed, stress regime,
                     # asset class inferred, ADV below calibration range, sigma prior, ...
                     reasons.extend(f"spread: {q}" for q in quals if q)
-                    fid = max(fid, Fidelity.T2_PROXY)
                 elif tr.liquidity == "TAKER":
                     reasons.append(f"spread estimated ({mkt.spread_source})")
                 if bar.mso is None and tr.liquidity == "TAKER":
@@ -431,7 +482,6 @@ class BarFillModel:
                     reasons.append(f"intrabar path resolved with {resolved_with} bars")
                 elif (len(cands) > 1 and nfills == 0 and cands[1][0] < 3.0) or restarted or nfills > 0:
                     reasons.append("intrabar order assumed adverse-first (bar data)")
-                    fid = max(fid, Fidelity.T2_PROXY)
                     stats.ambiguous_bars += 1
                 if "SSR" in " ".join(tr.reasons):
                     stats.ssr_blocked += 1
@@ -445,6 +495,7 @@ class BarFillModel:
                     stats.partial_fills += 1
                     if not limit_bound:
                         reasons.append(f"participation cap {cfg.participation_cap:.0%} of bar volume")
+                fid = bar_fill_tier(reasons)
                 dec = FillDecision(o, pos, ts_ns, math.copysign(q, o.quantity), price, tr.base, tr.liquidity,
                                    sc, ic, fid, tuple(reasons), partial)
                 on_fill(dec)
