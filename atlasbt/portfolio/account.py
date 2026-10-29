@@ -30,6 +30,7 @@ class Position:
     avg_price: float = 0.0          # average entry price per unit (share / option premium)
     mark: float = float("nan")
     mark_ts: Optional[pd.Timestamp] = None
+    mark_fidelity: Optional[object] = None   # Fidelity of the observation behind ``mark``
     realized: float = 0.0           # realized PnL (gross of explicit fees) since open
     opened_at: Optional[pd.Timestamp] = None
 
@@ -116,7 +117,11 @@ class Account:
         self._cash(fill.ts, Reason.EXCHANGE_FEES, -c.exchange_fees, sym, "", fill.order_id)
         self._cash(fill.ts, Reason.REGULATORY_FEES, -c.regulatory_fees, sym, "", fill.order_id)
         self.fees_total += c.explicit
-        return self.change_position(inst, q, px, fill.ts)
+        realized = self.change_position(inst, q, px, fill.ts)
+        p = self.positions.get(sym)
+        if p is not None and p.mark_ts == fill.ts:
+            p.mark_fidelity = fill.fidelity
+        return realized
 
     def change_position(self, inst: Instrument, q: float, px: float, ts) -> float:
         """Update position quantity at price px without touching cash."""
@@ -149,9 +154,11 @@ class Account:
             pos.qty = new
             pos.realized += realized
             self.realized_total += realized
-        if pos.mark != pos.mark:
+        if pos.mark != pos.mark or inst.is_option:
+            # options: a trade in the contract is the freshest observation of its price
             pos.mark = px
             pos.mark_ts = ts
+            pos.mark_fidelity = None
         if pos.qty == 0.0:
             del self.positions[sym]
         return realized

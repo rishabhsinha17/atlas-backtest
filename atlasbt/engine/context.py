@@ -35,7 +35,8 @@ class EngineContext:
     def __init__(self, bt: "Backtester"):
         self.__bt = bt
         self.strategy_id = bt.strategy.id
-        self.__pit = PITPortal(bt.portal, lambda: self.now, on_access=bt._note_data_access)
+        self.__pit = PITPortal(bt.portal, lambda: self.now, on_access=bt._note_data_access,
+                               universe_filter=bt._filter_universe)
         self.state: dict[str, Any] = {}        # free scratch space for strategies
 
     # ------------------------------------------------------------------ time
@@ -110,8 +111,9 @@ class EngineContext:
         if not adjusted and freq == self.__bt.base_freq and tuple(sessions) == tuple(self.__bt.data_sessions):
             b = self.__bt.md.bars(symbol, freq)
             i1 = b.last_index_at(int(now.value)) + 1
-            i0 = max(i1 - n, 0)
-            return b.frame(i0, i1)
+            # cache holds enough history (or all that exists); else fall through to the PIT portal
+            if i1 >= n or not self.__bt.md.may_be_truncated(b):
+                return b.frame(max(i1 - n, 0), i1)
         cal = self.__bt.cal
         if is_daily(freq):
             sess = self.__bt.session
@@ -141,7 +143,10 @@ class EngineContext:
         if not adjusted and freq == bt.base_freq and tuple(sessions) == tuple(bt.data_sessions):
             b = bt.md.bars(symbol, freq)
             i1 = b.last_index_at(int(self.now.value)) + 1
-            i0 = max(i1 - n, 0)
+            i0 = i1 - n
+            if i0 < 0 and not bt.md.may_be_truncated(b):
+                i0 = 0
+        if not adjusted and freq == bt.base_freq and tuple(sessions) == tuple(bt.data_sessions) and i0 >= 0:
             out = {"start": b.start[i0:i1], "end": b.end[i0:i1], "open": b.o[i0:i1], "high": b.h[i0:i1],
                    "low": b.l[i0:i1], "close": b.c[i0:i1], "volume": b.v[i0:i1], "session": b.sess[i0:i1]}
             for v in out.values():
@@ -204,17 +209,50 @@ class EngineContext:
                 target: Optional[float] = None, time_exit: Optional[pd.Timestamp] = None,
                 tif: TimeInForce = TimeInForce.DAY, child_tif: TimeInForce = TimeInForce.GTC,
                 tag: str = "entry", outside_rth: bool = False,
-                planned_entry: Optional[float] = None) -> Order:
+                planned_entry: Optional[float] = None,
+                stop_offset: Optional[float] = None, target_offset: Optional[float] = None,
+                stop_fn=None, target_fn=None, time_exit_moc=None) -> Order:
         """Entry + protective stop + profit target + time exit (OCO children
         created as the entry fills). ``stop`` is also recorded as the initial
-        risk for R-multiples."""
+        risk for R-multiples.
+
+        Fill-relative children: ``stop_offset`` / ``target_offset`` (price
+        distances) or ``stop_fn`` / ``target_fn`` (callables ``f(fill_price,
+        side) -> price``, side +1 long / -1 short) anchor the levels to the
+        ACTUAL entry fill price; they become active right after the entry fill
+        (rest of the entry bar under the adverse-first rule, or later bars), and
+        the computed stop becomes the initial stop for R.
+
+        ``time_exit_moc``: exit in the CLOSING AUCTION of a session (MOC child,
+        reduce-only, OCO with the other children): pass a session date, or
+        ``True`` to use the session of ``time_exit``. Use this on daily bars,
+        where a market time exit could only fill at a later open."""
         inst = symbol_or_inst if isinstance(symbol_or_inst, Instrument) else self.instrument(symbol_or_inst)
         templates = []
-        if stop is not None:
-            templates.append(ChildTemplate(OrderType.STOP, stop_price=stop, tag="stop", tif=child_tif))
-        if target is not None:
-            templates.append(ChildTemplate(OrderType.LIMIT, limit_price=target, tag="target", tif=child_tif))
-        if time_exit is not None:
+        if stop_offset is not None and stop_fn is None:
+            off = float(stop_offset)
+            stop_fn = lambda px, side, _o=off: px - side * _o            # noqa: E731
+        if target_offset is not None and target_fn is None:
+            offt = float(target_offset)
+            target_fn = lambda px, side, _o=offt: px + side * _o         # noqa: E731
+        if stop is not None or stop_fn is not None:
+            templates.append(ChildTemplate(OrderType.STOP, stop_price=stop, tag="stop", tif=child_tif,
+                                           rel_fn=stop_fn))
+        if target is not None or target_fn is not None:
+            templates.append(ChildTemplate(OrderType.LIMIT, limit_price=target, tag="target", tif=child_tif,
+                                           rel_fn=target_fn))
+        if time_exit_moc is not None and time_exit_moc is not False:
+            if time_exit_moc is True:
+                if time_exit is None:
+                    raise ValueError("time_exit_moc=True needs time_exit (or pass the session date)")
+                from ..portfolio.corporate_actions import as_session_date
+                sess = as_session_date(pd.Timestamp(time_exit))
+            else:
+                from ..portfolio.corporate_actions import as_session_date
+                sess = as_session_date(pd.Timestamp(time_exit_moc))
+            templates.append(ChildTemplate(OrderType.MOC, tag="time_exit", tif=TimeInForce.GTC,
+                                           target_session=sess))
+        elif time_exit is not None:
             templates.append(ChildTemplate(OrderType.MARKET, tag="time_exit", tif=TimeInForce.GTC,
                                            activate_at=pd.Timestamp(time_exit)))
         parent = Order(inst, quantity, entry_type, entry_limit, entry_stop, tif, tag=tag)
@@ -236,10 +274,12 @@ class EngineContext:
         return self.__bt.amend_bracket(parent_or_group, stop=stop, target=target, time_exit=time_exit)
 
     def cancel(self, order_id: int) -> None:
-        self.__bt.om.cancel(order_id, self.now, "cancelled by strategy")
+        """Cancel a strategy order (engine-internal flat_by / margin-liquidation
+        orders cannot be cancelled by strategy code)."""
+        self.__bt.strategy_cancel(order_id)
 
     def cancel_all(self, symbol: Optional[str] = None) -> None:
-        self.__bt.om.cancel_all(self.now, symbol, "cancel_all by strategy")
+        self.__bt.strategy_cancel_all(symbol)
 
     def flatten(self, symbol: Optional[str] = None, tag: str = "flatten") -> list[Order]:
         """Cancel open orders and submit market orders closing positions."""

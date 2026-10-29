@@ -35,8 +35,14 @@ For each session:
       during session-end processing (expiry/assignment) are delivered at the end of that session.
    3. Mark to market; engine session rules (`flat_by`), then `strategy.on_bar(ctx)` with `ctx.now = t`.
    4. MAE/MFE and bars-held tracking for open trades; debug invariants.
-3. **Session end** (`ctx.now` = last step): `strategy.on_session_end`; PM/physical option expiry
-   (exercise/assignment/cash settlement); option marks from quote snapshots; financing (cash interest, margin
+3. **Session end** (`ctx.now` = last step): `strategy.on_session_end`; option marks FIRST, then PM/physical
+   option expiry and early-assignment tests (exercise/assignment/cash settlement). Marks are same-session only:
+   per position the latest observation time-stamped in this session wins, either a fill in the contract or a
+   `portal.option_quotes` snapshot (real quote T0-T2; the data portal falls back to a same-day chain-surface mark
+   T2, then a PIT model value T3). `Position.mark_ts` / `mark_fidelity` record the source. With no same-session
+   observation the old mark is kept for NAV only, the run is flagged T2 ("no same-session option mark"), and the
+   lifecycle sees the old `mark_ts` and does not use it: a stale or missing mark never counts as zero extrinsic
+   value, so no early assignment is generated from it. Then financing (cash interest, margin
    interest, borrow fees) for the calendar days to the next session; DAY-order expiry; Reg-T margin check
    (margin call -> liquidation market orders that fill at the next open, logged in
    `diagnostics["margin_calls"]`); NAV and position snapshot.
@@ -51,6 +57,8 @@ open (or later per their type).
 * `ctx.history_arrays(symbol, n, freq)` is the fast path: a dict of READ-ONLY numpy arrays (start, end, open,
   high, low, close, volume, session) for the last `n` completed bars (raw base-frequency bars are views on the
   engine cache; ~40x faster than `history` for a 50-symbol 1-minute scan). Same PIT guarantee.
+* History is never silently truncated: if the engine cache (loaded with `lookback_sessions` of pre-start history)
+  may not hold `n` bars, `history` / `history_arrays` fall back to the PIT portal for the full request.
 * `ctx.history(symbol, n, freq)` returns completed bars only (daily bars of the current session are invisible
   until the close). Raw same-frequency history is served from the engine cache (fast path), everything else
   through the PIT portal.
@@ -82,6 +90,24 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
 * DAY validity = the session containing `eligible_at` if before its close (+4 h with `outside_rth`), else the next
   session. MOO joins the open of the first session whose 09:28 cutoff is after `eligible_at`; MOC the first close
   whose 15:50 cutoff is after it. Unfilled auction remainder is cancelled.
+* Fill-relative brackets: `ctx.bracket(..., stop_offset=, target_offset=)` or `stop_fn=/target_fn=` (callables
+  `f(fill_price, side)`) anchor the children to the ACTUAL entry fill price (e.g. "stop 2×ATR from fill", "2R
+  target"); they are active from the entry's path position onward (same rules as other bracket children) and the
+  anchored stop is the trade's initial stop for R.
+* Engine-internal orders (flat_by flatten, margin-call liquidation) cannot be cancelled by `ctx.cancel`,
+  `ctx.cancel_all` or `ctx.flatten`; attempts are ignored and logged in `diagnostics["warnings"]`.
+* Short-sale marking at submission uses the projected position at the order's execution time: current position +
+  pending same-symbol sells + pending buys sure to execute first (MARKET, MOO, earlier/same-auction MOC). A
+  same-close MOC exit of a position bought MOO is therefore not a short sale (no locate / margin check).
+* Fill-relative brackets (`stop_offset`/`target_offset`/`stop_fn`/`target_fn`) anchor children to the actual
+  entry fill; when a level evaluates to None/NaN that child is NOT created (`CHILD_SKIPPED` in
+  `diagnostics["order_events"]`), the other children keep their OCO link.
+* `ctx.bracket(..., time_exit_moc=SESSION_DATE | True)`: the time exit is an MOC child (tag `time_exit`, reduce-only,
+  sized to the position actually open, OCO with stop/target) that joins that session's closing auction (`True` =
+  the session of `time_exit`; never earlier than the first close the child can still reach before the MOC cutoff).
+  Use it on daily bars, where a market time exit could only fill at a later open. Within one window the engine
+  processes the opening auction, then continuous trading (stops/targets intrabar), then the closing auction, so a
+  stop hit during the session cancels the MOC leg and an MOC created by a same-bar entry fill still joins the close.
 * Bracket handles: `ctx.bracket(...)` returns the entry order; `ctx.bracket_group(order)` gives the public OCO group
   (children carry it as `oco_group`); `ctx.amend_bracket(order|group, stop=, target=, time_exit=)` re-prices
   working children (cancel/replace: effective from the next bar) or adds a missing leg sized to the open exit
@@ -134,7 +160,8 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
 | Halts | zero-volume RTH/DAY bars and `HALT` events (`effective_at`..`resume_at`) => no fills | |
 | Quotes (T0) | buy at ask, sell at bid, first quote strictly after `eligible_at`; quotes classified PRE/RTH/POST from the calendar and only used for RTH unless `outside_rth`, never before the order's validity session; displayed size is consumed across orders in priority order; resting limits never fill on quotes alone; locked/crossed quotes skipped | |
 | MOO / MOC | official open/close print ± impact, no spread; cap 10% of estimated auction volume (2% / 8% of daily volume in daily-bar mode, open/close bar volume intraday) | NYSE cutoffs 09:28 / 15:50 ET |
-| Options & combos | every snapshot in `(eligible_at, now]` is evaluated in time order via `portal.option_quotes` (the FIRST snapshot after submission first; GTC limits re-checked on each); all option legs from the same snapshot timestamp or REJECT; natural prices (buy ask / sell bid) with optional `price_improvement`; stock legs priced from the open of the first bar STARTING at/after submission ± estimated half-spread + impact (T2), and the combo WAITs if that bar has not started by the snapshot time | ARCHITECTURE §7 |
+| Fill source per window | `use_quotes='auto'`: a stock order in a step window fills from quotes only if the symbol has ≥ `quote_min_per_hour` (60) quotes per RTH hour overlapping that window, else from bars (never left unfillable because quotes exist elsewhere); symbols with no bars always use quotes. Every fill records its source in `fidelity_reason` ("fill source: quotes" / "fill source: bars (...)") | |
+| Options & combos | every snapshot in `(eligible_at, now]` is evaluated in time order via `portal.option_quotes` (the FIRST snapshot after submission first; GTC limits re-checked on each); all option legs from the same snapshot timestamp or REJECT; natural prices (buy ask / sell bid) with optional `price_improvement`; stock legs priced from the open of the first bar STARTING at/after submission ± estimated half-spread + impact (T2), and the combo WAITs if that bar has not started by the snapshot time; when the stock has synchronized quotes (`quote_min_per_hour` coverage) the stock leg instead uses the NBBO at the snapshot time (≤ `combo.stock_quote_max_age` = 5 s old, T0). Modelled (T3) option snapshots are accepted and pass their tier through. `combo.reject_locked` (default True) never fills from a locked/crossed option-leg snapshot: the order WAITs for the next valid snapshot (not rejected; it stays working until filled, cancelled or expired). Option instruments (single orders and every COMBO leg) are replaced at submission by the instrument-master record (`portal.instrument`): deliverable, tick size, exercise/settlement style come from the master (a strategy-built default deliverable of 100 is overridden with a warning); a contradiction on multiplier / strike / right / expiry / underlying, or an explicitly set wrong deliverable, REJECTs the order with the reason | ARCHITECTURE §7 |
 | Spread estimator | Corwin-Schultz (2012) 21-day mean of two-day estimates, negatives set to 0, overnight adjustment; fallback Abdi-Ranaldo (2017) monthly, then Roll (1984); all PIT (session i uses <= i-1), split-consistent | papers; known-answer tests |
 | Spread floors | full spread >= 1 tick (Rule 612: $0.01 >= $1, $0.0001 below) and price buckets <$1: 100bp, <$5: 30bp, <$10: 10bp, <$20: 4bp, else 1bp; default 20bp if no estimate (T2) | engineering defaults (conservative), configurable |
 | Time-of-day | x2.5 first 5 min, x1.75 to 15 min, x1.3 to 30 min, x1.3 last 5 min, x1.1 last 15 min, x3 extended hours; daily-bar open fills use the daily average (x1.0, `daily_open_spread_mult`) | U-shaped intraday spreads: McInish & Wood (1992), Chung, Van Ness & Van Ness (1999) |
@@ -233,7 +260,9 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
   * `portfolio.hooks.OptionLifecycle` with `at_session_start(session, prev_session, option_positions, prices)` and
     `at_session_end(session, option_positions, prices)` returning `OptionEvent`s (EXPIRE_WORTHLESS, EXERCISE,
     ASSIGNMENT, CASH_SETTLE, SETTLE_AT_MARK with option close price and optional stock delivery). The engine books
-    them. `prices` also offers `last_close(symbol)`. Default `DefaultOptionLifecycle`: PHYSICAL/CASH_PM expire at the
+    them and delivers every resulting fill (option leg and stock delivery; `order_id = -1`, `liquidity` =
+    EXERCISE / ASSIGNMENT / SETTLEMENT) to `Strategy.on_fill` in the same step, after the account is updated, so
+    wheel / covered strategies can react without polling positions. `prices` also offers `last_close(symbol)`. Default `DefaultOptionLifecycle`: PHYSICAL/CASH_PM expire at the
     expiry session close (official close); CASH_AM settle at the next session's open (SOQ proxy, T2); automatic
     exercise if ITM by ≥ $0.01; non-standard deliverables honoured (intrinsic = deliverable·S/multiplier − strike;
     delivery price = strike·multiplier/deliverable); a missing settlement price falls back to the last known
@@ -266,10 +295,25 @@ bracket parent may fill), the bar is replayed on the finer bars and the fill is 
   survivorship_bias, n_trials = grid size, plus engine details).
 * `RunStatus.NOT_TESTABLE` when a critical `Requirement` is unavailable (`portal.has` False or fidelity NA/worse
   than `min_fidelity`). Symbols come from `Requirement.symbols`, the strategy `universe`, or `universe_name`
-  resolved via `portal.universe(name, as_of=first open)`; `symbols=("*",)` asks portal-wide
+  resolved via `portal.universe(name, as_of=first open)` and filtered by the coverage rule below; `symbols=("*",)` asks portal-wide
   (`portal.has("*", "events", KIND)`, `portal.has("*", "fundamentals", FIELD)`); bars requirements with
-  `sessions` including PRE/POST are probed over the first 10 sessions and fail if that session has no bars; `FAILED` on strategy exceptions (traceback in diagnostics; `raise_errors=True` re-raises).
-  `LookaheadError` always propagates.
+  `sessions` including PRE/POST are probed over the first 10 sessions and fail if that session has no bars
+  (quotes requirements: no quote time-stamped in that session; options: no chain snapshot in that window); `FAILED` on strategy exceptions (traceback in diagnostics; `raise_errors=True` re-raises).
+  `LookaheadError` always propagates. A `NotTestableError` raised by strategy code (init / callbacks) ends the
+  run as `NOT_TESTABLE` with the exception message as the reason (also with `raise_errors=True`; it is a status,
+  not an error).
+* Universe coverage (`BacktestConfig.min_universe_coverage`, default 0.95): `portal.universe(name)` as seen by
+  the strategy (and the `universe_name` used for requirement checks) contains only members with VERIFIED data
+  (`has` + fidelity for base-frequency bars and every critical requirement without explicit `symbols`; memoised
+  per symbol). Members are not each required: if coverage (kept / members) at the run start or at any session
+  where the universe is queried is below the minimum, the run is `NOT_TESTABLE` with the coverage figure and
+  example members (1.0 = the old every-member rule). Coverage < 100% flags T2 "universe NAME coverage X%
+  (members without verified data excluded)"; `meta["universe_coverage"]` holds the series (date, members,
+  kept, coverage), every dropped member (first/last date, count, reason) and the minimum, and
+  `meta["survivorship_bias"]` notes the exclusion. Static `universe` lists remain strict.
+* `Strategy.on_run_end(ctx)` is called once after the last step (before results are built).
+* `fidelity_of(..., "actions")` for a requirement is the WORST tier over all actions (including `"*"`) in the
+  in-memory portal; the real data `Portal` currently returns T2_PROXY for actions irrespective of content.
 
 ## 5. Sizing profiles (`atlasbt/risk/sizing.py`)
 Verbatim sheet text in `PROFILE_TEXT`. Functions return signed whole shares / integer contracts:
@@ -297,17 +341,23 @@ IBKR_PRO_TIERED), `latency_bars` (0), `latency_quotes` (1 s), `bar_fill` (`parti
 `daily_open_spread_mult` (1.0), `use_quotes` ('auto'), `resolve_intrabar_freq` ('1m'), `short_sale_rules`,
 `borrow` (`BorrowConfig`: default 0.30%, `require_borrow_data`), `enforce_locates`, `halt_events`,
 `financing` (`FinancingConfig`: spreads 0.50%/1.50%, rebate 0, day count 360), `corporate_actions`
-(withholding, fractional shares), `option_margin` (None/'cboe'/'conservative'/instance), `option_lifecycle` (None/'occ'/'conservative'/instance), `check_margin_on_submit`, `margin_calls`,
+(withholding, fractional shares), `quote_min_per_hour` (60), `option_margin` (None/'cboe'/'conservative'/instance), `option_lifecycle` (None/'occ'/'conservative'/instance), `check_margin_on_submit`, `margin_calls`,
 `rf_tenor` ('3M'), `stats_window` (20), `lookback_sessions` (60), `debug` (invariants every step),
-`record_intraday_equity`, `max_option_mark_staleness` (5 days), `stale_price_sessions` (5).
+`record_intraday_equity`, `max_option_mark_staleness` (5 days), `stale_price_sessions` (5),
+`min_universe_coverage` (0.95).
+
+Per-strategy overrides: the class attribute `Strategy.config_overrides = {...}` may set ONLY `option_lifecycle` and `option_margin`
+(whitelist; any other key raises `ValueError`); applied overrides are recorded in `meta["config_overrides"]`.
 
 ## 7. Testing support
 `atlasbt/engine/testing.py`: `InMemoryPortal` (DataPortal over DataFrames incl. PIT adjustment, quotes, option
-quote snapshots incl. `option_quotes(instrument, start, end, as_of)`, actions, events, borrow, rf) and `synthetic_*`
+quote snapshots incl. `option_quotes(instrument, start, end, as_of)`, actions, events, borrow, rf; `fidelity={(symbol, kind[, freq]): Fidelity}` configures `fidelity_of` per symbol/kind/freq, `"*"` = any symbol; without an override, events/actions report the worst tier of the matching records and the event KIND is never parsed as a bar frequency) and `synthetic_*`
 builders — synthetic data for mechanics tests only.
 
 PIT hardening: the Context and the PIT portal are slotted proxies with name-mangled fields (no `ctx._bt`,
-no `ctx.portal()._p`), and `tests/engine/test_eng_strategy_lint.py` statically rejects strategy code that accesses
+no `ctx.portal()._p`; the PIT portal exposes a WHITELIST of data methods (bars, quotes, option chain /
+option_quotes, actions, events, fundamentals / fundamentals_history, borrow, risk_free_rate(_info), universe,
+universe_survivorship_bias, has, fidelity_of, ...) and raises `AttributeError` for anything else), and `tests/engine/test_eng_strategy_lint.py` statically rejects strategy code that accesses
 private attributes of non-`self` objects, uses `getattr(x, "_...")`, imports `inspect`/`gc`/`ctypes`, touches
 `sys.modules`, or imports engine internals (`backtester`, `context`, `market`, `pit`).
 

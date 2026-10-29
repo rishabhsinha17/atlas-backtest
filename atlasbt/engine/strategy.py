@@ -104,6 +104,12 @@ class Strategy:
     def on_session_end(self, ctx) -> None:
         pass
 
+    def on_run_end(self, ctx) -> None:
+        """Called once after the last session (ctx.now = last close). Raising
+        ``NotTestableError`` here ends the run as NOT_TESTABLE (e.g. no
+        qualifying events were available in the window)."""
+        pass
+
     def on_order_event(self, ctx, event: dict) -> None:
         """Engine-initiated order changes (corporate-action adjustments or
         cancellations, session-rule cancellations, reduce-only shrinking,

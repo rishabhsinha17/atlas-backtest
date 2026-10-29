@@ -31,7 +31,7 @@ import pandas as pd
 from ..core.clock import ET, et, nyse, to_et
 from ..core.types import (
     AssetClass, BacktestResult, CorporateAction, CostBreakdown, Fidelity, Fill, Instrument, Leg,
-    LookaheadError, Order, OrderStatus, OrderType, RunStatus, TimeInForce,
+    LookaheadError, NotTestableError, Order, OrderStatus, OrderType, RunStatus, TimeInForce,
 )
 from ..execution.constraints import bar_is_halted, round_limit_for_side, round_stop_for_side, valid_tick
 from ..execution.fills import (
@@ -61,6 +61,10 @@ class Backtester:
         self.strategy = strategy
         self.portal = portal
         self.cfg = config or BacktestConfig()
+        self.config_overrides = self._strategy_overrides(strategy)
+        if self.config_overrides:
+            from dataclasses import replace as _replace
+            self.cfg = _replace(self.cfg, **self.config_overrides)
         self.cal = calendar or getattr(portal, "calendar", None) or nyse()
         self.base_freq = canonical_freq(strategy.bar_freq)
         self.daily = is_daily(self.base_freq)
@@ -74,9 +78,25 @@ class Backtester:
         self.data_sessions = tuple(sorted((s for s in data_sess if s in order_), key=order_.get)) or ("RTH",)
         self._reset_state()
 
+    #: strategies may only choose model plug-ins (never costs, fees, fills)
+    OVERRIDABLE = {"option_lifecycle", "option_margin"}
+
+    @classmethod
+    def _strategy_overrides(cls, strategy) -> dict:
+        ov = dict(getattr(type(strategy), "config_overrides", None) or {})
+        bad = set(ov) - cls.OVERRIDABLE
+        if bad:
+            raise ValueError(f"{strategy.id}: config_overrides may only set {sorted(cls.OVERRIDABLE)}, "
+                             f"not {sorted(bad)}")
+        return ov
+
     # ================================================================= state
     def _reset_state(self) -> None:
         cfg = self.cfg
+        self._verified: dict[str, tuple[bool, str]] = {}
+        self._cov_log: dict[tuple[str, str], tuple[int, int, list]] = {}
+        self._cov_flagged: set = set()
+        self._coverage_fail: Optional[str] = None
         self.account = Account(cfg.initial_cash, cfg.account_type)
         self.om = OrderManager()
         self.fees = copy.deepcopy(cfg.make_fees())
@@ -107,6 +127,7 @@ class Backtester:
         self._instruments: dict[str, Instrument] = {}
         self._pending_on_fill: list[Fill] = []
         self._pending_events: list[dict] = []
+        self._sparse_quote_note = False
         self._state_ver = 0                     # bumped on fills / submissions (reduce-only clamp cache)
         self._clamp_seen: dict[str, tuple] = {}
         self._oc_cache: dict[int, tuple[int, int]] = {}
@@ -150,6 +171,49 @@ class Backtester:
                 inst = Instrument(symbol=symbol, asset_class=AssetClass.STOCK)
             self._instruments[symbol] = inst
         return inst
+
+    def _master_option(self, inst: Instrument) -> tuple[Optional[Instrument], Optional[str]]:
+        """Replace a strategy-built option instrument by the instrument-master
+        record (deliverable, tick size, exercise/settlement style). Returns
+        ``(master, None)``, or ``(None, reason)`` when the two disagree on
+        multiplier / strike / right / expiry / underlying, or on an explicitly
+        set (non-default) deliverable. Without a master record the strategy's
+        instrument is used (and registered)."""
+        sym = inst.symbol
+        m = self._instruments.get(sym)
+        if m is None or not m.is_option:
+            try:
+                m = self.portal.instrument(sym)
+            except Exception:
+                m = None
+            if m is None or not m.is_option:
+                self._instruments[sym] = inst
+                return inst, None
+            self._instruments[sym] = m
+        if m is inst:
+            return m, None
+        bad = []
+        if abs(float(inst.multiplier) - float(m.multiplier)) > 1e-9:
+            bad.append(f"multiplier {inst.multiplier:g} vs {m.multiplier:g}")
+        if inst.strike is not None and m.strike is not None and abs(float(inst.strike) - float(m.strike)) > 1e-9:
+            bad.append(f"strike {inst.strike:g} vs {m.strike:g}")
+        if inst.right is not None and m.right is not None and inst.right != m.right:
+            bad.append(f"right {inst.right} vs {m.right}")
+        if inst.expiry is not None and m.expiry is not None and \
+                pd.Timestamp(inst.expiry).date() != pd.Timestamp(m.expiry).date():
+            bad.append(f"expiry {pd.Timestamp(inst.expiry).date()} vs {pd.Timestamp(m.expiry).date()}")
+        if inst.underlying and m.underlying and inst.underlying.upper() != m.underlying.upper():
+            bad.append(f"underlying {inst.underlying} vs {m.underlying}")
+        d_s, d_m = float(inst.deliverable_shares), float(m.deliverable_shares)
+        if abs(d_s - d_m) > 1e-9:
+            if abs(d_s - 100.0) > 1e-9:            # explicitly set by the strategy and wrong
+                bad.append(f"deliverable {d_s:g} vs {d_m:g}")
+            else:
+                self.diag["warnings"].append(
+                    f"{sym}: deliverable {d_m:g} shares taken from the instrument master (strategy built {d_s:g})")
+        if bad:
+            return None, f"option {sym} disagrees with the instrument master: " + "; ".join(bad)
+        return m, None
 
     def _note_data_access(self, kind, symbol, fidelity) -> None:
         k = f"{kind}"
@@ -205,6 +269,8 @@ class Backtester:
         return f
 
     def _uses_quotes(self, symbol: str) -> bool:
+        """Does the portal have ANY quotes for the symbol (cached)? The fill
+        source is decided per bar window by ``_quote_window`` ('auto')."""
         m = self._quotes_mode.get(symbol)
         if m is None:
             mode = self.cfg.use_quotes
@@ -219,6 +285,35 @@ class Backtester:
                     m = False
             self._quotes_mode[symbol] = m
         return m
+
+    def _has_bars(self, symbol: str) -> bool:
+        b = self.md.bars(symbol) if self.md is not None else None
+        return b is not None and b.n > 0
+
+    def _quote_window(self, sym: str, lo: int, hi: int):
+        """Per-window fill source. Returns the quotes frame to fill from, or
+        None for bar fills. 'auto': quotes are used only if they cover the
+        window with at least ``quote_min_per_hour`` quotes per RTH hour (or if
+        the symbol has no bars at all); otherwise bars. Never leaves an order
+        unfillable for lack of quotes while bars exist."""
+        if not self._uses_quotes(sym):
+            return None
+        try:
+            df = self.portal.quotes(sym, ts_utc(lo + 1), ts_utc(hi + 1), as_of=self.now)
+        except Exception:
+            df = None
+        n = 0 if df is None else len(df)
+        if self.cfg.use_quotes == "always" or not self._has_bars(sym):
+            return df if n else None
+        o_ns, c_ns = (int(x.value) for x in self.session_open_close)
+        rth = max(min(hi, c_ns) - max(lo, o_ns), 0)          # RTH time covered by the window
+        hours = rth / 3.6e12
+        need = max(1.0, self.cfg.quote_min_per_hour * hours)
+        if n >= need:
+            return df
+        if n:
+            self._sparse_quote_note = True
+        return None
 
     def _roll_to_session(self, d: pd.Timestamp) -> pd.Timestamp:
         d = pd.Timestamp(d).normalize()
@@ -262,11 +357,19 @@ class Backtester:
         fidmap: dict[str, Optional[int]] = {}
         syms_default = list(self.strategy.universe)
         if self.strategy.universe_name and sessions is not None and len(sessions):
+            members = None
             try:
                 o0 = self.cal.open_close(sessions[0])[0]
-                syms_default = list(self.portal.universe(self.strategy.universe_name, o0)) or syms_default
+                members = list(self.portal.universe(self.strategy.universe_name, o0))
             except Exception:
-                pass
+                members = None
+            if members:
+                # universe_name: per-member data is NOT required of every member; members
+                # without verified data are excluded and coverage must reach the minimum
+                kept = self._coverage_check(self.strategy.universe_name, o0, members, raise_=False)
+                if self._coverage_fail:
+                    return False, self._coverage_fail, fidmap
+                syms_default = kept
         for r in self.strategy.requires:
             syms = list(r.symbols) if r.symbols else syms_default
             for s_ in syms:
@@ -279,23 +382,126 @@ class Backtester:
                 f = Fidelity(int(f)) if f is not None else Fidelity.NA
                 fidmap[key] = int(f)
                 if r.critical and (not has or f == Fidelity.NA or f > r.min_fidelity):
-                    return False, f"required {r.kind} {r.freq or ''} for {s_} unavailable (fidelity {f.name})", fidmap
+                    why = f"required {r.kind} {r.freq or ''} for {s_} unavailable (fidelity {f.name}"
+                    why += f", need {Fidelity(int(r.min_fidelity)).name} or better)" if has and f != Fidelity.NA else ")"
+                    return False, why + (f": {r.note}" if r.note else ""), fidmap
                 ext = [x for x in r.sessions if x in ("PRE", "POST")]
-                if r.kind == "bars" and ext and s_ != "*" and r.critical and sessions is not None and len(sessions):
-                    missing = self._probe_sessions(s_, r.freq or self.base_freq, ext, sessions)
+                if r.kind in ("bars", "quotes", "options") and ext and s_ != "*" and r.critical \
+                        and sessions is not None and len(sessions):
+                    missing = self._probe_sessions(s_, r.freq or self.base_freq, ext, sessions, kind=r.kind)
                     if missing:
                         fidmap[key + ":" + ",".join(missing)] = int(Fidelity.NA)
-                        return False, (f"required {'/'.join(missing)} {r.freq or self.base_freq} bars for {s_} not "
+                        what = f"{r.freq or self.base_freq} bars" if r.kind == "bars" else r.kind
+                        return False, (f"required {'/'.join(missing)} {what} for {s_} not "
                                        f"available in the backtest window"), fidmap
         return True, "", fidmap
 
-    def _probe_sessions(self, sym: str, freq: str, ext: list, sessions, n_probe: int = 10) -> list:
-        """Engine-internal availability probe for extended-hours bars over the
-        first ``n_probe`` sessions of the run (no strategy-visible data)."""
+    # ---------------------------------------------------------- universe coverage
+    def _member_verified(self, sym: str) -> tuple[bool, str]:
+        """A universe member is usable when the portal has its base-frequency bars and
+        every critical requirement that applies to universe members (no explicit
+        ``symbols``) is available at the required fidelity. Memoised per symbol."""
+        v = self._verified.get(sym)
+        if v is not None:
+            return v
+        checks = [("bars", self.base_freq, Fidelity.T3_MODELED)]
+        checks += [(r.kind, r.freq, r.min_fidelity) for r in self.strategy.requires if r.critical and not r.symbols]
+        v = (True, "")
+        for kind, freq, mf in checks:
+            try:
+                has = bool(self.portal.has(sym, kind, freq))
+                f = self.portal.fidelity_of(sym, kind, freq) if has else Fidelity.NA
+                f = Fidelity(int(f)) if f is not None else Fidelity.NA
+            except Exception:
+                has, f = False, Fidelity.NA
+            if not has or f == Fidelity.NA or f > mf:
+                v = (False, f"{kind} {freq or ''} unavailable (fidelity {f.name})".replace("  ", " "))
+                break
+        self._verified[sym] = v
+        return v
+
+    def _coverage_check(self, name: str, as_of, members: list, raise_: bool = True) -> list:
+        kept, dropped = [], []
+        for s_ in members:
+            ok, why = self._member_verified(s_)
+            (kept if ok else dropped).append(s_)
+        d = str(self._session_of_ns(int(pd.Timestamp(as_of).value)).date())
+        key = (name, d)
+        if key not in self._cov_log:
+            self._cov_log[key] = (len(members), len(kept), dropped)
+            cov = len(kept) / len(members) if members else 1.0
+            if cov < 1.0:
+                tag = (name, round(cov, 3))
+                if tag not in self._cov_flagged:
+                    self._cov_flagged.add(tag)
+                    self.fid.flag(pd.Timestamp(as_of), Fidelity.T2_PROXY,
+                                  f"universe {name} coverage {cov:.1%} (members without verified data excluded)")
+            if cov < self.cfg.min_universe_coverage and self._coverage_fail is None:
+                ex = ", ".join(f"{s_}: {self._verified[s_][1]}" for s_ in dropped[:3])
+                self._coverage_fail = (f"universe {name} coverage {cov:.1%} on {d} ({len(dropped)}/{len(members)} "
+                                       f"members without verified data, e.g. {ex}) is below "
+                                       f"min_universe_coverage {self.cfg.min_universe_coverage:.0%}")
+                if raise_:
+                    raise NotTestableError(self._coverage_fail)
+        return kept
+
+    def _filter_universe(self, name: str, as_of, members: list) -> list:
+        """PITPortal.universe hook: the strategy only sees members with verified data."""
+        return self._coverage_check(name, as_of, members)
+
+    def _coverage_meta(self) -> dict:
+        if not self._cov_log:
+            return {}
+        rows = [{"date": d, "universe": n, "members": m, "kept": k, "coverage": (k / m if m else float("nan"))}
+                for (n, d), (m, k, _) in sorted(self._cov_log.items(), key=lambda kv: kv[0][1])]
+        dropped: dict[str, dict] = {}
+        for (n, d), (_, _, dr) in sorted(self._cov_log.items(), key=lambda kv: kv[0][1]):
+            for s_ in dr:
+                e = dropped.setdefault(s_, {"first": d, "last": d, "n": 0, "reason": self._verified[s_][1]})
+                e["last"] = d
+                e["n"] += 1
+        cov = [r["coverage"] for r in rows if r["coverage"] == r["coverage"]]
+        return {"min_universe_coverage": self.cfg.min_universe_coverage,
+                "coverage_min": min(cov) if cov else float("nan"),
+                "series": pd.DataFrame(rows), "dropped": dropped}
+
+    def _probe_sessions(self, sym: str, freq: str, ext: list, sessions, n_probe: int = 10,
+                        kind: str = "bars") -> list:
+        """Engine-internal availability probe for extended-hours bars / quotes /
+        option snapshots over the first ``n_probe`` sessions of the run (no
+        strategy-visible data)."""
         probe = list(sessions[:n_probe])
         a = self.cal.open_close(probe[0])[0] - pd.Timedelta(hours=12)
         b = self.cal.open_close(probe[-1])[1] + pd.Timedelta(hours=8)
         missing = []
+        if kind == "quotes":
+            try:
+                df = self.portal.quotes(sym, a, b, as_of=b)
+            except Exception:
+                df = None
+            from .timeutil import as_ns_array
+            codes = {self._classify_ts(int(t))[0] for t in as_ns_array(df.index)} if df is not None and len(df) else set()
+            return [c for c in ext if c not in codes]
+        if kind == "options":
+            for code in ext:
+                found = False
+                for d in probe:
+                    o_, c_ = self.cal.open_close(d)
+                    lo, hi = ((o_ - pd.Timedelta(hours=5, minutes=30), o_) if code == "PRE"
+                              else (c_, c_ + pd.Timedelta(hours=4)))
+                    try:
+                        ch = self.portal.option_chain(sym, hi - pd.Timedelta(1, "ns"))
+                    except Exception:
+                        ch = None
+                    if ch is not None and len(ch) and "ts" in ch.columns:
+                        ts_ = pd.DatetimeIndex(ch["ts"])
+                        ts_ = ts_.tz_localize("UTC") if ts_.tz is None else ts_.tz_convert("UTC")
+                        if ((ts_ >= lo) & (ts_ < hi)).any():
+                            found = True
+                            break
+                if not found:
+                    missing.append(code)
+            return missing
         for code in ext:
             try:
                 df = self.portal.bars(sym, freq, a, b, as_of=b, adjusted=False, sessions=(code,))
@@ -354,9 +560,19 @@ class Backtester:
                 self._session_start(s)
                 for t_ns in self._steps(s):
                     self._step(int(t_ns))
+                    if self._coverage_fail:              # even if the strategy swallowed the exception
+                        raise NotTestableError(self._coverage_fail)
                 self._session_end(s, sessions[i + 1] if i + 1 < len(sessions) else self.cal.next_session(s))
+                if self._coverage_fail:
+                    raise NotTestableError(self._coverage_fail)
+            self.strategy.on_run_end(self.ctx)
+            self._flush_on_fill()
         except LookaheadError:
             raise
+        except NotTestableError as e:              # a designed outcome, not an error (even with raise_errors)
+            status = RunStatus.NOT_TESTABLE
+            err = str(e) or "NotTestableError raised by strategy"
+            self.diag["not_testable_raised_at"] = str(self.now)
         except Exception as e:
             if raise_errors or self.cfg.debug:
                 raise
@@ -675,16 +891,26 @@ class Backtester:
                 continue
             inst = self.instrument(sym)
             self._clamp_reduce_only(sym)
-            auction = [o for o in self.om.active(sym) if o.type in (OrderType.MOO, OrderType.MOC)]
-            if auction:
-                self._fill_auction(sym, inst, auction, lo, hi)
+            # chronological: opening auction, continuous trading, closing auction
+            # (MOC children created by fills in this window, e.g. a bracket
+            # time_exit_moc on a daily bar, still join this window's close)
+            moo = [o for o in self.om.active(sym) if o.type == OrderType.MOO]
+            if moo:
+                self._fill_auction(sym, inst, moo, lo, hi)
             rest = [o for o in self.om.active(sym) if o.type not in (OrderType.MOO, OrderType.MOC)]
+            if rest:
+                self._sparse_quote_note = False
+                qdf = self._quote_window(sym, lo, hi)
+                if qdf is not None:
+                    self._fill_quotes(sym, inst, lo, hi, qdf)
+                else:
+                    self._fill_bars(sym, inst, lo, hi)
+            moc = [o for o in self.om.active(sym) if o.type == OrderType.MOC]
+            if moc:
+                self._clamp_reduce_only(sym)
+                self._fill_auction(sym, inst, moc, lo, hi)
             if not rest:
                 continue
-            if self._uses_quotes(sym):
-                self._fill_quotes(sym, inst, lo, hi)
-            else:
-                self._fill_bars(sym, inst, lo, hi)
             # IOC: cancel remainder after first evaluation
             for o in self.om.active(sym):
                 ex = self.om.extras[o.id]
@@ -849,8 +1075,9 @@ class Backtester:
                                             lambda o, r: self._reject_working(o, r), resolved_with=resolved)
             self._add_stats(stats)
 
-    def _fill_quotes(self, sym: str, inst: Instrument, lo: int, hi: int) -> None:
-        df = self.portal.quotes(sym, ts_utc(lo + 1), ts_utc(hi + 1), as_of=self.now)
+    def _fill_quotes(self, sym: str, inst: Instrument, lo: int, hi: int, df=None) -> None:
+        if df is None:
+            df = self.portal.quotes(sym, ts_utc(lo + 1), ts_utc(hi + 1), as_of=self.now)
         if df is None or len(df) == 0:
             return
         from .timeutil import as_ns_array
@@ -1014,6 +1241,22 @@ class Backtester:
 
     def _stock_leg_quote(self, leg: Leg, od: Order, eligible_ns: int, snap_ns: int) -> Optional[LegQuote]:
         sym = leg.instrument.symbol
+        if self._uses_quotes(sym):
+            # synchronized stock NBBO at the option snapshot time (T0), when quotes cover it
+            age = self.cfg.combo.stock_quote_max_age
+            lo_ns = max(eligible_ns, snap_ns - int(age.value))
+            try:
+                qd = self.portal.quotes(sym, ts_utc(lo_ns + 1), ts_utc(snap_ns + 1), as_of=self.now)
+            except Exception:
+                qd = None
+            if qd is not None and len(qd):
+                from .timeutil import as_ns_array
+                tsa = as_ns_array(qd.index)
+                for j in range(len(qd) - 1, -1, -1):
+                    bid_, ask_ = float(qd["bid"].iloc[j]), float(qd["ask"].iloc[j])
+                    if lo_ns < tsa[j] <= snap_ns and ask_ > bid_ > 0:
+                        return LegQuote(leg.instrument, snap_ns, bid_, ask_, Fidelity.T0_QUOTE,
+                                        "stock leg from synchronized NBBO quote")
         b = self.md.bars(sym)
         i = int(np.searchsorted(b.start, eligible_ns, side="left"))
         if i >= b.n or b.start[i] > snap_ns or b.start[i] > self.now_ns:
@@ -1052,6 +1295,10 @@ class Backtester:
 
     # ================================================================= booking
     def _on_decision(self, d: FillDecision, inst: Instrument) -> None:
+        if d.liquidity in ("TAKER", "MAKER") and "fill source: quotes" not in d.reasons and \
+                self._uses_quotes(inst.symbol):
+            d.reasons = tuple(d.reasons) + (("fill source: bars (quotes sparse in window)",) if self._sparse_quote_note
+                                            else ("fill source: bars (no quotes in window)",))
         self._book(d, inst, fee_key=d.order.id, notify_manager=True)
 
     def _book(self, d: FillDecision, inst: Instrument, fee_key: int, notify_manager: bool) -> None:
@@ -1078,7 +1325,7 @@ class Backtester:
         self._record_fill(fill, o.tag, d.reasons)
         self._pending_on_fill.append(fill)
         if notify_manager:
-            self._after_fill_order(o, d.qty, ts, d.pos, d.ts_ns)
+            self._after_fill_order(o, d.qty, ts, d.pos, d.ts_ns, d.price)
 
     def _record_fill(self, fill: Fill, tag: str, reasons: tuple) -> None:
         c = fill.costs
@@ -1108,7 +1355,8 @@ class Backtester:
             "fidelity_name": Fidelity(fill.fidelity).name})
         self.fid.on_fill(fill, tuple(reasons))
 
-    def _after_fill_order(self, o: Order, qty: float, ts: pd.Timestamp, pos: float, ts_ns: int) -> None:
+    def _after_fill_order(self, o: Order, qty: float, ts: pd.Timestamp, pos: float, ts_ns: int,
+                          fill_px: Optional[float] = None) -> None:
         touched, templates, child_updates = self.om.on_fill(o, qty, ts)
         spec = self.om.bracket_of(o.id)
         if spec is None:
@@ -1119,13 +1367,45 @@ class Backtester:
             if child is not None and child.status in ACTIVE:
                 child.quantity += dq
                 continue
-            self._create_child(o, spec, k, dq, ts, ts_ns, pos)
+            if getattr(templates[k], "skip", False):
+                continue
+            self._create_child(o, spec, k, dq, ts, ts_ns, pos, fill_px)
 
     def _create_child(self, o: Order, spec, k: int, dq: float, ts: Optional[pd.Timestamp] = None,
-                      ts_ns: Optional[int] = None, pos: Optional[float] = None) -> Order:
+                      ts_ns: Optional[int] = None, pos: Optional[float] = None,
+                      fill_px: Optional[float] = None) -> Order:
         ts = self.now if ts is None else ts
         ts_ns = self.now_ns if ts_ns is None else ts_ns
         t = spec.templates[k]
+        if t.rel_fn is not None:
+            ref = fill_px
+            if ref is None or ref != ref:
+                p_ = self.account.get(o.instrument.symbol)
+                ref = p_.avg_price if p_ is not None else float("nan")
+            side = 1 if o.quantity > 0 else -1
+            raw = t.rel_fn(float(ref), side)
+            lvl = float(raw) if raw is not None else float("nan")
+            if not (lvl == lvl and lvl > 0):
+                t.rel_fn = None
+                t.skip = True
+                ev = {"ts": self.now, "order_id": o.id, "symbol": o.instrument.symbol, "action": "CHILD_SKIPPED",
+                      "reason": f"fill-relative {t.tag} level is None/NaN: child not created (OCO group kept)",
+                      "tag": t.tag}
+                self.diag["order_events"].append(ev)
+                self._pending_events.append(ev)
+                return None
+            if t.type == OrderType.STOP:
+                t.stop_price = lvl
+                pex_ = self.om.extras[o.id]
+                if pex_.initial_stop is None or pex_.initial_stop != pex_.initial_stop or pex_.anchor_stop:
+                    pex_.initial_stop = lvl
+                    pex_.anchor_stop = True
+                    tr = self.trades.open.get(o.instrument.symbol)
+                    if tr is not None:
+                        tr.initial_stop = lvl
+            else:
+                t.limit_price = lvl
+            t.rel_fn = None                      # anchored once, to the first entry fill
         co = Order(o.instrument, dq, t.type, t.limit_price, t.stop_price, t.tif, tag=t.tag,
                    oco_group=spec.oco_group)
         co.strategy_id = o.strategy_id
@@ -1141,6 +1421,11 @@ class Backtester:
                           activate_at_ns=int(t.activate_at.value) if t.activate_at is not None else None,
                           eligible_ns=ts_ns, submitted_ns=ts_ns, in_bar_from=pos, reduce_only=True)
         cex.valid_session_ns = self._validity_session(ts_ns, cex.outside_rth) if t.tif == TimeInForce.DAY else None
+        if t.type == OrderType.MOC:
+            tgt = t.target_session if t.target_session is not None else self._session_of_ns(ts_ns)
+            tgt = tgt if self.cal.is_session(tgt) else self.cal.next_session(tgt)
+            earliest = self._auction_session(ts_ns, False)
+            cex.target_session_ns = max(int(pd.Timestamp(tgt).value), earliest)
         self.om.add(co, cex, ts)
         self._state_ver += 1
         spec.child_ids[k] = co.id
@@ -1152,7 +1437,7 @@ class Backtester:
             if p.instrument.is_option:
                 continue
             b = self.md.bars(sym)
-            if b.n == 0 and self._uses_quotes(sym):
+            if b.n == 0 and self._uses_quotes(sym):   # quote-only symbol
                 q = self.ctx.last_quote(sym)
                 if q is not None and q.ask > q.bid > 0:
                     p.mark = q.mid
@@ -1164,17 +1449,35 @@ class Backtester:
                 p.mark_ts = ts_utc(int(b.end[i]))
 
     def _mark_options(self) -> None:
+        """Same-session option marks only. Per position, the latest observation
+        time-stamped in THIS session wins: a fill in the contract, or a snapshot
+        from ``portal.option_quotes`` (real quote T0-T2; the data portal falls
+        back to a same-day chain-surface mark T2 and then a PIT model value T3).
+        ``Position.mark_ts`` / ``mark_fidelity`` record where the mark came from.
+        With no same-session observation the previous mark is kept for NAV only
+        (its old ``mark_ts`` tells the lifecycle it is stale, so it is never used
+        as an early-assignment price) and the run is flagged T2."""
+        o_ts, _ = self.session_open_close
+        lo_ns = int(o_ts.value) - int(6 * 3600e9)            # session day incl. pre-market
         for p in self.account.option_positions():
-            q = self.portal.option_quote(p.instrument, self.now)
-            if q is not None and q.bid == q.bid and q.ask == q.ask and q.ask > 0:
-                p.mark = 0.5 * (q.bid + q.ask)
-                p.mark_ts = pd.Timestamp(q.ts)
-                if q.fidelity >= Fidelity.T2_PROXY:
-                    self.fid.note(q.fidelity, "option marks from quote snapshots")
-            else:
-                age = self.now - p.mark_ts if p.mark_ts is not None else pd.Timedelta(days=999)
-                if age > self.cfg.max_option_mark_staleness:
-                    self.fid.flag(self.now, Fidelity.T2_PROXY, f"stale option mark {p.symbol}")
+            cur_ns = int(pd.Timestamp(p.mark_ts).value) if p.mark_ts is not None else None
+            cur_ok = p.mark == p.mark and cur_ns is not None and lo_ns < cur_ns <= self.now_ns
+            snaps = self._option_snapshots(p.instrument, lo_ns)
+            best = None
+            for t in sorted(snaps, reverse=True):
+                b, a, f = snaps[t]
+                if b == b and a == a and a > 0 and b >= 0 and a >= b:
+                    best = (t, 0.5 * (b + a), f)
+                    break
+            if best is not None and (not cur_ok or best[0] >= cur_ns):
+                p.mark = best[1]
+                p.mark_ts = ts_utc(best[0])
+                p.mark_fidelity = best[2]
+                if best[2] >= Fidelity.T2_PROXY:
+                    self.fid.note(best[2], "option marks from quote snapshots / surface / model")
+            elif not cur_ok:
+                self.fid.flag(self.now, Fidelity.T2_PROXY,
+                              f"no same-session option mark {p.symbol}: last mark kept for NAV only")
 
     def _update_excursions(self, lo: int, hi: int) -> None:
         for sym in list(self.trades.open):
@@ -1269,6 +1572,36 @@ class Backtester:
             d = self.cal.next_session(d)
         return int(d.value)
 
+    def _exec_rank(self, otype: OrderType, eligible_ns: int, target_session_ns: Optional[int]) -> int:
+        """Earliest time an order can execute: auction time for MOO/MOC, else eligible_at."""
+        if otype in (OrderType.MOO, OrderType.MOC):
+            sess_ns = target_session_ns if target_session_ns is not None else \
+                self._auction_session(eligible_ns, otype == OrderType.MOO)
+            o_, c_ = self.cal.open_close(pd.Timestamp(sess_ns))
+            return int((o_ if otype == OrderType.MOO else c_).value)
+        return eligible_ns
+
+    def _projected_position(self, sym: str, order: Order, eligible_ns: int) -> float:
+        """Position this order will meet when it executes: current position plus
+        pending same-symbol orders that execute no later than it. Pending sells
+        always count (conservative); pending buys count only when they are sure
+        to execute first (MARKET / MOO / earlier-or-same auction MOC)."""
+        mine = self._exec_rank(order.type, eligible_ns, None)
+        proj = self.account.position(sym)
+        for o in self.om.active(sym):
+            ex = self.om.extras[o.id]
+            if ex.parent_id is not None or ex.reduce_only:
+                continue
+            rem = o.remaining
+            if rem < 0:
+                proj += rem
+                continue
+            if o.type not in (OrderType.MARKET, OrderType.MOO, OrderType.MOC):
+                continue
+            if self._exec_rank(o.type, ex.eligible_ns, ex.target_session_ns) <= mine:
+                proj += rem
+        return proj
+
     @staticmethod
     def _conservative_price(otype: OrderType, q: float, limit: Optional[float], stop: Optional[float],
                             ref: float) -> float:
@@ -1291,6 +1624,17 @@ class Backtester:
         if order.type == OrderType.COMBO or order.legs:
             if not order.legs:
                 return self.om.reject(order, "COMBO order without legs", now)
+            legs = []
+            for leg in order.legs:
+                li = leg.instrument
+                if isinstance(li, str):
+                    li = self.instrument(li)
+                if li.is_option:
+                    li, why = self._master_option(li)
+                    if why:
+                        return self.om.reject(order, why, now)
+                legs.append(leg if li is leg.instrument else replace(leg, instrument=li))
+            order.legs = tuple(legs)
             order.type = OrderType.COMBO
             q = order.quantity
             if q != int(q) or q == 0:
@@ -1302,8 +1646,13 @@ class Backtester:
             if isinstance(inst, str):
                 inst = self.instrument(inst)
                 order.instrument = inst
+            if inst.is_option:
+                inst, why = self._master_option(inst)
+                if why:
+                    return self.om.reject(order, why, now)
+                order.instrument = inst
             sym = inst.symbol
-            quotes = (not inst.is_option) and self._uses_quotes(sym)
+            quotes = (not inst.is_option) and self._uses_quotes(sym) and not self._has_bars(sym)
         lat = self.cfg.latency_quotes if (quotes or (inst is not None and inst.is_option) or order.type == OrderType.COMBO) \
             else self.cfg.latency_bars
         order.eligible_at = now + lat
@@ -1356,10 +1705,9 @@ class Backtester:
                 return self.om.reject(order, f"no new entries after {ne} ET (close-adjusted)", now)
         # short sales: locate + account type
         if inst is not None and not inst.is_option and t != OrderType.COMBO and q < 0:
-            pend_sells = sum(o.remaining for o in self.om.active(sym) if o.remaining < 0
-                             and self.om.extras[o.id].parent_id is None and not o.oco_group)
-            if cur + pend_sells + q < -1e-9:
-                order.is_short_sale = True
+            projected = self._projected_position(sym, order, int((now + lat).value))
+            if projected + q < -1e-9:
+                order.is_short_sale = True                 # only the part below zero is short; re-decided at fill
                 if self.account.account_type == AccountType.CASH:
                     return self.om.reject(order, "cash account: short selling not permitted", now)
                 if self.cfg.enforce_locates:
@@ -1370,7 +1718,7 @@ class Backtester:
                         self.fid.note(Fidelity.T2_PROXY, f"borrow default {fee:.2%} p.a. (no borrow data)")
         # buying power (conservative price; no credit for pending exposure-reducing orders)
         if self.cfg.check_margin_on_submit and not internal and t != OrderType.COMBO and inst is not None \
-                and abs(cur + q) > abs(cur) + 1e-12:
+                and increases:
             px = self._conservative_price(order.type, q, order.limit_price, order.stop_price, self.last_price(sym))
             pending = []
             for o2 in self.om.active():
@@ -1393,6 +1741,7 @@ class Backtester:
                          activate_at_ns=int(pd.Timestamp(activate_at).value) if activate_at is not None else None,
                          submitted_ns=int(now.value), eligible_ns=int(order.eligible_at.value), is_flatten=internal,
                          reduce_only=internal, planned_entry=planned_entry)
+        ex.quote_eligible_ns = int((now + self.cfg.latency_quotes).value)
         if t in (OrderType.MOO, OrderType.MOC):
             ex.target_session_ns = self._auction_session(ex.eligible_ns, t == OrderType.MOO)
         if order.tif == TimeInForce.DAY:
@@ -1404,6 +1753,22 @@ class Backtester:
         if children:
             self.om.register_bracket(order, children, f"bracket-{order.id}")
         return order
+
+    def strategy_cancel(self, order_id: int) -> bool:
+        ex = self.om.extras.get(order_id)
+        if ex is not None and ex.is_flatten:
+            self.diag["warnings"].append(f"{self.now}: strategy tried to cancel engine-internal order {order_id} "
+                                         f"(flat_by / margin liquidation): ignored")
+            return False
+        return self.om.cancel(order_id, self.now, "cancelled by strategy")
+
+    def strategy_cancel_all(self, symbol: Optional[str] = None) -> int:
+        n = 0
+        for oid in list(self.om.active_ids(symbol)):
+            if self.om.extras[oid].is_flatten:
+                continue
+            n += self.om.cancel(oid, self.now, "cancel_all by strategy")
+        return n
 
     def amend_bracket(self, parent_or_group, stop=None, target=None, time_exit=None) -> list[Order]:
         if isinstance(parent_or_group, Order):
@@ -1456,7 +1821,9 @@ class Backtester:
                 siblings = [self.om.orders[c] for c in spec.child_ids.values()
                             if c in self.om.orders and self.om.orders[c].status in ACTIVE]
                 q = siblings[0].remaining if siblings else -parent.filled_qty
-                out.append(self._create_child(parent, spec, k, q))
+                c_ = self._create_child(parent, spec, k, q)
+                if c_ is not None:
+                    out.append(c_)
         return out
 
     def _borrow(self, sym: str) -> tuple[bool, float, Fidelity]:
@@ -1503,8 +1870,10 @@ class Backtester:
             f = Fill(-1, inst, self.now, ev.option_qty, ev.option_price, CostBreakdown(), ev.fidelity,
                      liquidity=liq, note=f"{ev.kind}: {ev.note}")
             self.account.apply_fill(f, cash_reason=reason)
+            self._state_ver += 1
             self.trades.on_fill(f, pos_before, None, ev.kind.lower())
             self._record_fill(f, ev.kind.lower(), (ev.note,) if ev.note else ())
+            self._pending_on_fill.append(f)          # Strategy.on_fill, same step
             if ev.underlying and ev.underlying_qty:
                 uinst = self.instrument(ev.underlying)
                 c = self.fees.explicit_costs(uinst, ev.underlying_qty, ev.underlying_price, self.now, liq)
@@ -1518,6 +1887,7 @@ class Backtester:
                     p.mark_ts = self.now
                 self.trades.on_fill(uf, ub, None, ev.kind.lower())
                 self._record_fill(uf, ev.kind.lower(), ("option delivery",))
+                self._pending_on_fill.append(uf)
             self.diag["option_events"].append({"ts": self.now, "kind": ev.kind, "option": inst.symbol,
                                                "qty": ev.option_qty, "settlement_value": ev.settlement_value,
                                                "underlying_qty": ev.underlying_qty, "note": ev.note})
@@ -1533,9 +1903,9 @@ class Backtester:
         # option expiry (PM / physical)
         opts = self.account.option_positions()
         if opts:
-            evs = self.lifecycle.at_session_end(session, opts, _Prices(self))
+            self._mark_options()          # same-session marks BEFORE expiry / early-assignment tests
+            evs = self.lifecycle.at_session_end(session, self.account.option_positions(), _Prices(self))
             self._apply_option_events(evs)
-            self._mark_options()
         self._flush_on_fill()
         # financing for calendar days until next session
         days = int((pd.Timestamp(next_session) - pd.Timestamp(session)).days)
@@ -1559,7 +1929,7 @@ class Backtester:
         self.om.expire_session(int(session.value), ts)
         # margin
         if self.account.account_type == AccountType.REG_T_MARGIN and self.cfg.margin_calls:
-            snap = self.margin.snapshot(self.account, self._underlying_price)
+            snap = self.margin.snapshot(self.account, self._underlying_price, as_of=ts)
             if snap.is_call:
                 plan = self.margin.liquidation_plan(self.account, snap)
                 self.diag["margin_calls"].append({"ts": ts, "equity": snap.equity, "maintenance": snap.maintenance,
@@ -1677,7 +2047,14 @@ class Backtester:
             "account_type": self.cfg.account_type.value, "initial_cash": self.cfg.initial_cash,
             "data_sessions": self.data_sessions, "timeline_sessions": self.timeline_sessions,
             "session_rules": self._session_rules,
+            "config_overrides": dict(self.config_overrides),
         }
+        cm = self._coverage_meta()
+        if cm:
+            meta["universe_coverage"] = cm
+            if cm["coverage_min"] == cm["coverage_min"] and cm["coverage_min"] < 1.0:
+                meta["survivorship_bias"] += (f"; members without verified data excluded (coverage min "
+                                              f"{cm['coverage_min']:.1%}, {len(cm['dropped'])} members dropped)")
         return BacktestResult(
             strategy_id=self.strategy.id, params=params, status=status, equity=eq, returns=rets,
             fills=fills_frame(self.fill_rows), trades=self.trades.frame(marks),

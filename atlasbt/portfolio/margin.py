@@ -216,6 +216,8 @@ class RegTMarginModel:
                 short_mv += mv
                 init += self.initial_short * -mv
                 maint += self._short_maint(px, -p.qty * p.multiplier)
+        if self.option_model is not None and as_of is not None and hasattr(self.option_model, "as_of"):
+            self.option_model.as_of = pd.Timestamp(as_of)       # dated (rule-version) option margin
         opt = self.option_model.requirement(account, underlying_price) if self.option_model else 0.0
         if account.account_type == AccountType.CASH:
             # cash account: everything is paid in full; requirement = option collateral only

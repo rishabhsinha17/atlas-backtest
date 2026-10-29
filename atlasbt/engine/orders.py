@@ -40,6 +40,8 @@ class OrderExtras:
     planned_entry: Optional[float] = None    # optional planned entry price (planned R)
     last_snap_ns: int = 0                    # option/combo: last snapshot evaluated
     original_quantity: Optional[float] = None  # quantity at submission (before OCO/CA/reduce-only changes)
+    anchor_stop: bool = False                # initial stop anchored to the entry fill (fill-relative bracket)
+    quote_eligible_ns: int = 0               # quote fills: submitted + latency_quotes
     submitted_ns: int = 0
     eligible_ns: int = 0
     fills: int = 0
@@ -54,6 +56,11 @@ class ChildTemplate:
     tif: TimeInForce = TimeInForce.GTC
     activate_at: Optional[pd.Timestamp] = None
     outside_rth: bool = False
+    #: fill-relative level: f(entry_fill_price, side) -> price (side +1 long / -1 short);
+    #: when set, the child's price is anchored to the ACTUAL entry fill
+    rel_fn: Optional[object] = None
+    skip: bool = False                       # fill-relative level unavailable: leg not created
+    target_session: Optional[pd.Timestamp] = None   # MOC child: session whose closing auction it joins
 
 
 @dataclass

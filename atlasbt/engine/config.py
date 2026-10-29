@@ -36,6 +36,9 @@ class BacktestConfig:
     daily_open_spread_mult: float = 1.0
     use_quotes: str = "auto"                   # 'auto' | 'never' | 'always'
     resolve_intrabar_freq: Optional[str] = "1m"  # finer bars used to resolve ambiguous coarse bars (None: off)
+    #: 'auto' quote mode: a bar window fills from quotes only if it holds at least this many quotes per
+    #: RTH hour (else bars); symbols without bars always use quotes
+    quote_min_per_hour: float = 60.0
     # constraints
     short_sale_rules: ShortSaleRules = field(default_factory=ShortSaleRules)
     borrow: BorrowConfig = field(default_factory=BorrowConfig)
@@ -61,6 +64,10 @@ class BacktestConfig:
     record_intraday_equity: bool = False
     max_option_mark_staleness: pd.Timedelta = pd.Timedelta(days=5)
     stale_price_sessions: int = 5          # held symbol without a bar for N sessions -> T2 flag + warning
+    #: universes (portal.universe) are filtered to members with verified data; the run is
+    #: NOT_TESTABLE if coverage at the start or at any session the universe is queried is
+    #: below this (1.0 = every member must have data)
+    min_universe_coverage: float = 0.95
 
     def make_fees(self) -> FeeSchedule:
         if isinstance(self.fees, FeeSchedule):
@@ -83,12 +90,13 @@ class BacktestConfig:
         lc = self.option_lifecycle
         if lc == "conservative":
             return DefaultOptionLifecycle()
-        if lc is None or lc == "occ":
+        if lc is None or lc in ("occ", "occ_early_assignment", "occ_no_early_assignment"):
             from ..options.plugins import OccOptionLifecycle
+            early = lc != "occ_no_early_assignment"
             if portal is None:
-                return OccOptionLifecycle()
+                return OccOptionLifecycle(early_assignment=early)
             return OccOptionLifecycle(rate=_portal_rate(portal, self.rf_tenor, now_fn),
-                                      dividends=_portal_dividends(portal, now_fn))
+                                      dividends=_portal_dividends(portal, now_fn), early_assignment=early)
         if isinstance(lc, str):
             raise ValueError(f"unknown option_lifecycle {lc!r}")
         return lc

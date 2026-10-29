@@ -29,12 +29,14 @@ class PITPortal:
     tests/engine/test_eng_strategy_lint.py forbids private-attribute access
     from strategy code."""
 
-    __slots__ = ("__p", "__now", "__on_access")
+    __slots__ = ("__p", "__now", "__on_access", "__ufilter")
 
-    def __init__(self, portal, now_fn: Callable[[], pd.Timestamp], on_access: Optional[Callable] = None):
+    def __init__(self, portal, now_fn: Callable[[], pd.Timestamp], on_access: Optional[Callable] = None,
+                 universe_filter: Optional[Callable] = None):
         self.__p = portal
         self.__now = now_fn
         self.__on_access = on_access
+        self.__ufilter = universe_filter      # engine: keep members with verified data (coverage rule)
 
     # ------------------------------------------------------------- helpers
     def _as_of(self, as_of) -> pd.Timestamp:
@@ -58,7 +60,11 @@ class PITPortal:
         return self.__p.security_master(self._as_of(as_of))
 
     def universe(self, name: str, as_of=None) -> list[str]:
-        return self.__p.universe(name, self._as_of(as_of))
+        a = self._as_of(as_of)
+        members = self.__p.universe(name, a)
+        if self.__ufilter is not None:
+            return self.__ufilter(name, a, list(members))
+        return members
 
     def has(self, symbol: str, kind: str, freq: Optional[str] = None) -> bool:
         return self.__p.has(symbol, kind, freq)
@@ -144,3 +150,28 @@ class PITPortal:
         if df is not None and len(df) and "known_at" in df.columns and (utc_index(df["known_at"]) > a).any():
             raise LookaheadError(f"fundamentals known after {a}")
         return df
+
+    # ------------------------------------------------------------- newer portal methods (whitelisted)
+    def risk_free_rate_info(self, as_of=None, tenor: str = "3M") -> tuple:
+        a = self._as_of(as_of)
+        out = self.__p.risk_free_rate_info(a, tenor)
+        if out is not None and len(out) >= 4 and out[3] is not None:
+            obs = pd.Timestamp(out[3])
+            obs_u = obs.tz_localize("UTC") if obs.tzinfo is None else obs.tz_convert("UTC")
+            if obs_u.normalize() > a.normalize() + pd.Timedelta(days=1):
+                raise LookaheadError(f"risk-free observation {obs} after {a}")
+        return out
+
+    def fundamentals_history(self, symbols, fields, as_of=None, start=None) -> pd.DataFrame:
+        a = self._as_of(as_of)
+        df = self.__p.fundamentals_history(symbols, fields, a, start=start)
+        if df is not None and len(df) and "known_at" in df.columns and (utc_index(df["known_at"]) > a).any():
+            raise LookaheadError(f"fundamentals_history known after {a}")
+        return df
+
+    def universe_survivorship_bias(self, name: str, as_of=None) -> dict:
+        return self.__p.universe_survivorship_bias(name, self._as_of(as_of))
+
+    def __getattr__(self, name: str):
+        # only reached for names NOT defined on the wrapper: never forward un-whitelisted portal methods
+        raise AttributeError(f"PITPortal: '{name}' is not a whitelisted point-in-time portal method")

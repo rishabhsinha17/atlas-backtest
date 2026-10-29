@@ -447,7 +447,8 @@ def test_option_spread_fill_and_expiry_assignment():
         if ctx.session_date() == ss[0]:
             ctx.submit(Order(None, -2, OrderType.COMBO, limit_price=0.70,
                              legs=(Leg(p95, 1), Leg(p90, -1)), tif=TimeInForce.GTC, tag="credit_spread"))
-    r = Backtester(make()(script), portal, BacktestConfig(debug=True)).run(ss[0], ss[-1], raise_errors=True)
+    st = make()(script)
+    r = Backtester(st, portal, BacktestConfig(debug=True)).run(ss[0], ss[-1], raise_errors=True)
     legs = r.fills[r.fills.tag == "credit_spread"]
     assert set(legs.price.round(4)) == {1.0, 0.25}                      # natural: sell 98P bid, buy 90P ask
     assert (legs.ts == snap[1]).all()                                   # snapshot strictly after submission
@@ -458,6 +459,43 @@ def test_option_spread_fill_and_expiry_assignment():
     assert r.positions[r.positions.ts == r.equity.index[-1]].set_index("symbol").loc["XYZ", "quantity"] == 200
     led = r.ledger
     assert led[led.reason == "OPTION_ASSIGNMENT"].amount.sum() == pytest.approx(-200 * 98.0)
+    # assignment / expiry fills reach Strategy.on_fill in the same step (wheel strategies need no polling)
+    life = [f for f in st.fills if f.order_id == -1]
+    by_liq = sorted((f.liquidity, f.instrument.symbol, f.quantity) for f in life)
+    assert by_liq == sorted([("ASSIGNMENT", p95.symbol, 2.0), ("ASSIGNMENT", "XYZ", 200.0),
+                             ("SETTLEMENT", p90.symbol, -2.0)])
+    expiry_close = CAL.open_close(exp)[1]
+    assert all(f.ts == expiry_close for f in life)
+
+
+def test_option_lifecycle_fills_delivered_to_on_fill_same_step():
+    ss = sessions("2024-06-17", 6)                       # expiry Fri 21 Jun, run through Mon 24 Jun
+    exp = ss[4]
+    under = synthetic_bars_from_rows([(100, 101, 99, 100)] * 4 + [(97, 98, 96, 97)] * 2, "1d", session_dates=ss)
+    put = Instrument.option("XYZ", exp, 98.0, Right.PUT)
+    snap = [CAL.open_close(s)[1] for s in ss]
+    q = pd.DataFrame({"bid": [1.0] * 6, "ask": [1.1] * 6}, index=pd.DatetimeIndex(snap))
+    portal = InMemoryPortal(bars={("XYZ", "1d"): under}, option_quotes={put.symbol: q},
+                            instruments={put.symbol: put})
+
+    class Wheel(Scripted):
+        def on_bar(self, ctx):
+            if ctx.session_date() == ss[0]:
+                ctx.order(put, -1, OrderType.LIMIT, limit_price=0.9, tif=TimeInForce.GTC, tag="csp")
+
+        def on_fill(self, ctx, fill):
+            self.fills.append((fill.liquidity, fill.instrument.symbol, fill.quantity, ctx.now,
+                               ctx.position("XYZ")))
+            if fill.liquidity == "ASSIGNMENT" and not fill.instrument.is_option:
+                ctx.order("XYZ", -100, OrderType.MOO, tag="sell_assigned")   # reacts without polling
+    st = Wheel()
+    r = Backtester(st, portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    asg = [f for f in st.fills if f[0] == "ASSIGNMENT"]
+    assert len(asg) == 2 and {f[1] for f in asg} == {put.symbol, "XYZ"}
+    assert all(f[3] == CAL.open_close(exp)[1] for f in asg)              # same step as the expiry
+    assert [f for f in asg if f[1] == "XYZ"][0][4] == 100                # position already updated
+    out = r.fills[r.fills.tag == "sell_assigned"]
+    assert len(out) == 1 and out.ts.iloc[0] == CAL.open_close(ss[5])[0]
 
 
 # =================================================================== misc
@@ -708,3 +746,400 @@ def test_requirements_universe_star_and_premarket_probe():
     uni = make("1m", universe=[], universe_name="U", requires=[Requirement("bars", "1m")])
     r = Backtester(uni(None), portal, zero_cost()).run(s, s)
     assert r.status == RunStatus.NOT_TESTABLE and "NOPE" in r.not_testable_reason
+
+
+def test_moc_exit_after_pending_moo_buy_is_not_a_short_sale():
+    portal, ss = daily_portal(FLAT * 2, borrow={"XYZ": (False, 0.0)})        # not shortable at all
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.order("XYZ", 100, OrderType.MOO, tag="in")
+            st.seen.append(ctx.order("XYZ", -100, OrderType.MOC, tag="out"))
+    st = make()(script)
+    r = Backtester(st, portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert st.seen[0].status != OrderStatus.REJECTED and not st.seen[0].is_short_sale
+    assert set(r.fills.tag) == {"in", "out"} and (r.positions.quantity == 0).all() if len(r.positions) else True
+
+
+def test_history_not_silently_truncated_by_cache_lookback():
+    df = synthetic_daily_bars("2022-01-03", "2023-06-30", seed=2)
+    portal = InMemoryPortal(bars={("XYZ", "1d"): df})
+
+    def script(ctx, st):
+        if not st.seen:
+            st.seen.append(len(ctx.history("XYZ", 200, "1d", adjusted=False)))
+            st.seen.append(len(ctx.history_arrays("XYZ", 200, "1d")["close"]))
+    st = make()(script)
+    Backtester(st, portal, zero_cost(lookback_sessions=60)).run("2023-03-01", "2023-03-10", raise_errors=True)
+    assert st.seen == [200, 200]
+
+
+def test_universe_name_fundamentals_requirement_not_testable():
+    import pandas as pd_
+    s = pd.Timestamp("2024-03-04")
+    portal, ss = daily_portal(FLAT, universes={"SP500": ["XYZ"]})
+    S = make(universe=[], universe_name="SP500", requires=[Requirement("fundamentals", "book_equity")])
+    r = Backtester(S(None), portal, zero_cost()).run(ss[0], ss[-1])
+    assert r.status == RunStatus.NOT_TESTABLE and "fundamentals" in r.not_testable_reason
+    fund = pd_.DataFrame({"symbol": ["XYZ"], "field": ["book_equity"], "value": [1.0],
+                          "period_end": [pd_.Timestamp("2023-12-31")], "known_at": [pd_.Timestamp("2024-02-01", tz="UTC")],
+                          "source": ["synthetic"]})
+    portal2, _ = daily_portal(FLAT, universes={"SP500": ["XYZ"]}, fundamentals=fund)
+    assert Backtester(S(None), portal2, zero_cost()).run(ss[0], ss[-1]).status == RunStatus.OK
+
+
+def test_fill_relative_bracket_children_anchor_to_actual_fill():
+    rows = [(100, 101, 99, 100), (103, 104, 102.5, 103.5), (103, 103.5, 100, 101), (101, 102, 100, 101)]
+    portal, ss = daily_portal(rows)
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket("XYZ", 100, stop_offset=2.0, target_fn=lambda px, side: px + side * 4.0)
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    o = r.diagnostics["orders"].set_index("tag")
+    assert o.loc["stop", "stop_price"] == pytest.approx(101.0)          # entry filled at 103 (gap), not 100
+    assert o.loc["target", "limit_price"] == pytest.approx(107.0)
+    stop = r.fills[r.fills.tag == "stop"].iloc[0]
+    assert stop.price == pytest.approx(101.0) and stop.ts >= CAL.open_close(ss[2])[0]
+    t = r.trades.iloc[0]
+    assert t.initial_risk == pytest.approx(200.0) and t.r_multiple == pytest.approx(-1.0)
+
+
+def test_not_testable_error_from_strategy_and_internal_orders_protected():
+    from atlasbt.core.types import NotTestableError
+    portal, ss = daily_portal(FLAT)
+
+    def boom(ctx, st):
+        raise NotTestableError("needs point-in-time index membership")
+    r = Backtester(make()(boom), portal, zero_cost(debug=False)).run(ss[0], ss[-1])
+    assert r.status == RunStatus.NOT_TESTABLE and "membership" in r.not_testable_reason
+    r2 = Backtester(make()(boom), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert r2.status == RunStatus.NOT_TESTABLE                 # a designed outcome, also with raise_errors
+
+    class EndCheck(make()):
+        def on_run_end(self, ctx):
+            raise NotTestableError("no cited announcements in window")
+    r3 = Backtester(EndCheck(None), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert r3.status == RunStatus.NOT_TESTABLE and "announcements" in r3.not_testable_reason
+
+    s = sessions("2024-03-04", 1)[0]
+    mdf = synthetic_intraday_bars(str(s.date()), str(s.date()), seed=4)
+
+    def script(ctx, st):
+        t = ctx.now_et()
+        if (t.hour, t.minute) == (10, 0):
+            ctx.order("XYZ", 100)
+        if (t.hour, t.minute) == (15, 55):
+            ctx.cancel_all()                                   # tries to kill the engine's flatten order
+            for o in ctx.open_orders():
+                ctx.cancel(o.id)
+    r = Backtester(make("1m", sizing="DAY_RISK")(script), InMemoryPortal(bars={("XYZ", "1m"): mdf}),
+                   zero_cost()).run(s, s, raise_errors=True)
+    assert len(r.fills[r.fills.tag == "flat_by"]) == 1
+    assert r.positions.empty or (r.positions.quantity == 0).all()
+
+
+def test_requirement_premarket_quotes_probe():
+    s = pd.Timestamp("2024-03-04")
+    o, c = CAL.open_close(s)
+    rth = pd.date_range(o, c, freq="1min", inclusive="left") + pd.Timedelta(seconds=5)
+    q = pd.DataFrame({"bid": 99.99, "ask": 100.01}, index=rth)
+    S = make("1m", requires=[Requirement("quotes", sessions=("PRE", "RTH"))])
+    r = Backtester(S(None), InMemoryPortal(quotes={"XYZ": q}), zero_cost()).run(s, s)
+    assert r.status == RunStatus.NOT_TESTABLE and "PRE" in r.not_testable_reason
+    pre = pd.date_range(et(s, "08:00"), o, freq="5min", inclusive="left")
+    q2 = pd.concat([pd.DataFrame({"bid": 99.9, "ask": 100.1}, index=pre), q])
+    assert Backtester(S(None), InMemoryPortal(quotes={"XYZ": q2}), zero_cost()).run(s, s).status == RunStatus.OK
+
+
+def test_pit_portal_whitelist_and_actions_fidelity():
+    from atlasbt.engine.pit import PITPortal
+    now = pd.Timestamp("2024-03-05 21:00", tz="UTC")
+
+    class _P(InMemoryPortal):
+        def risk_free_rate_info(self, as_of, tenor="3M"):
+            return (0.05, "DGS3MO", Fidelity.T1_BAR, pd.Timestamp(as_of).normalize())
+
+        def secret_raw_dump(self):
+            return "future"
+    acts = [CorporateAction("XYZ", ActionType.CASH_DIVIDEND, pd.Timestamp("2024-03-01"), pd.Timestamp("2024-02-01", tz="UTC"),
+                            amount=1.0, fidelity=Fidelity.T1_BAR),
+            CorporateAction("XYZ", ActionType.SPLIT, pd.Timestamp("2024-03-02"), pd.Timestamp("2024-02-01", tz="UTC"),
+                            ratio=2.0, fidelity=Fidelity.T2_PROXY)]
+    p = _P(actions=acts)
+    pit = PITPortal(p, lambda: now)
+    assert pit.risk_free_rate_info()[0] == 0.05
+    with pytest.raises(LookaheadError):
+        pit.risk_free_rate_info(as_of=now + pd.Timedelta(days=1))
+    with pytest.raises(AttributeError):
+        pit.secret_raw_dump()
+    assert p.fidelity_of("XYZ", "actions") == Fidelity.T2_PROXY
+
+
+# =================================================================== quote coverage (CRITICAL fix) & combos
+def test_auto_quote_mode_is_per_window_bars_elsewhere():
+    df = synthetic_daily_bars("2022-01-03", "2023-12-29", seed=5)
+    qday = pd.Timestamp("2023-06-15")
+    o, c = CAL.open_close(qday)
+    qt = pd.date_range(o, c, freq="10s", inclusive="left")
+    q = pd.DataFrame({"bid": 99.0, "ask": 99.02, "bid_size": 1e6, "ask_size": 1e6}, index=qt)
+    portal = InMemoryPortal(bars={("XYZ", "1d"): df}, quotes={"XYZ": q})
+
+    def script(ctx, st):
+        if ctx.session_date() == pd.Timestamp("2022-03-01"):
+            ctx.order("XYZ", 100, tag="bh")
+
+    def on_start(ctx, st):
+        if ctx.session_date() == qday:
+            ctx.order("XYZ", 10, tag="qday")
+    r = Backtester(make()(script, on_start=on_start), portal, zero_cost()).run("2022-03-01", "2023-12-29",
+                                                                               raise_errors=True)
+    bh = r.fills[r.fills.tag == "bh"].iloc[0]
+    assert bh.ts == CAL.open_close(pd.Timestamp("2022-03-02"))[0] and bh.quantity == 100
+    assert "fill source: bars" in bh.fidelity_reason
+    qf = r.fills[r.fills.tag == "qday"].iloc[0]
+    assert qf.price == 99.02 and qf.fidelity == int(Fidelity.T0_QUOTE) and "fill source: quotes" in qf.fidelity_reason
+
+
+def test_sparse_quote_day_falls_back_to_bars():
+    rows = [(100, 101, 99, 100)] * 3
+    portal0, ss = daily_portal(rows)
+    o, c = CAL.open_close(ss[1])
+    q = pd.DataFrame({"bid": 90.0, "ask": 90.02, "bid_size": 1e6, "ask_size": 1e6},
+                     index=pd.DatetimeIndex([o + pd.Timedelta(hours=2)]))          # 1 quote all day
+    portal = InMemoryPortal(bars={("XYZ", "1d"): synthetic_bars_from_rows(rows, "1d", session_dates=ss)},
+                            quotes={"XYZ": q})
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.order("XYZ", 100)
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    f = r.fills.iloc[0]
+    assert f.price == pytest.approx(100.0, abs=0.01) and "quotes sparse" in f.fidelity_reason
+
+
+def test_option_fill_accepts_t3_snapshots_and_rejects_locked():
+    ss = sessions("2024-03-04", 3)
+    under = synthetic_bars_from_rows([(100, 101, 99, 100)] * 3, "1d", session_dates=ss)
+    call = Instrument.option("XYZ", pd.Timestamp("2024-03-15"), 100.0, Right.CALL)
+    idx = [et(ss[1], "10:00"), et(ss[1], "11:00")]
+    q = pd.DataFrame({"bid": [2.0, 2.0], "ask": [2.0, 2.2], "fidelity": [int(Fidelity.T3_MODELED)] * 2},
+                     index=pd.DatetimeIndex(idx))
+    portal = InMemoryPortal(bars={("XYZ", "1d"): under}, option_quotes={call.symbol: q},
+                            instruments={call.symbol: call})
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.order(call, 1, tag="c")
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    f = r.fills.iloc[0]
+    assert f.ts == et(ss[1], "11:00") and f.price == 2.2 and f.fidelity == int(Fidelity.T3_MODELED)
+
+
+def test_strategy_config_overrides_whitelist():
+    portal, ss = daily_portal(FLAT)
+    ok = make(config_overrides={"option_lifecycle": "occ_no_early_assignment"})
+    bt = Backtester(ok(None), portal, zero_cost())
+    assert bt.lifecycle.early_assignment is False
+    assert bt.run(ss[0], ss[-1]).meta["config_overrides"] == {"option_lifecycle": "occ_no_early_assignment"}
+    bad = make(config_overrides={"fees": "NO_FEES"})
+    with pytest.raises(ValueError):
+        Backtester(bad(None), portal, zero_cost())
+
+
+def test_fill_relative_nan_target_skips_child_keeps_stop():
+    rows = [(100, 101, 99, 100), (100, 101, 99, 100), (100, 101, 95, 96), (96, 97, 95, 96)]
+    portal, ss = daily_portal(rows)
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket("XYZ", 100, stop_offset=3.0, target_fn=lambda px, side: float("nan"))
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert "target" not in set(r.diagnostics["orders"].tag)
+    assert any(e["action"] == "CHILD_SKIPPED" for e in r.diagnostics["order_events"])
+    assert len(r.fills[r.fills.tag == "stop"]) == 1
+
+
+def test_daily_bracket_time_exit_moc_and_moc_after_pending_buy():
+    rows = [(100, 101, 99, 100), (101, 102, 100, 101.5), (102, 103, 101, 102.5), (103, 104, 102, 103)]
+    portal, ss = daily_portal(rows)
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket("XYZ", 100, stop=90.0, time_exit_moc=ss[1])
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    f = r.fills.set_index("tag")
+    assert f.loc["entry", "ts"] == CAL.open_close(ss[1])[0]
+    assert f.loc["time_exit", "ts"] == CAL.open_close(ss[1])[1] and f.loc["time_exit", "price"] == 101.5
+    assert f.loc["time_exit", "liquidity"] == "AUCTION" and f.loc["time_exit", "quantity"] == -100
+    o = r.diagnostics["orders"].set_index("tag")
+    assert o.loc["stop", "status"] == "CANCELLED"                  # OCO with the MOC exit
+    # time_exit_moc=True uses the session of time_exit (two sessions later)
+    def script2(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.bracket("XYZ", 100, stop=90.0, time_exit=ss[2], time_exit_moc=True)
+    r2 = Backtester(make()(script2), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    f2 = r2.fills.set_index("tag")
+    assert f2.loc["time_exit", "ts"] == CAL.open_close(ss[2])[1] and f2.loc["time_exit", "price"] == 102.5
+    # the stop trades first intrabar: the MOC leg is cancelled, never flips the position
+    portal3, ss3 = daily_portal([(100, 101, 99, 100), (101, 102, 85, 95), (95, 96, 94, 95)])
+
+    def script3(ctx, st):
+        if ctx.session_date() == ss3[0]:
+            ctx.bracket("XYZ", 100, stop=90.0, time_exit_moc=ss3[1])
+    r3 = Backtester(make()(script3), portal3, zero_cost()).run(ss3[0], ss3[-1], raise_errors=True)
+    assert list(r3.fills["tag"]) == ["entry", "stop"]
+    assert r3.fills["quantity"].sum() == 0
+    o3 = r3.diagnostics["orders"].set_index("tag")
+    assert o3.loc["time_exit", "status"] == "CANCELLED"
+
+
+def test_same_close_moc_exit_of_pending_market_buy_not_short():
+    """S114 pattern: pending market buy (fills at next open) and an MOC exit for
+    that session's close, with the stock not shortable: the exit is a long sale."""
+    portal, ss = daily_portal(FLAT * 2, borrow={"XYZ": (False, 0.0)})
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.order("XYZ", 100, tag="in")
+            st.seen.append(ctx.order("XYZ", -100, OrderType.MOC, tag="out"))
+    st = make()(script)
+    r = Backtester(st, portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert not st.seen[0].is_short_sale and st.seen[0].status == OrderStatus.FILLED
+    assert list(r.fills.tag) == ["in", "out"]
+    assert r.fills.ts.iloc[1] == CAL.open_close(ss[1])[1]
+
+
+def test_combo_legs_use_instrument_master_adjusted_deliverable():
+    from dataclasses import replace as dc_replace
+    ss = sessions("2024-06-17", 5)
+    exp = ss[-1]
+    under = synthetic_bars_from_rows([(80, 81, 79, 80)] * 5, "1d", session_dates=ss)
+    c60 = Instrument.option("XYZ", exp, 60.0, Right.CALL)          # strategy-built: default deliverable 100
+    c90 = Instrument.option("XYZ", exp, 130.0, Right.CALL)   # 1.5 x 80 = 120 < 130: OTM
+    m60 = dc_replace(c60, deliverable_shares=150.0, tick_size=0.05)  # adjusted contract in the master
+    m90 = dc_replace(c90, deliverable_shares=150.0, tick_size=0.05)
+    snap = [CAL.open_close(s)[1] for s in ss]
+    q60 = pd.DataFrame({"bid": [29.9] * 5, "ask": [30.1] * 5}, index=pd.DatetimeIndex(snap))
+    q90 = pd.DataFrame({"bid": [0.5] * 5, "ask": [0.6] * 5}, index=pd.DatetimeIndex(snap))
+    portal = InMemoryPortal(bars={("XYZ", "1d"): under}, option_quotes={c60.symbol: q60, c90.symbol: q90},
+                            instruments={c60.symbol: m60, c90.symbol: m90})
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            st.seen.append(ctx.submit(Order(None, 1, OrderType.COMBO, limit_price=30.0,
+                                            legs=(Leg(c60, 1), Leg(c90, -1)), tif=TimeInForce.GTC, tag="spread")))
+            bad = dc_replace(c60, multiplier=10.0)                    # contradicts the master
+            st.seen.append(ctx.submit(Order(None, 1, OrderType.COMBO, limit_price=30.0,
+                                            legs=(Leg(bad, 1), Leg(c90, -1)), tag="bad")))
+    st = make()(script)
+    r = Backtester(st, portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert st.seen[1].status == OrderStatus.REJECTED and "multiplier" in st.seen[1].reject_reason
+    assert st.seen[0].legs[0].instrument.deliverable_shares == 150.0
+    ev = {e["option"]: e for e in r.diagnostics["option_events"]}
+    assert ev[c90.symbol]["kind"] == "EXPIRE_WORTHLESS"
+    assert ev[c60.symbol]["kind"] == "EXERCISE" and ev[c60.symbol]["underlying_qty"] == 150
+    last = r.positions[r.positions.ts == r.equity.index[-1]].set_index("symbol")
+    assert last.loc["XYZ", "quantity"] == 150
+    led = r.ledger
+    assert led[led.reason == "OPTION_EXERCISE"].amount.sum() == pytest.approx(-60.0 * 100)
+
+
+def test_inmemory_portal_fidelity_overrides():
+    from atlasbt.core.types import Fidelity as F
+    portal, ss = daily_portal(FLAT, fidelity={("XYZ", "options", "1d"): F.T3_MODELED, ("*", "bars"): F.T2_PROXY})
+    assert portal.fidelity_of("XYZ", "bars", "1d") == F.T2_PROXY
+    assert portal.fidelity_of("XYZ", "bars") == F.T2_PROXY
+    assert portal.fidelity_of("ABC", "bars", "1d") == F.NA                 # no data: still NA
+    c = Instrument.option("XYZ", ss[-1], 100.0, Right.CALL)
+    q = pd.DataFrame({"bid": [1.0], "ask": [1.1]}, index=pd.DatetimeIndex([CAL.open_close(ss[0])[1]]))
+    p2 = InMemoryPortal(option_quotes={c.symbol: q}, instruments={c.symbol: c},
+                        fidelity={("XYZ", "options", "1d"): F.T3_MODELED})
+    assert p2.fidelity_of("XYZ", "options", "1d") == F.T3_MODELED
+    assert p2.fidelity_of("XYZ", "options", "1m") == F.T1_BAR             # default when not configured
+
+
+def _short_put_run(quotes_by_day):
+    """Short 1 American 100P (exp ~6 weeks), stock 100 -> 80 from session 2; rf 5%
+    (carry ≈ 100(1-e^{-rT}) ≈ 0.5). ``quotes_by_day``: {session index: (bid, ask)}."""
+    ss = sessions("2024-03-04", 6)
+    exp = pd.Timestamp("2024-04-19")
+    under = synthetic_bars_from_rows([(100, 101, 99, 100)] * 2 + [(80, 81, 79, 80)] * 4, "1d", session_dates=ss)
+    put = Instrument.option("XYZ", exp, 100.0, Right.PUT)
+    idx = sorted(quotes_by_day)
+    q = pd.DataFrame({"bid": [quotes_by_day[i][0] for i in idx], "ask": [quotes_by_day[i][1] for i in idx],
+                      "fidelity": [int(quotes_by_day[i][2]) if len(quotes_by_day[i]) > 2 else 2 for i in idx]},
+                     index=pd.DatetimeIndex([CAL.open_close(ss[i])[1] for i in idx]))
+    portal = InMemoryPortal(bars={("XYZ", "1d"): under}, option_quotes={put.symbol: q},
+                            instruments={put.symbol: put}, rf=0.05)
+
+    def script(ctx, st):
+        if ctx.session_date() == ss[0]:
+            ctx.order(put, -1, OrderType.LIMIT, limit_price=1.8, tif=TimeInForce.GTC, tag="short_put")
+    r = Backtester(make()(script), portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    return r, ss, put
+
+
+def test_stale_mark_itm_put_not_early_assigned_when_same_day_extrinsic_exceeds_carry():
+    from atlasbt.core.types import Fidelity as F
+    # entry quote on day 1 (mid 2.0), nothing on day 2 (only the stale 2.0 mark), then same-day
+    # model snapshots (T3) worth 22.5 = intrinsic 20 + extrinsic 2.5 > carry
+    r, ss, put = _short_put_run({1: (1.9, 2.1), 3: (22.4, 22.6, F.T3_MODELED), 4: (22.4, 22.6, F.T3_MODELED)})
+    assert len(r.fills[r.fills.tag == "short_put"]) == 1
+    assert not [e for e in r.diagnostics["option_events"] if e["kind"] == "ASSIGNMENT"]
+    last = r.positions[r.positions.ts == r.equity.index[-1]].set_index("symbol")
+    assert last.loc[put.symbol, "quantity"] == -1 and "XYZ" not in last.index
+    assert any("no same-session option mark" in x["reason"] for x in r.fidelity["reasons"])
+
+
+def test_deep_itm_put_with_same_session_mark_is_early_assigned():
+    r, ss, put = _short_put_run({1: (1.9, 2.1), 2: (20.0, 20.1), 3: (20.0, 20.1)})
+    ev = [e for e in r.diagnostics["option_events"] if e["kind"] == "ASSIGNMENT"]
+    assert len(ev) == 1 and ev[0]["ts"] == CAL.open_close(ss[2])[1]      # first close deep ITM, same-day mark
+    last = r.positions[r.positions.ts == r.equity.index[-1]].set_index("symbol")
+    assert last.loc["XYZ", "quantity"] == 100 and put.symbol not in last.index
+
+
+def test_inmemory_portal_events_fidelity_not_canonicalised_as_freq():
+    from atlasbt.core.types import Fidelity as F, MarketEvent
+    t = pd.Timestamp("2024-03-01", tz="UTC")
+    p = InMemoryPortal(events=[MarketEvent("EARNINGS", "XYZ", t, t, {}, F.T1_BAR),
+                               MarketEvent("EARNINGS", "ABC", t, t, {}, F.T2_PROXY)])
+    assert p.fidelity_of("*", "events", "EARNINGS") == F.T2_PROXY
+    assert p.fidelity_of("XYZ", "events", "EARNINGS") == F.T1_BAR
+    assert p.fidelity_of("*", "events", "FOMC") == F.NA
+    portal, ss = daily_portal(FLAT, events=[MarketEvent("EARNINGS", "XYZ", t, t, {}, F.T1_BAR)])
+    S = make(requires=[Requirement("events", "EARNINGS", symbols=("*",))])
+    assert Backtester(S(None), portal, zero_cost()).run(ss[0], ss[-1]).status == RunStatus.OK
+
+
+def test_universe_coverage_filters_members_without_data_and_min_coverage():
+    ss = sessions("2024-03-04", 3)
+    bars = {(f"S{i:02d}", "1d"): synthetic_bars_from_rows(FLAT, "1d", session_dates=ss) for i in range(39)}
+    members = [f"S{i:02d}" for i in range(40)]             # S39 has no data: coverage 39/40 = 97.5%
+    portal = InMemoryPortal(bars=bars, universes={"SP500": members})
+
+    def script(ctx, st):
+        st.seen.append(list(ctx.portal().universe("SP500")))
+    S = make(universe=[], universe_name="SP500")
+    st = S(script)
+    r = Backtester(st, portal, zero_cost()).run(ss[0], ss[-1], raise_errors=True)
+    assert r.status == RunStatus.OK
+    assert all("S39" not in u and len(u) == 39 for u in st.seen)
+    cov = r.meta["universe_coverage"]
+    assert cov["coverage_min"] == pytest.approx(0.975) and "S39" in cov["dropped"]
+    assert len(cov["series"]) == 3 and "excluded" in r.meta["survivorship_bias"]
+    assert any("universe SP500 coverage 97.5%" in x["reason"] for x in r.fidelity["reasons"])
+    # strict: 1.0 reproduces the old all-members rule
+    r2 = Backtester(S(script), portal, zero_cost(min_universe_coverage=1.0)).run(ss[0], ss[-1])
+    assert r2.status == RunStatus.NOT_TESTABLE and "coverage 97.5%" in r2.not_testable_reason
+    # coverage dropping below the minimum at a later rebalance session -> NOT_TESTABLE
+    late = InMemoryPortal(bars=bars, universes={"SP500": members[:39]})
+    orig = late.universe
+
+    def universe(name, as_of):
+        extra = [f"X{i}" for i in range(5)] if pd.Timestamp(as_of) >= CAL.open_close(ss[2])[0] else []
+        return orig(name, as_of) + extra                     # 5 new members without data: 39/44
+    late.universe = universe
+    r3 = Backtester(S(script), late, zero_cost()).run(ss[0], ss[-1])
+    assert r3.status == RunStatus.NOT_TESTABLE and "coverage 88.6%" in r3.not_testable_reason

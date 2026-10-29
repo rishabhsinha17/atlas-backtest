@@ -540,7 +540,7 @@ class QuoteFillModel:
             # displayed size is consumed across orders in priority (order id) order
             left = {True: q.ask_size, False: q.bid_size}
             for o, ex in get_orders():
-                if ex.eligible_ns >= q.ts:
+                if max(ex.eligible_ns, getattr(ex, "quote_eligible_ns", 0) or 0) >= q.ts:
                     continue
                 if not session_allows(q.sess, getattr(ex, "outside_rth", False)):
                     continue
@@ -575,7 +575,7 @@ class QuoteFillModel:
                             ok = touch <= o.limit_price if buy else touch >= o.limit_price
                 if not ok:
                     continue
-                reasons = ["NBBO quote fill"]
+                reasons = ["NBBO quote fill", "fill source: quotes"]
                 liq = "TAKER"
                 px = touch
                 if (not buy) and mkt.short_sale_state is not None and not o.is_short_sale:
@@ -718,6 +718,8 @@ class ComboConfig:
     price_improvement: float = 0.0             # fraction of (natural -> mid) captured, 0 = natural
     snapshot_tolerance: pd.Timedelta = pd.Timedelta(0)
     max_spread_frac: float = 2.0               # skip quotes with spread > 200% of mid (bad prints)
+    reject_locked: bool = True                 # locked/crossed (ask <= bid) snapshots: wait for the next valid one
+    stock_quote_max_age: pd.Timedelta = pd.Timedelta(seconds=5)   # stock leg quote sync window
 
 
 class ComboFillModel:
@@ -759,6 +761,8 @@ class ComboFillModel:
         for leg, q in legs:
             if not (q.bid >= 0 and q.ask > 0 and q.ask >= q.bid):
                 return "WAIT", [], float("nan"), f"invalid quote {leg.instrument.symbol}"
+            if self.cfg.reject_locked and leg.instrument.is_option and q.bid > 0 and q.ask <= q.bid:
+                return "WAIT", [], float("nan"), f"locked/crossed quote {leg.instrument.symbol}: waiting"
             mid = 0.5 * (q.bid + q.ask)
             if mid > 0 and (q.ask - q.bid) / mid > self.cfg.max_spread_frac:
                 return "WAIT", [], float("nan"), f"quote too wide {leg.instrument.symbol}"

@@ -206,6 +206,11 @@ class MarketData:
         self._daily[symbol] = st
         return st
 
+    def may_be_truncated(self, b: BarArrays) -> bool:
+        """True if the cache window may cut off older history (data starts at
+        the cache's load boundary or nothing was loaded)."""
+        return b.n == 0 or int(b.start[0]) <= int((self.range_start + pd.Timedelta(days=5)).value)
+
     # ------------------------------------------------------------- guarded access
     def check(self, hi_ns: int) -> None:
         if hi_ns > self.now_ns:

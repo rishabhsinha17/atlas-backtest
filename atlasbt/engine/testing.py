@@ -61,7 +61,14 @@ class InMemoryPortal:
                  default_borrow: Optional[tuple[bool, float]] = (True, 0.003),
                  universes: Optional[Mapping[str, list[str]]] = None,
                  fundamentals: Optional[pd.DataFrame] = None,
-                 calendar: Optional[NYSECalendar] = None):
+                 calendar: Optional[NYSECalendar] = None,
+                 fidelity: Optional[Mapping[tuple, Fidelity]] = None):
+        """``fidelity``: per-dataset tier overrides for ``fidelity_of``, keyed
+        ``(symbol, kind, freq)`` or ``(symbol, kind)``; ``symbol`` may be ``"*"``
+        (e.g. ``{("SPX", "options", "1d"): Fidelity.T3_MODELED}``). Most
+        specific key wins; without a key: quotes T0, everything else T1,
+        actions = worst action."""
+        self._fid_over = {tuple(k): Fidelity(v) for k, v in (fidelity or {}).items()}
         self._bars: dict[tuple[str, str], pd.DataFrame] = {}
         for (sym, fq), df in (bars or {}).items():
             self._bars[(sym, canonical_freq(fq))] = self._normalize_bars(df, fq)
@@ -223,6 +230,21 @@ class InMemoryPortal:
     def fidelity_of(self, symbol: str, kind: str, freq: Optional[str] = None) -> Fidelity:
         if not self.has(symbol, kind, freq):
             return Fidelity.NA
+        try:
+            fq = canonical_freq(freq) if freq and kind in ("bars", "options", "quotes") else freq
+        except Exception:
+            fq = freq
+        for key in ((symbol, kind, fq), (symbol, kind, freq), (symbol, kind), ("*", kind, fq), ("*", kind, freq),
+                    ("*", kind)):
+            if key in self._fid_over:
+                return self._fid_over[key]
+        if kind == "events":        # worst fidelity among matching events of that kind
+            fids = [int(e.fidelity) for e in self._events
+                    if (symbol == "*" or e.symbol == symbol) and (freq is None or e.kind == freq)]
+            return Fidelity(max(fids)) if fids else Fidelity.NA
+        if kind == "actions":       # worst fidelity among the symbol's actions
+            fids = [int(a.fidelity) for a in self._actions if symbol == "*" or a.symbol == symbol]
+            return Fidelity(max(fids)) if fids else Fidelity.NA
         return Fidelity.T0_QUOTE if kind == "quotes" else Fidelity.T1_BAR
 
     # ------------------------------------------------------------ actions/events
