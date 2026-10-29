@@ -104,6 +104,7 @@ class Instrument:
     multiplier: float = 1.0
     currency: str = "USD"
     tick_size: float = 0.01                # min price increment (Reg NMS: $0.0001 below $1)
+    exchange: Optional[str] = None         # primary listing venue (e.g. 'NYSE','NASDAQ','AMEX','ARCA'); PIT where known
     # option-only fields
     underlying: Optional[str] = None
     expiry: Optional[pd.Timestamp] = None  # last trading day (date, ET); settlement per `settlement`
