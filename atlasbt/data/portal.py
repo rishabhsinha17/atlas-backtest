@@ -100,7 +100,26 @@ class Portal:
     def clear_cache(self):
         self._cache.clear()
 
+    def resolve_symbol(self, symbol: str, as_of=None) -> tuple[str, Optional[int], Optional[str]]:
+        """THE key resolver used by every Portal entry point: -> (ticker, cik or None, store
+        symbol). A security key 'T~CIK..' maps to store files filed under T only when they belong
+        to that issuer: ticker-keyed CURRENT stores (Yahoo intraday, quotes, borrow, directory)
+        when the key's CIK is T's current registrant (as_of None); date-stamped stores (DoltHub
+        option chains) when T denoted the key's CIK at as_of. Otherwise store symbol = None."""
+        t, kc = self._split_key(symbol)
+        if kc is None:
+            return t, None, t
+        if as_of is None:
+            ok = self.identity_index().cik_now(t) in (kc, None)
+        else:
+            c, _, _ = self._identity_by_date(t, [_session_date(_utc(as_of))])
+            ok = int(c[0]) == kc
+        return t, kc, (t if ok else None)
+
     def _bar_source(self, symbol: str, freq: str, source: Optional[str] = None) -> Optional[str]:
+        symbol = self.resolve_symbol(symbol)[2]
+        if symbol is None:
+            return None
         kind = f"bars_{freq}"
         if source:
             return source if self.store.exists(kind, source, symbol) else None
@@ -230,6 +249,27 @@ class Portal:
                 d.setdefault("sector", None)
                 if not d.get("sector"):
                     d["sector"] = r.get("gics_sector")
+        # every S&P member exactly as universe() spells it (security keys included), resolved for
+        # THAT issuer by CIK: a reused / renamed ticker's current SEC row describes another company
+        cur_by_cik = {}
+        if len(cur):
+            for r in cur.to_dict("records"):
+                ck = pd.to_numeric(r.get("cik"), errors="coerce")
+                if pd.notna(ck):
+                    cur_by_cik[int(ck)] = r
+        if self.store.exists("reference", "sp500", "membership"):
+            sess = _session_date(as_of)
+            for k in self.universe("SP500", as_of):
+                t, kc = self._split_key(k)
+                c = kc
+                if c is None:
+                    ci, _, _ = self._identity_by_date(t, [sess])
+                    c = int(ci[0]) or None
+                prev = rows.get(k)
+                if prev is not None and c is not None and pd.notna(prev.get("cik")) and int(prev["cik"]) == c \
+                        and isinstance(prev.get("sector"), str) and prev.get("sector"):
+                    continue
+                rows[k] = self._member_master_row(k, t, c, sess, cur_by_cik)
         for etf, (sector, inception) in U.SECTOR_SPDRS.items():
             rows.setdefault(etf, {"symbol": etf, "name": f"Select Sector SPDR {sector}"})
         for s in U.CORE_ETFS:
@@ -238,20 +278,35 @@ class Portal:
         df["asset_class"] = [("ETF" if self._is_etf(s) else "STK") for s in df["symbol"]]
         df["sector_etf"] = [U.sector_etf_for(sec, as_of) if isinstance(sec, str) else None
                             for sec in df.get("sector", pd.Series([None] * len(df)))]
-        members = {k.split("~")[0] for k in self.universe("SP500", as_of)} \
-            if self.store.exists("reference", "sp500", "membership") else set()
+        uk = set(self.universe("SP500", as_of)) if self.store.exists("reference", "sp500", "membership") else set()
+        members = uk | {k.split("~")[0] for k in uk if "~" not in k}
         df["in_sp500"] = df["symbol"].isin(members)
+        if "sector_unknown_reason" not in df.columns:
+            df["sector_unknown_reason"] = None
+        df["sector_unknown_reason"] = df["sector_unknown_reason"].astype(object)
+        miss = df["sector"].isna() & df["sector_unknown_reason"].isna()
+        df.loc[miss, "sector_unknown_reason"] = "no SIC / GICS classification available"
         # primary listing venue at as_of: mover table (PIT) where known, else the current Nasdaq
         # Trader directory -- flagged inferred when as_of precedes the directory snapshot
-        ven = [self.exchange_at(sym, as_of) for sym in df["symbol"]]
+        def _ven(sym):
+            t_, kc_ = self._split_key(sym)
+            if kc_ is not None and self.identity_index().cik_now(t_) not in (kc_, None):
+                return (None, "unknown: issuer is not the ticker's current registrant", True)
+            return self.exchange_at(sym, as_of)
+        ven = [_ven(sym) for sym in df["symbol"]]
         df["exchange_pit"] = [v[0] for v in ven]
         df["exchange_source"] = [v[1] for v in ven]
         df["exchange_inferred"] = [v[2] for v in ven]
         firsts, lasts = [], []
         for s in df["symbol"]:
-            src = self._bar_source(s, "1d")
-            if src:
-                b = self._read("bars_1d", src, s, columns=["known_at"])
+            t_, kc_ = self._split_key(s)
+            if kc_ is not None:
+                b = self._identity_any(s)          # the key's verified series
+                b = b[["known_at"]] if len(b) else b
+            else:
+                src = self._bar_source(s, "1d")
+                b = self._read("bars_1d", src, s, columns=["known_at"]) if src else pd.DataFrame()
+            if len(b):
                 b = b[b["known_at"] <= as_of]
                 firsts.append(b.index[0] if len(b) else pd.NaT)
                 lasts.append(b.index[-1] if len(b) else pd.NaT)
@@ -263,6 +318,46 @@ class Portal:
         df.attrs.update({"source": "sec+wikipedia+nasdaqtrader", "fidelity": int(Fidelity.T2_PROXY),
                          "pit_note": "SIC/GICS are current classifications, not point-in-time"})
         return df.sort_values("symbol").reset_index(drop=True)
+
+    def _cik_submissions(self, cik: int) -> dict:
+        """Cached SEC submissions JSON of a registrant (cache-only; {} if not precached)."""
+        key = ("cik_submissions", int(cik))
+        if key not in self._cache:
+            import json
+            from .http import FetchError, client
+            try:
+                b = client().get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", allow_404=True,
+                                 ttl=None, cache_only=True)
+                self._cache[key] = json.loads(b) if b else {}
+            except (FetchError, ValueError):
+                self._cache[key] = {}
+        return self._cache[key]
+
+    def _member_master_row(self, key: str, ticker: str, cik, sess, cur_by_cik: dict) -> dict:
+        from .identity import cik_name_at
+        row = {"symbol": key, "name": None, "cik": cik, "sic": None, "sic_description": None, "sector": None,
+               "exchange": None, "sector_unknown_reason": None}
+        if not cik:
+            row["sector_unknown_reason"] = "issuer (CIK) not established for this member on as_of"
+            return row
+        sub = self._cik_submissions(int(cik))
+        row["name"] = cik_name_at(int(cik), sess) or sub.get("name")
+        sic = sub.get("sic")
+        row["sic"] = int(sic) if str(sic or "").isdigit() else None
+        row["sic_description"] = sub.get("sicDescription")
+        row["sector"] = U.sic_to_sector(row["sic"]) if row["sic"] else None
+        exch = sub.get("exchanges") or []
+        row["exchange"] = ",".join(e for e in exch if e) or None
+        cr = cur_by_cik.get(int(cik))
+        if cr is not None:
+            row["gics_sector_current"] = cr.get("gics_sector")
+            row["gics_sub_industry_current"] = cr.get("gics_sub_industry")
+            if not row["sector"]:
+                row["sector"] = cr.get("gics_sector")
+        if not row["sector"]:
+            row["sector_unknown_reason"] = ("SEC submissions not cached for this CIK" if not sub else
+                                            f"SIC {sic!r} has no sector mapping")
+        return row
 
     def universe(self, name: str, as_of, require_bars: bool = False) -> list[str]:
         """Members at as_of. require_bars=True keeps only members for which bars(sym, '1d', ...,
@@ -1124,6 +1219,7 @@ class Portal:
 
     def quotes(self, symbol: str, start, end, as_of, source: Optional[str] = None) -> pd.DataFrame:
         as_of, start, end = _utc(as_of), _utc(start), _utc(end)
+        symbol = self.resolve_symbol(symbol)[2] or "~none~"
         for s in ((source,) if source else QUOTE_SOURCES):
             if self.store.exists("quotes", s, symbol):
                 q = self.store.read("quotes", s, symbol, start=start, end=min(end, as_of + pd.Timedelta(microseconds=1)))
@@ -1162,7 +1258,10 @@ class Portal:
             if not self.store.symbols("fundamentals", "sec"):
                 return set()
             return {f + sfx for f in FIELD_MAP for sfx in ("", "_q", "_fy", "_ytd")}
-        f = self._read("fundamentals", "sec", symbol, columns=["field"])
+        fs = self._fund_symbol(symbol)
+        if fs is None:
+            return set()
+        f = self._read("fundamentals", "sec", fs, columns=["field"])
         return set(f["field"]) if len(f) else set()
 
     def bars_coverage(self, symbol: str, start, end, as_of, freq: str = "1d") -> dict:
@@ -1211,7 +1310,7 @@ class Portal:
                 return False                      # e.g. BUYBACK, HALT: no source integrated
             if any_sym or k in ("FOMC", "FOMC_SCHEDULE"):
                 return True
-            return symbol.upper() in self._event_symbols(k)
+            return self._split_key(symbol)[0] in self._event_symbols(k)
         if kind == "fundamentals":
             fields = self._fundamental_fields(None if any_sym else symbol)
             return bool(fields) and (freq is None or freq in fields)
@@ -1246,14 +1345,15 @@ class Portal:
                 tags = self._session_tags(symbol, fr, self._bar_source(symbol, fr))
                 return set(sessions) <= tags
             return True
+        ss_ = self.resolve_symbol(symbol)[2]
         if kind == "quotes":
-            return any(self.store.exists("quotes", s, symbol) for s in QUOTE_SOURCES)
+            return ss_ is not None and any(self.store.exists("quotes", s, ss_) for s in QUOTE_SOURCES)
         if kind == "options":
             return bool(self._option_sources(symbol, freq))
         if kind == "actions":
             return len(self._actions_frame(symbol)) > 0
         if kind == "borrow":
-            return self.store.exists("borrow", "iborrowdesk", symbol)
+            return ss_ is not None and self.store.exists("borrow", "iborrowdesk", ss_)
         return False
 
     def _session_tags(self, symbol: str, freq: str, src: str) -> set:
@@ -1267,18 +1367,26 @@ class Portal:
                     sessions: Optional[Sequence[str]] = None) -> Fidelity:
         if kind == "bars" and sessions and freq and freq != "1d" and not self.has(symbol, "bars", freq, sessions):
             return Fidelity.NA
+        t_, kc_, ss_ = self.resolve_symbol(symbol)
+        if kind == "bars" and (freq or "1d") == "1d" and symbol not in ("*", None, "") and \
+                (kc_ is not None or not self._is_plain(t_)):
+            # stocks / security keys: the identity-verified series decides (same as has / bars)
+            f = self._identity_any(symbol)
+            if not len(f):
+                return Fidelity.NA
+            return SOURCE_FIDELITY.get(str(f.attrs.get("source") or "yahoo").split("+")[0], Fidelity.T1_BAR)
         if kind == "bars":
             src = self._bar_source(symbol, freq or "1d")
             if src is None and (freq or "1d") not in ("1d", "1m"):
                 src = self._bar_source(symbol, "1m")
             if src is None and freq and freq != "1d" and any(
-                    self.store.exists(f"bars_{freq}", s, symbol) or self.store.exists("bars_1m", s, symbol)
+                    ss_ is not None and (self.store.exists(f"bars_{freq}", s, ss_) or self.store.exists("bars_1m", s, ss_))
                     for s in PROXY_INTRADAY_SOURCES):
                 return Fidelity.T2_PROXY       # only CFD proxy bars exist (opt-in)
             return SOURCE_FIDELITY.get(src, Fidelity.T1_BAR) if src else Fidelity.NA
         if kind == "quotes":
             for s in QUOTE_SOURCES:
-                if self.store.exists("quotes", s, symbol):
+                if ss_ is not None and self.store.exists("quotes", s, ss_):
                     return QUOTE_FIDELITY[s]
             return Fidelity.NA
         if kind == "options":
@@ -1487,7 +1595,8 @@ class Portal:
         attrs['synthetic'] = True. Real and synthetic rows are never mixed in one frame."""
         as_of = _utc(as_of)
         u = underlying.upper()
-        df, src = self._chain_frame(u, as_of)
+        su = self.resolve_symbol(u, as_of)[2]
+        df, src = self._chain_frame(su, as_of) if su is not None else (pd.DataFrame(), "")
         if not df.empty:
             ts = df["ts"].max()
             if (as_of - ts).total_seconds() / 86400 <= self.MAX_CHAIN_STALE_DAYS or not synthetic:
@@ -1628,6 +1737,10 @@ class Portal:
         and timestamped quote snapshots (kind option_quotes, e.g. Databento OPRA when keyed)."""
         eod = freq in (None, "1d", "1D", "EOD", "eod")
         kinds = ["option_chain"] if eod else [f"option_bars_{freq}", "option_quotes"]
+        if symbol not in ("*", None, ""):
+            symbol = self.resolve_symbol(symbol)[2]
+            if symbol is None:
+                return []
         out = []
         for k in kinds:
             for src in self.store.sources(k):
@@ -1749,8 +1862,11 @@ class Portal:
 
     def borrow(self, symbol: str, as_of) -> tuple[bool, float, Fidelity]:
         from .providers import borrow as B
-        if self.has(symbol, "borrow"):
-            b = self._read("borrow", "iborrowdesk", symbol)
+        orig = symbol
+        ss = self.resolve_symbol(symbol)[2]
+        symbol = self._split_key(symbol)[0]
+        if ss is not None and self.has(ss, "borrow"):
+            b = self._read("borrow", "iborrowdesk", ss)
             if len(b) and "fee" in b.columns and "time" in b.columns:
                 t = pd.to_datetime(b["time"], utc=True)
                 b = b[t <= _utc(as_of)]
@@ -1760,7 +1876,8 @@ class Portal:
                     return avail, fee, Fidelity.T1_BAR
         member = False
         try:
-            member = symbol.upper() in set(self.universe("SP500", as_of))
+            uk = set(self.universe("SP500", as_of))
+            member = orig.upper() in uk or symbol.upper() in {k.split("~")[0] for k in uk}
         except Exception:
             pass
         return B.default_fee(symbol, is_etf=self._is_etf(symbol), is_index_member=member)

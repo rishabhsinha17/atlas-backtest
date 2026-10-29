@@ -343,3 +343,45 @@ def test_membership_continuity_and_stub_cases(portal, sym, day, sid, lo, hi):
     b = portal.bars(sym, "1d", pd.Timestamp(day), pd.Timestamp(day) + pd.Timedelta(days=1), ASOF)
     assert len(b) == 1 and b.attrs["security_id"] == sid and lo < float(b["close"].iloc[0]) < hi, \
         (float(b["close"].iloc[0]) if len(b) else None, b.attrs.get("security_id"))
+
+
+@pytest.mark.parametrize("day", ["1998-06-30", "2003-06-30", "2008-06-30", "2013-06-28", "2019-06-28", "2025-06-30"])
+def test_security_master_covers_every_universe_member(portal, day):
+    """Coordinator: security_master(as_of) has one row per universe('SP500') member exactly as
+    spelled (security keys included), resolved for that issuer by CIK, with a sector or an explicit
+    sector_unknown_reason; members that bars() can serve always have a sector."""
+    a = pd.Timestamp(day + " 21:00", tz="UTC")
+    u = portal.universe("SP500", a)
+    sm = portal.security_master(a).set_index("symbol")
+    assert not [k for k in u if k not in sm.index]
+    sub = sm.loc[u]
+    assert (sub["sector"].notna() | sub["sector_unknown_reason"].notna()).all()
+    for k in [k for k in u if "~CIK" in k][:20]:
+        assert int(sub.loc[k, "cik"]) == int(k.split("~CIK")[1])
+    unknown = sub[sub["sector"].isna()].index
+    served = [k for k in unknown if portal.has(k, "bars", "1d", start=a - pd.Timedelta(days=8), end=a, as_of=a)]
+    assert not served, f"tradable members without sector: {served[:10]}"
+
+
+@pytest.mark.parametrize("day", ["2003-06-30", "2012-06-29", "2019-06-28", "2025-06-30"])
+def test_key_resolution_consistent_for_all_members(portal, day):
+    """Coordinator (BLOCKING): for EVERY universe('SP500') member at several dates: windowed has()
+    equals 'bars() serves >= 1 bar'; fidelity_of(member, 'bars', '1d') != NA whenever has() is
+    True; a security_master row exists; instrument() keeps the spelling."""
+    from atlasbt.core.types import DataUnavailableError, Fidelity
+    a = pd.Timestamp(day + " 21:00", tz="UTC")
+    s0 = a - pd.Timedelta(days=8)
+    u = portal.universe("SP500", a)
+    sm = set(portal.security_master(a)["symbol"])
+    bad = []
+    for k in u:
+        try:
+            served = len(portal.bars(k, "1d", s0, a, a)) > 0
+        except DataUnavailableError:
+            served = False
+        h = portal.has(k, "bars", "1d", start=s0, end=a, as_of=a)
+        f = portal.fidelity_of(k, "bars", "1d")
+        if h != served or (h and f == Fidelity.NA) or (portal.has(k, "bars", "1d") and f == Fidelity.NA) \
+                or k not in sm or portal.instrument(k).symbol != k:
+            bad.append((k, h, served, int(f), k in sm))
+    assert not bad, bad[:10]

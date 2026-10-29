@@ -477,7 +477,12 @@ kept outside the cache (scratch) and can be deleted after loading.
   period_end >= start): symbol, field, value, period_start, period_end, fiscal_period, fy, form,
   known_at, accn, concept, duration_days, source -- for PIT TTM / YoY rebuilding.
 * `borrow()`, `security_master(as_of)` (SIC sector, current GICS, sector SPDR if
-  it existed at as_of; NOT fully PIT), `universe(name, as_of)`: `SP500` (PIT), `SECTOR_SPDR`,
+  it existed at as_of; NOT fully PIT) -- one row per `universe('SP500', as_of)` member exactly as spelled (security
+  keys included), resolved for THAT issuer by CIK from the cached SEC submissions (name in force at
+  as_of, SIC -> sector, exchanges; Wikipedia GICS only when the current constituent is the same
+  CIK); rows without a sector carry `sector_unknown_reason` (all are members whose issuer cannot
+  be established -- bars() fails closed for them too). Sector known for members: 1998-06 63.9 %,
+  2003-06 89.5 %, 2008-06 96.8 %, 2013-06 99.0 %, 2019-06 99.4 %, 2025-06 100 %, `universe(name, as_of)`: `SP500` (PIT), `SECTOR_SPDR`,
   `SECTOR_SPDR_9`, `BROAD_INDEX_ETF`, `GEM_DUAL_MOMENTUM`, `ACCEL_DUAL_MOM`, `CROSS_ASSET`,
   `TREASURY_DURATION`, `TBILL_PROXY`, `LEVERAGED`, `EQUAL_WEIGHT_PAIR`, `CORE_ETF`, `MEGACAP`
   (fixed lists only include ETFs with a completed bar by as_of), and `SP500_TOP<N>_DV` (e.g.
