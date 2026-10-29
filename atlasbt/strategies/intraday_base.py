@@ -82,6 +82,27 @@ MODULE_DEVIATIONS = (
 )
 
 
+#: engine session codes (history_arrays 'session': 0 RTH, 1 PRE, 2 POST, 3 DAY) -> labels
+_SESSION_NAMES = np.array(["RTH", "PRE", "POST", "DAY"], dtype=object)
+
+
+def _frame_to_arrays(df) -> dict:
+    """ctx.history frame -> the history_arrays dict layout (start ns, OHLCV floats, session codes)."""
+    if df is None or len(df) == 0:
+        z = np.zeros(0)
+        return {"start": np.zeros(0, np.int64), "open": z, "high": z, "low": z, "close": z, "volume": z,
+                "session": np.zeros(0, np.int8)}
+    idx = df.index
+    st = idx.asi8 if getattr(idx, "unit", "ns") == "ns" else pd.DatetimeIndex(idx).as_unit("ns").asi8
+    out = {"start": st}
+    for k in ("open", "high", "low", "close", "volume"):
+        out[k] = df[k].to_numpy(dtype=float)
+    codes = {"RTH": 0, "PRE": 1, "POST": 2, "DAY": 3}
+    out["session"] = (np.array([codes.get(str(x), 0) for x in df["session"]], np.int8) if "session" in df.columns
+                      else np.zeros(len(df), np.int8))
+    return out
+
+
 def _hm(s: str) -> int:
     h, m = s.split(":")
     return int(h) * 60 + int(m)
@@ -144,18 +165,22 @@ class Tape:
             return
         last_end = max(self.last_start + self.bar_ns, self.day_start_ns)
         n = int(max(now - last_end, 0) // self.bar_ns) + 2
-        df = ctx.history(self.symbol, n, adjusted=False, sessions=tuple(data_sessions))
+        # perf (docs/PERF.md): history_arrays = the same completed raw bars as ctx.history (engine cache
+        # views, same PIT fallback) without building a DataFrame per symbol and step
+        if hasattr(ctx, "history_arrays"):
+            a = ctx.history_arrays(self.symbol, n, adjusted=False, sessions=tuple(data_sessions))
+        else:                                   # minimal contexts (tests): same arrays from the frame
+            a = _frame_to_arrays(ctx.history(self.symbol, n, adjusted=False, sessions=tuple(data_sessions)))
         self.updated_at = now
-        if df is None or len(df) == 0:
+        if len(a["close"]) == 0:
             return
-        idx = df.index
-        st = idx.asi8 if getattr(idx, "unit", "ns") == "ns" else pd.DatetimeIndex(idx).as_unit("ns").asi8
+        st = a["start"]
         sel = np.nonzero((st >= self.day_start_ns) & (st > self.last_start))[0]
         if sel.size == 0:
             return
-        o, h, l, c, v = (df[k].to_numpy(dtype=float) for k in ("open", "high", "low", "close", "volume"))
-        rth_only = tuple(data_sessions) == ("RTH",) or "session" not in df.columns
-        ses = None if rth_only else df["session"].to_numpy(object)
+        o, h, l, c, v = (a[k] for k in ("open", "high", "low", "close", "volume"))
+        rth_only = tuple(data_sessions) == ("RTH",)
+        ses = None if rth_only else _SESSION_NAMES[a["session"]]
         for i in sel:
             s = "RTH" if rth_only else ses[i]
             if s == "RTH":

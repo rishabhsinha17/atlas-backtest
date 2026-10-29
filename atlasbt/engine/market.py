@@ -26,11 +26,13 @@ CODE_SESSION = {v: k for k, v in SESSION_CODE.items()}
 
 
 class BarArrays:
-    __slots__ = ("symbol", "freq", "start", "end", "o", "h", "l", "c", "v", "sess", "n")
+    __slots__ = ("symbol", "freq", "start", "end", "o", "h", "l", "c", "v", "sess", "n", "_start_ix", "_end_ix",
+                 "_sess_lbl")
 
     def __init__(self, symbol: str, freq: str, df: Optional[pd.DataFrame]):
         self.symbol = symbol
         self.freq = freq
+        self._start_ix = self._end_ix = self._sess_lbl = None     # lazy frame() helpers (perf)
         if df is None or len(df) == 0:
             z = np.zeros(0)
             self.start = np.zeros(0, np.int64)
@@ -65,11 +67,17 @@ class BarArrays:
         return int(np.searchsorted(self.end, t, side="right")) - 1
 
     def frame(self, i0: int, i1: int) -> pd.DataFrame:
-        idx = pd.DatetimeIndex(self.start[i0:i1], tz="UTC", name="start")
+        # perf (docs/PERF.md): the UTC DatetimeIndex of start/end and the session labels are built once
+        # per symbol and sliced; the frame is identical to building them from the int64 / code slices
+        if self._start_ix is None:
+            self._start_ix = pd.DatetimeIndex(self.start, tz="UTC", name="start")
+            self._end_ix = pd.DatetimeIndex(self.end, tz="UTC")
+            self._sess_lbl = np.array([CODE_SESSION[int(x)] for x in self.sess], dtype=object)
+        lbl = self._sess_lbl[i0:i1]
         return pd.DataFrame({"open": self.o[i0:i1], "high": self.h[i0:i1], "low": self.l[i0:i1],
                              "close": self.c[i0:i1], "volume": self.v[i0:i1],
-                             "session": [CODE_SESSION[int(x)] for x in self.sess[i0:i1]],
-                             "known_at": pd.DatetimeIndex(self.end[i0:i1], tz="UTC")}, index=idx)
+                             "session": lbl if len(lbl) else [],      # [] -> same dtype as before
+                             "known_at": self._end_ix[i0:i1]}, index=self._start_ix[i0:i1])
 
 
 class DailyStats:

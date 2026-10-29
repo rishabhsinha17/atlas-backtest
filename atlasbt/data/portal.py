@@ -12,6 +12,7 @@ Source priority & fidelity are documented in docs/DATA.md.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import re
 from functools import lru_cache
@@ -217,12 +218,19 @@ class Portal:
         s = symbol.upper()
         if s in U.CORE_ETFS or s in U.SECTOR_SPDRS:
             return True
+        # memo (perf, docs/PERF.md): a pure function of the cached directory frame (cleared with it)
+        ck = ("is_etf", s)
+        hit_ = self._cache.get(ck)
+        if hit_ is not None:
+            return hit_
+        out = False
         d = self._directory()
         if len(d):
             hit = d[d["symbol"].str.upper().str.replace(".", "-", regex=False) == s]
             if len(hit):
-                return bool(hit["etf"].iloc[-1])
-        return False
+                out = bool(hit["etf"].iloc[-1])
+        self._cache[ck] = out
+        return out
 
     def _directory(self) -> pd.DataFrame:
         return self._read("reference", "nasdaqtrader", "directory")
@@ -378,6 +386,13 @@ class Portal:
             if not len(m):
                 raise DataUnavailableError("S&P 500 membership not in store (run fetch --only sp500)")
             d = _session_date(as_of)
+            # memo (perf, docs/PERF.md): membership is a function of the session date d only
+            # (every input below is keyed by d or static); a copy is returned so callers cannot
+            # mutate the memo
+            ck = ("universe_sp500", d)
+            got = self._cache.get(ck)
+            if got is not None:
+                return list(got)
             # a member is in the index for sessions in [start, end)
             cur = m[(m["start"] <= d) & (m["end"].isna() | (m["end"] > d))]
             # fja05680 tickers are NOT reliably point-in-time (survivors appear under today's
@@ -386,7 +401,9 @@ class Portal:
             # over history is returned as a security key 'TICKER~CIK##########' so bars / actions
             # never splice two companies. Unresolvable members keep the bare ticker (bars() fails
             # closed -> counted missing by the survivorship report).
-            return sorted({self._member_key(str(b).upper().replace(".", "-"), d) for b in cur["base"]})
+            out = sorted({self._member_key(str(b).upper().replace(".", "-"), d) for b in cur["base"]})
+            self._cache[ck] = tuple(out)
+            return out
         mt = re.fullmatch(r"SP500_TOP(\d+)_DV", n)
         if mt:
             return self._top_dollar_volume("SP500", int(mt.group(1)), as_of)
@@ -443,7 +460,7 @@ class Portal:
         if not c_m:
             c_m = c_d
         tl = self.ticker_timeline(ticker)
-        reused = len(tl) and tl["cik"].nunique() > 1
+        reused = len(tl) and self._timeline_arrays(tl)[5] > 1
         if not c_m:
             key = ticker
         elif c_d == c_m and not reused:
@@ -522,10 +539,14 @@ class Portal:
             df = self._cache[key]
         if df.empty:
             return frames.empty_bars()
-        sel = (df.index >= start) & (df.index < end) & (df["known_at"] <= as_of)
+        # perf (docs/PERF.md): on the cached identity frame, select on an attrs-free twin (pandas deep-copies
+        # attrs -- incl. the 'actions' frame -- on every intermediate op) and attach ONE deep copy of the
+        # identity attrs below; the naive session dates of the cached index are computed once
+        base = self._attrs_free(df) if native == "identity" else df
+        sel = (df.index >= start) & (df.index < end) & (base["known_at"] <= as_of)
         if allowed is not None:
-            sel &= frames.to_naive_date(df.index).isin(allowed)
-        out = df.loc[sel]
+            sel &= (self._naive_dates_memo(df) if native == "identity" else frames.to_naive_date(df.index)).isin(allowed)
+        out = base.loc[sel]
         if freq != "1d" and sessions:
             out = out[out["session"].isin(tuple(sessions))]
         cols = [c for c in ("open", "high", "low", "close", "volume", "vwap", "trades", "session", "known_at")
@@ -533,9 +554,16 @@ class Portal:
         out = out[cols].copy()
         if adjusted and len(out):
             out = self._adjust(symbol, out, as_of, src, ident)
+        if base is not df:
+            out.attrs = copy.deepcopy(df.attrs)        # what the op chain on `df` would have propagated
         fid = SOURCE_FIDELITY.get(str(src).split("+")[0], Fidelity.T1_BAR)
         if ident is not None and len(out) and "src_ticker" in df.columns:
-            used = set(df.loc[out.index, "src_ticker"]) | set(df.loc[out.index, "src"])
+            if base is not df and base.index.is_unique:
+                # out's rows are exactly base[sel] (1d: no session filter; adjust keeps the index), so a
+                # boolean take equals the label lookup (perf: no get_indexer over the whole history)
+                used = set(base.loc[sel, "src_ticker"]) | set(base.loc[sel, "src"])
+            else:
+                used = set(base.loc[out.index, "src_ticker"]) | set(base.loc[out.index, "src"])
             if used - {symbol.upper(), "yahoo"}:
                 fid = max(fid, Fidelity.T2_PROXY)          # renamed ticker / DoltHub segment spliced in
         out.attrs.update({"source": src, "fidelity": int(fid), "adjusted": adjusted, "symbol": symbol.upper(),
@@ -554,6 +582,27 @@ class Portal:
                         f"this ticker"]
         return out
 
+    def _attrs_free(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Shallow, attrs-free twin of a CACHED frame (memoized per frame object; perf only)."""
+        ck = ("attrs_free", id(df))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is df:
+            return hit[1]
+        tw = df.copy(deep=False)
+        tw.attrs = {}
+        self._cache[ck] = (df, tw)
+        return tw
+
+    def _naive_dates_memo(self, df: pd.DataFrame) -> pd.DatetimeIndex:
+        """frames.to_naive_date(df.index) of a CACHED frame, memoized per frame object (perf only)."""
+        ck = ("naive_dates", id(df))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is df and hit[1] is df.index:
+            return hit[2]
+        nd = frames.to_naive_date(df.index)
+        self._cache[ck] = (df, df.index, nd)
+        return nd
+
     def _adjust(self, symbol: str, bars: pd.DataFrame, as_of: pd.Timestamp, src: str,
                 ident: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         if ident is None and self._is_plain(symbol) is False:
@@ -565,15 +614,16 @@ class Portal:
             ident.attrs["actions"] = self._yahoo_actions(symbol)
         acts = self.corporate_actions([symbol], pd.Timestamp("1900-01-01"), _session_date(as_of), as_of,
                                       _ident=ident)
-        acts = [a for a in acts if _naive_date(a.ex_date) <= _session_date(as_of) and a.type != ActionType.DELIST]
+        sd_ = _session_date(as_of)            # loop invariant (perf)
+        acts = [a for a in acts if _naive_date(a.ex_date) <= sd_ and a.type != ActionType.DELIST]
         if not acts:
             return bars
         daily = ident if ident is not None and len(ident) else (
             self._plain_frame(symbol.upper()) if self._is_plain(symbol) else frames.empty_bars())
         daily_src = (daily.attrs.get("security_id") or "plain") if len(daily) else None
         if daily_src:
-            dd = frames.to_naive_date(daily.index)
-            raw_close = pd.Series(daily["close"].to_numpy(), index=dd)
+            dd = self._naive_dates_memo(daily)          # daily = cached identity / plain frame
+            raw_close = pd.Series(self._attrs_free(daily)["close"].to_numpy(), index=dd)
         else:   # no daily bars: session closes from the intraday RTH bars themselves
             rth = bars[bars["session"] == "RTH"] if "session" in bars else bars
             raw_close = rth["close"].groupby(frames.to_naive_date(rth.index)).last()
@@ -590,7 +640,7 @@ class Portal:
             if daily_src:
                 self._cache[fkey] = (pf_d, vf_d)
         bd = frames.to_naive_date(bars.index)
-        if len(bars) and (bars["session"] == "DAY").all() and dd.get_indexer(frames.to_naive_date(bars.index)).min() >= 0:
+        if len(bars) and (bars["session"] == "DAY").all() and dd.get_indexer(bd).min() >= 0:
             pos = dd.get_indexer(bd)
         else:
             pos = dd.searchsorted(bd, side="left")       # intraday: factor of its session date
@@ -612,14 +662,22 @@ class Portal:
         s = symbol.upper()
         if s in INDEX_SYMBOLS or s in U.CORE_ETFS or s in U.SECTOR_SPDRS:
             return True
+        # memo (perf, docs/PERF.md): store layout + cached directory / identity index are fixed for
+        # the portal's lifetime (same assumption as the _read cache; cleared by clear_cache)
+        ck = ("is_plain", s)
+        hit = self._cache.get(ck)
+        if hit is not None:
+            return hit
+        out = False
         if self.store.exists("bars_1d", "cboe", s) and not self.store.exists("bars_1d", "yahoo", s):
-            return True
-        if self._is_etf(s):
+            out = True
+        elif self._is_etf(s):
             # an ETF today, but was the ticker an operating company's (GENZ: Genzyme)? -> identity layer
             from .identity import norm
             e = self.identity_index().by_ticker.get(norm(s))
-            return e is None or not len(e)
-        return False
+            out = e is None or not len(e)
+        self._cache[ck] = out
+        return out
 
     def _name_hint(self, symbol: str, date) -> Optional[str]:
         """Security name of the S&P 500 member `symbol` around `date` (Wikipedia changes / current
@@ -970,23 +1028,41 @@ class Portal:
         gap AFTER a segment -> the previous issuer carried forward (via 'carry'); before the first
         segment -> 0 (unknown: an earlier company may have used the ticker)."""
         tl = self.ticker_timeline(symbol)
-        d = pd.DatetimeIndex(dates)
-        n = len(d)
+        if isinstance(dates, list) and len(dates) == 1 and isinstance(dates[0], pd.Timestamp) \
+                and dates[0] is not pd.NaT and dates[0].tzinfo is None:
+            # perf fast path (docs/PERF.md): one naive Timestamp -> the same instant as
+            # pd.DatetimeIndex(dates).values, without building an index
+            dv = np.array([dates[0].value], dtype="datetime64[ns]")
+        else:
+            dv = pd.DatetimeIndex(dates).values
+        n = len(dv)
         cik = np.zeros(n, dtype=np.int64)
         via = np.full(n, "", dtype=object)
         hint = np.full(n, None, dtype=object)
         if not len(tl) or not n:
             return cik, via, hint
-        st = pd.DatetimeIndex(tl["start"]).values
-        en = pd.DatetimeIndex(tl["end"]).values
-        pos = np.searchsorted(st, d.values, side="right") - 1
+        st, en, tl_cik, tl_via, tl_hint, _ = self._timeline_arrays(tl)
+        pos = np.searchsorted(st, dv, side="right") - 1
         ok = pos >= 0
         p = np.clip(pos, 0, len(tl) - 1)
-        inside = ok & (d.values < en[p])
-        cik[ok] = tl["cik"].to_numpy()[p[ok]]
-        via[ok] = np.where(inside[ok], tl["via"].to_numpy()[p[ok]], "carry")
-        hint[ok] = tl["hint"].to_numpy()[p[ok]]
+        inside = ok & (dv < en[p])
+        cik[ok] = tl_cik[p[ok]]
+        via[ok] = np.where(inside[ok], tl_via[p[ok]], "carry")
+        hint[ok] = tl_hint[p[ok]]
         return cik, via, hint
+
+    def _timeline_arrays(self, tl: pd.DataFrame):
+        """Column arrays of a cached ticker timeline (+ its number of distinct CIKs), memoized per
+        timeline object (perf, docs/PERF.md: a pure function of the frame, which is cached and never
+        mutated; the identity check guards against a rebuilt timeline)."""
+        ck = ("timeline_arrays", id(tl))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is tl:
+            return hit[1]
+        arrs = (pd.DatetimeIndex(tl["start"]).values, pd.DatetimeIndex(tl["end"]).values, tl["cik"].to_numpy(),
+                tl["via"].to_numpy(), tl["hint"].to_numpy(), int(tl["cik"].nunique()) if len(tl) else 0)
+        self._cache[ck] = (tl, arrs)
+        return arrs
 
     def _cik_series(self, cik: int, symbol: str, hint: Optional[str] = None) -> pd.DataFrame:
         """Verified RAW daily history of issuer `cik` (lineage from `symbol`, or `hint`'s lineage
@@ -994,9 +1070,17 @@ class Portal:
         from .identity import build_series, norm
         idx = self.identity_index()
         sym = norm(symbol)
-        main, _ = idx.lineage(cik, sym)
-        if hint:
-            main = list(dict.fromkeys(idx.lineage(cik, hint)[0] + [sym]))
+        # memo (perf, docs/PERF.md): the lineage is a pure function of the (cached, immutable)
+        # identity index, so the key tuple is computed once per (cik, symbol, hint)
+        mk = ("cik_series_main", cik, sym, hint)
+        main = self._cache.get(mk)
+        if main is None:
+            main, _ = idx.lineage(cik, sym)
+            if hint:
+                main = list(dict.fromkeys(idx.lineage(cik, hint)[0] + [sym]))
+            main = tuple(main)
+            self._cache[mk] = main
+        main = list(main)
         ck = ("identity_series", cik, tuple(main))
         if ck not in self._cache:
             got = self._load_identity(cik, main)
@@ -1223,12 +1307,73 @@ class Portal:
         symbol = self.resolve_symbol(symbol)[2] or "~none~"
         for s in ((source,) if source else QUOTE_SOURCES):
             if self.store.exists("quotes", s, symbol):
-                q = self.store.read("quotes", s, symbol, start=start, end=min(end, as_of + pd.Timedelta(microseconds=1)))
+                q = self._store_read_memo("quotes", s, symbol, start=start,
+                                          end=min(end, as_of + pd.Timedelta(microseconds=1)))
                 q = q[(q.index >= start) & (q.index < end) & (q.index <= as_of)]
                 q = q[[c for c in ("bid", "ask", "bid_size", "ask_size") if c in q.columns]]
                 q.attrs.update({"source": s, "fidelity": int(QUOTE_FIDELITY.get(s, Fidelity.T2_PROXY))})
                 return q
         raise DataUnavailableError(f"no quotes for {symbol}")
+
+    def _store_read_memo(self, kind: str, source: str, symbol: str, start=None, end=None) -> pd.DataFrame:
+        """``self.store.read(kind, source, symbol, start=, end=)`` with the parquet files' frames
+        memoized (perf, docs/PERF.md). Same file selection, concatenation, time filter, index and
+        attrs as ParquetStore.read (tested equal in tests/perf/test_perf_equivalence.py); each file
+        is keyed by (path, mtime, size), so a rewritten file is re-read. The engine queries quotes
+        for every fill window, which used to re-read the whole file each time."""
+        import pyarrow.parquet as pq
+
+        from .store import _like
+        st = self.store
+        files = st._files(kind, source, symbol)
+        if not files:
+            return pd.DataFrame()
+        if len(files) > 1 and (start is not None or end is not None):
+            y0 = pd.Timestamp(start).year - 1 if start is not None else -10**9
+            y1 = pd.Timestamp(end).year + 1 if end is not None else 10**9
+            kept = [f for f in files if not f.stem.isdigit() or y0 <= int(f.stem) <= y1]
+            if not kept:
+                return st.read(kind, source, symbol, start=start, end=end)     # empty frame + meta attrs
+            files = kept
+
+        def _key(f):
+            stt = f.stat()
+            return ("store_file", str(f), stt.st_mtime_ns, stt.st_size)
+
+        k0 = _key(files[0])
+        meta = self._cache.get(("store_meta",) + k0[1:])
+        if meta is None:
+            meta = st._read_meta(files[0])
+            self._cache[("store_meta",) + k0[1:]] = meta
+        idx = meta.get("index")
+        frames_ = []
+        for f in files:
+            k = _key(f)
+            fr = self._cache.get(k)
+            if fr is None:
+                fr = pq.read_table(f).to_pandas()
+                self._cache[k] = fr
+            frames_.append(fr)
+        frames_ = [f for f in frames_ if len(f)]
+        if not frames_:
+            return pd.DataFrame()
+        df = pd.concat(frames_, ignore_index=True) if len(frames_) > 1 else frames_[0]
+        tcol = idx
+        if tcol and (start is not None or end is not None):
+            t = df[tcol]
+            m = pd.Series(True, index=df.index)
+            if start is not None:
+                m &= t >= _like(start, t)
+            if end is not None:
+                m &= t < _like(end, t)
+            df = df[m]
+        if idx:
+            df = df.set_index(idx)
+        elif df is frames_[0]:
+            df = df.copy()              # never hand out the memoized frame itself
+        df.attrs.update({"source": meta.get("source"), "fidelity": meta.get("fidelity"),
+                         "adjusted": meta.get("adjusted", False), "kind": kind})
+        return df
 
     EVENT_SOURCES = {"EARNINGS": [("events", "ziplime", "EARNINGS"), ("reference", "dolthub", "earnings_calendar")],
                      "EARNINGS_SCHEDULE": [("reference", "dolthub", "earnings_calendar")],
@@ -1482,22 +1627,46 @@ class Portal:
                     ident = self._identity_frame(sym, rdate)
             a = self._actions_frame(sym, rdate, ident)
             if a is not None and len(a):
-                ex = pd.to_datetime(a["ex_date"])
-                m = (ex >= s0) & (ex <= e0) & (pd.to_datetime(a["known_at"], utc=True) <= as_of)
+                # perf (docs/PERF.md): the parsed ex/known columns, the records and the (frozen)
+                # CorporateAction objects of a cached actions frame are memoized per frame object;
+                # the row mask below is computed exactly as before and objects are built lazily
+                # from the same records, in row order
+                memo = self._actions_memo(sym, a)
+                ex, kn, recs, objs = memo
+                m = (ex >= s0) & (ex <= e0) & (kn <= as_of)
                 if allowed is not None and len(allowed):
                     m &= (ex >= allowed[0]) & (ex <= allowed[-1] + pd.Timedelta(days=7))
-                for r in a[m].to_dict("records"):
-                    ratio = r.get("ratio", 1.0)
-                    out.append(CorporateAction(
-                        symbol=sym.upper(), type=ActionType(r["type"]), ex_date=pd.Timestamp(r["ex_date"]).normalize(),
-                        known_at=pd.Timestamp(r["known_at"]),
-                        ratio=float(ratio) if ratio is not None and np.isfinite(float(ratio)) else 1.0,
-                        amount=float(r.get("amount", 0.0) or 0.0),
-                        pay_date=None if pd.isna(r.get("pay_date", pd.NaT)) else pd.Timestamp(r["pay_date"]),
-                        new_symbol=r.get("new_symbol") if isinstance(r.get("new_symbol"), str) else None,
-                        fidelity=Fidelity(int(r.get("fidelity", 2) if pd.notna(r.get("fidelity", 2)) else 2))))
+                for i in np.flatnonzero(np.asarray(m, dtype=bool)):
+                    o = objs[i]
+                    if o is None:
+                        r = recs[i]
+                        ratio = r.get("ratio", 1.0)
+                        o = CorporateAction(
+                            symbol=sym.upper(), type=ActionType(r["type"]), ex_date=pd.Timestamp(r["ex_date"]).normalize(),
+                            known_at=pd.Timestamp(r["known_at"]),
+                            ratio=float(ratio) if ratio is not None and np.isfinite(float(ratio)) else 1.0,
+                            amount=float(r.get("amount", 0.0) or 0.0),
+                            pay_date=None if pd.isna(r.get("pay_date", pd.NaT)) else pd.Timestamp(r["pay_date"]),
+                            new_symbol=r.get("new_symbol") if isinstance(r.get("new_symbol"), str) else None,
+                            fidelity=Fidelity(int(r.get("fidelity", 2) if pd.notna(r.get("fidelity", 2)) else 2)))
+                        objs[i] = o
+                    out.append(o)
             out.extend(self._delist_actions(sym, s0, e0, as_of, ident))
         return sorted(out, key=lambda x: (x.ex_date, x.symbol))
+
+    def _actions_memo(self, sym: str, a: pd.DataFrame):
+        """(ex_date Series, known_at Series (UTC), records, lazily built objects) of an actions frame,
+        memoized per (symbol, frame object) -- perf only; the frames come from the identity cache."""
+        ck = ("actions_memo", sym.upper(), id(a))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is a:
+            return hit[1]
+        ex = pd.to_datetime(a["ex_date"])
+        kn = pd.to_datetime(a["known_at"], utc=True)
+        recs = a.to_dict("records")
+        memo = (ex, kn, recs, [None] * len(recs))
+        self._cache[ck] = (a, memo)
+        return memo
 
     def _delist_actions(self, sym, s0, e0, as_of, ident=None) -> list[CorporateAction]:
         from .survivorship import delisting_for
@@ -1818,6 +1987,16 @@ class Portal:
     RATE_CHAINS = {"1M": ["1M", "3M"], "3M": ["3M"], "6M": ["6M", "3M"], "1Y": ["1Y", "1Y_CMT", "3M"],
                    "ON": ["ON"], "SOFR": ["SOFR", "ON"], "2Y": ["2Y"], "5Y": ["5Y"], "10Y": ["10Y"], "30Y": ["30Y"]}
 
+    def _rate_cols(self, df: pd.DataFrame):
+        """(known_at Series, value array) of a cached rate frame, memoized per frame object."""
+        ck = ("rate_cols", id(df))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is df:
+            return hit[1]
+        cols = (df["known_at"], df["value"].to_numpy())
+        self._cache[ck] = (df, cols)
+        return cols
+
     def risk_free_rate_info(self, as_of, tenor: str = "3M") -> tuple[float, str, Fidelity, pd.Timestamp]:
         """(rate, series_used, fidelity, observation_date). Rate as in risk_free_rate().
         fidelity T1_BAR when the native series for `tenor` was used (e.g. DTB4WK for 1M, available
@@ -1834,11 +2013,14 @@ class Portal:
             df = self.rate_series(sid)
             if not len(df):
                 continue
-            df = df[df["known_at"] <= as_of]
-            if not len(df):
+            # perf (docs/PERF.md): the last row with known_at <= as_of, located on the cached series'
+            # columns instead of materialising the filtered frame (same row, same values)
+            ka, vals = self._rate_cols(df)
+            hit = np.flatnonzero((ka <= as_of).to_numpy())
+            if not len(hit):
                 continue
-            obs = pd.Timestamp(df.index[-1])
-            v = float(df["value"].iloc[-1]) / 100.0
+            obs = pd.Timestamp(df.index[hit[-1]])
+            v = float(vals[hit[-1]]) / 100.0
             if kind == "discount":
                 r = rates.discount_to_money_market(v, days)
             elif kind == "be":
@@ -1875,10 +2057,22 @@ class Portal:
                     fee = float(b["fee"].iloc[-1]) / 100.0
                     avail = float(b.get("available", pd.Series([1])).iloc[-1]) > 0
                     return avail, fee, Fidelity.T1_BAR
+        su = symbol.upper()
+        if su in B.LEVERAGED_ETFS or su in B.CORE_ETFS or self._is_etf(symbol):
+            # perf (docs/PERF.md): default_fee ignores index membership for these symbols, so the
+            # (expensive, per-date) S&P 500 membership lookup below cannot change the result
+            return B.default_fee(symbol, is_etf=self._is_etf(symbol), is_index_member=False)
         member = False
         try:
-            uk = set(self.universe("SP500", as_of))
-            member = orig.upper() in uk or symbol.upper() in {k.split("~")[0] for k in uk}
+            # (keys, base tickers) of the session's members, built once per session date from the
+            # memoized universe (a failing universe() is never memoized: member stays False, as before)
+            mk = ("borrow_members", _session_date(_utc(as_of)))
+            sets = self._cache.get(mk)
+            if sets is None:
+                uk = set(self.universe("SP500", as_of))
+                sets = (frozenset(uk), frozenset(k.split("~")[0] for k in uk))
+                self._cache[mk] = sets
+            member = orig.upper() in sets[0] or symbol.upper() in sets[1]
         except Exception:
             pass
         return B.default_fee(symbol, is_etf=self._is_etf(symbol), is_index_member=member)

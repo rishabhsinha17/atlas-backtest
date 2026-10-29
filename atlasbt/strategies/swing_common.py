@@ -203,6 +203,25 @@ def _frame_arrays(df: pd.DataFrame):
     return start, end, [o, h, l, c], v
 
 
+def _recent_raw(ctx, sym: str, n: int):
+    """``_frame_arrays(ctx.history(sym, n, "1d", adjusted=False))`` (None when empty) without building a
+    DataFrame: ``ctx.history_arrays`` serves the same completed raw bars (engine cache views, same
+    fallback to the PIT portal). Perf only (docs/PERF.md); the arrays are copied like _frame_arrays does.
+    Falls back to the DataFrame path if a frame lacked a known_at / volume column (array lengths differ)."""
+    a = ctx.history_arrays(sym, n, "1d", adjusted=False)
+    k = len(a["close"])
+    if k == 0:
+        return None
+    if len(a["end"]) != k or len(a["volume"]) != k:          # pragma: no cover - non-canonical frame
+        df = ctx.history(sym, n, "1d", adjusted=False)
+        return _frame_arrays(df) if df is not None and len(df) else None
+    st = np.array(a["start"], dtype=np.int64)
+    en = np.array(a["end"], dtype=np.int64)
+    o, h, l, c = (np.array(a[x], dtype=float) for x in ("open", "high", "low", "close"))
+    v = np.array(a["volume"], dtype=float)
+    return st, en, [o, h, l, c], v
+
+
 class _Entry:
     __slots__ = ("start", "end", "o", "h", "l", "c", "v", "ver")
 
@@ -271,6 +290,9 @@ class BarCache:
             self._d.pop(sym, None)
             return None
         e = _Entry()
+        # perf (docs/PERF.md): only the arrays are kept; dropping the (local) frame's attrs first avoids a
+        # deep copy of them (incl. the identity 'actions' frame) on each of the six column reads below
+        df.attrs = {}
         e.start, e.end, (e.o, e.h, e.l, e.c), e.v = _frame_arrays(df)
         self._ver += 1
         e.ver = self._ver
@@ -289,9 +311,9 @@ class BarCache:
         else:
             now_ns = int(ctx.now.value)
             if e.end[-1] < now_ns:
-                df = ctx.history(sym, 3, "1d", adjusted=False)
-                if df is not None and len(df):
-                    st, en, (o, h, l, c), v = _frame_arrays(df)
+                got = _recent_raw(ctx, sym, 3)
+                if got is not None:
+                    st, en, (o, h, l, c), v = got
                     m = st > e.start[-1]
                     if m.all() and len(st) >= 3:
                         e = self._full(ctx, sym, need)       # gap: refetch
