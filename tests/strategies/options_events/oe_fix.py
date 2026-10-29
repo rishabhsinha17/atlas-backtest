@@ -195,6 +195,10 @@ class OEPortal(InMemoryPortal):
         return super().has(symbol, kind, freq)
 
     def fidelity_of(self, symbol, kind, freq=None):
+        if kind in ("events", "fundamentals"):
+            # InMemoryPortal.fidelity_of passes the event KIND through canonical_freq (ValueError -> the
+            # engine reads NA); answer directly here (engine test-portal bug, reported)
+            return Fidelity.T1_BAR if self.has(symbol, kind, freq) else Fidelity.NA
         f = super().fidelity_of(symbol, kind, freq)
         if kind == "options" and f != Fidelity.NA:
             return self.option_fidelity

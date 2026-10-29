@@ -18,8 +18,8 @@ from ..options.structures import (Package, calendar, iron_condor, risk_reversal,
                                   vertical)
 from ..pricing.realized import daily_variance, har_rv_forecast, realized_vol
 from ..risk import sizing as SZ
-from .options_events_common import (COMMON_DEVIATIONS, OPT_ETF, choose_series, SECTOR_SPDR, OptionsEventBase, pct_rank_prev,
-                                    underlying_class, z_prev)
+from .options_events_common import (ACTIVE, COMMON_DEVIATIONS, OPT_ETF, SECTOR_SPDR, OptionsEventBase,
+                                    choose_series, pct_rank_prev, underlying_class, z_prev)
 from .options_events_specs import NAMES, SPECS
 from .registry import register
 
@@ -49,6 +49,9 @@ def _credit_legs(pkg: Package) -> list:
 
 
 class _DailyBase(OptionsEventBase):
+    activity_note = ("Signals need 252 valid daily observations from REAL chains (DoltHub from 2020 -> first signals "
+                     "2021) and are tail conditions (IV percentile / skew z / term spread / forecast edge); "
+                     "synthetic chains are refused: low activity expected, zero before 2021.")
     bar_freq = "1d"
     universe = list(OPT_ETF)
     CHAIN_MAX_FID = Fidelity.T2_PROXY
@@ -86,7 +89,7 @@ class _DailyBase(OptionsEventBase):
             try:
                 self.step(ctx, und)
             except SelectionError as e:
-                self.skip(ctx, f"{und}: {e}")
+                self.skip(ctx, f"{und}: {e}", activity="selection_failure")
 
     def step(self, ctx, und: str) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -274,7 +277,7 @@ class S167(_DailyBase):
         try:
             n = SZ.size_opt_naked(ctx.nav, sl, mg)
         except ValueError as e:
-            self.skip(ctx, f"{und}: {e}")
+            self.skip(ctx, f"{und}: {e}", activity="selection_failure")
             return
         self.open_package(ctx, f"{und}:{ctx.session_date().date()}", und, pkg, n, "credit" if pkg.natural_open() < 0
                           else "debit", meta={"skew_z": z, "stress_per_unit": sl, "margin_per_unit": mg,
@@ -350,7 +353,7 @@ class S169(_DailyBase):
     spec = SPECS["S169"]
 
     def _forecast(self, ctx, und: str) -> float:
-        n = 600 if self.params["forecast"] == "har" else 30
+        n = 100_000 if self.params["forecast"] == "har" else 30      # HAR: full history (expanding window)
         h = ctx.history(und, n, "1d", adjusted=True)
         if h is None or len(h) < 22:
             return float("nan")
@@ -405,6 +408,8 @@ TOP5_SECTORS = ["XLK", "XLV", "XLF", "XLY", "XLC"]
 
 @register
 class S170(_DailyBase):
+    activity_note = ("One dispersion package per month at most (month-end, when flat), only if all six real chains "
+                     "are usable and every sector leg fills before the SPY leg is sent.")
     id = "S170"
     name = NAMES["S170"]
     sizing = "OPT_NAKED"
@@ -418,8 +423,12 @@ class S170(_DailyBase):
         "not re-selected); 11 = all sector SPDRs. A month is skipped if any selected sector has no usable chain.",
         "Dollar-vega matching: total long sector straddle $vega = vega_ratio x short SPY straddle $vega, split "
         "equally across the sectors; integer contracts (rounded, >= 1).",
-        "Net delta hedged per underlying with shares at each close (initial hedge the session after the options "
-        "fill), executed at the next open; hedges are unwound once the options are closed.",
+        "One dispersion package (dispersion_id): the five (or 11) long sector straddles are submitted first (DAY "
+        "COMBOs at the month-end close, filled at the next snapshot); the short SPY straddle only after ALL sector "
+        "legs filled completely. If any member is unfilled / partially filled by the next bar, every working member "
+        "is cancelled and every filled member closed (no naked index leg, no partial package).",
+        "Net delta hedged per underlying with shares at each close once the package is complete (initial hedge the "
+        "close after the SPY leg fills), executed at the next open; hedges are unwound once the options are closed.",
         "OPT_NAKED sizing on the short SPY straddle: stress loss (predefined scenarios) <= 1% NAV with a positive "
         "Cboe margin; sector straddles are long premium (bounded debit).",
         "'Model each ETF option quotes and cross-correlation': each ETF uses its own real chain; the implied "
@@ -430,6 +439,24 @@ class S170(_DailyBase):
     def sectors(self) -> list[str]:
         return list(TOP5_SECTORS) if int(self.params["n_sectors"]) == 5 else list(SECTOR_SPDR)
 
+    def __init__(self, **params):
+        super().__init__(**params)
+        self.disp: Optional[dict] = None          # the ONE dispersion package (all six straddles)
+
+    def _members_filled(self, keys) -> bool:
+        for k in keys:
+            st = self.book.get(k)
+            if st is None or st.open_order.status in ACTIVE or st.filled_units + 1e-9 < st.units:
+                return False
+        return True
+
+    def _unwind(self, ctx, reason: str) -> None:
+        for k in list(self.disp["members"]):
+            if k in self.book:
+                self.close_package(ctx, k, reason)       # cancels a working entry, closes filled legs
+        self.disp["stage"] = "unwinding"
+        ctx.log("S170 dispersion unwound", id=self.disp["id"], reason=reason, activity="combo_cancelled")
+
     def on_bar(self, ctx) -> None:
         self.refresh(ctx)
         chains: dict = {}
@@ -439,21 +466,45 @@ class S170(_DailyBase):
                 chains[u] = self.today_chain(ctx, u)
             return chains[u]
 
-        open_pk = [k for k, st in self.book.items()]
-        if open_pk:
-            if any(self.near_dte(ctx, st) <= self.params["exit_dte"] for st in self.book.values()):
-                for k in open_pk:
-                    if self.book[k].close_order is None:
+        d = self.disp
+        if d is not None:
+            if d["stage"] == "sectors" and ctx.now > d["submitted_at"]:
+                if self._members_filled(d["sector_keys"]):
+                    st = self.open_package(ctx, d["index_key"], "SPY", d["idx_pkg"], d["n_idx"], "credit",
+                                           meta=d["idx_meta"] | {"dispersion_id": d["id"]})
+                    if st is None:
+                        self._unwind(ctx, "index_leg_rejected")
+                    else:
+                        d["members"].append(d["index_key"])
+                        d["stage"], d["submitted_at"] = "index", ctx.now
+                else:
+                    self._unwind(ctx, "sector_leg_unfilled")
+            elif d["stage"] == "index" and ctx.now > d["submitted_at"]:
+                if self._members_filled(d["members"]):
+                    d["stage"] = "complete"
+                else:
+                    self._unwind(ctx, "index_leg_unfilled")
+            if d["stage"] == "complete":
+                sts = [self.book[k] for k in d["members"] if k in self.book]
+                if len(sts) < len(d["members"]):
+                    self._unwind(ctx, "member_closed_by_lifecycle")
+                elif any(self.near_dte(ctx, st) <= self.params["exit_dte"] for st in sts):
+                    for k in d["members"]:
                         self.close_package(ctx, k, "dte")
-        # daily delta hedge per underlying (to zero once options are flat)
-        unds = {st.und for st in self.book.values()} | {s for s, q in ctx.positions().items()
-                                                         if abs(q) > 0 and not ctx.instrument(s).is_option}
+                    d["stage"] = "closing"
+            if d["stage"] in ("unwinding", "closing") and not any(k in self.book for k in d["members"]):
+                self.disp = None
+        # delta hedge per underlying only while the package is complete; unwind shares otherwise
+        complete = self.disp is not None and self.disp["stage"] == "complete"
+        hedged = {self.book[k].und for k in self.disp["members"] if k in self.book} if complete else set()
+        unds = hedged | {s for s, q in ctx.positions().items() if abs(q) > 0 and not ctx.instrument(s).is_option}
         for u in sorted(unds):
-            if any(st.und == u for st in self.book.values()):
+            if u in hedged:
                 self.hedge_to_neutral(ctx, u, chain(u))
-            elif abs(ctx.position(u)) > 0 and not _pending_stock(ctx, u):
+            elif abs(ctx.position(u)) > 0 and not _pending_stock(ctx, u) and \
+                    (self.disp is None or self.disp["stage"] != "closing"):
                 ctx.order(u, -ctx.position(u), tag="hedge_unwind")
-        if self.book or not ctx.calendar().is_last_session_of_month(ctx.session_date()):
+        if self.disp is not None or self.book or not ctx.calendar().is_last_session_of_month(ctx.session_date()):
             return
         self._open(ctx, chain)
 
@@ -464,7 +515,7 @@ class S170(_DailyBase):
         try:
             idx = straddle(_series(x, self.params["dte"]), -1, usable=self.usable(x))
         except SelectionError as e:
-            self.skip(ctx, f"SPY: {e}")
+            self.skip(ctx, f"SPY: {e}", activity="selection_failure")
             return
         secs = {}
         for s in self.sectors():
@@ -475,7 +526,7 @@ class S170(_DailyBase):
             try:
                 secs[s] = straddle(_series(xs, self.params["dte"]), 1, usable=self.usable(xs))
             except SelectionError as e:
-                self.skip(ctx, f"{s}: {e}; month skipped")
+                self.skip(ctx, f"{s}: {e}; month skipped", activity="selection_failure")
                 return
         S = float(np.nanmedian(x["spot"]))
         pos = [OptionPosition.from_leg(l, l.ratio, l.bid) for l in idx.legs]
@@ -484,7 +535,7 @@ class S170(_DailyBase):
         try:
             n_idx = SZ.size_opt_naked(ctx.nav, sl, mg)
         except ValueError as e:
-            self.skip(ctx, str(e))
+            self.skip(ctx, str(e), activity="selection_failure")
             return
         if n_idx <= 0:
             self.skip(ctx, "SPY straddle size 0")
@@ -506,8 +557,17 @@ class S170(_DailyBase):
         ivs = np.array([np.nanmean([l.iv for l in secs[s].legs]) for s in secs])
         rho = (iv_idx / float(np.sum(w * ivs) / np.sum(w))) ** 2 if np.sum(w) > 0 else float("nan")
         tag = ctx.session_date().date()
-        self.open_package(ctx, f"SPY:{tag}", "SPY", idx, n_idx, "credit",
-                          meta={"role": "index", "stress_per_unit": sl, "margin_per_unit": mg,
-                                "implied_corr_proxy": rho})
+        did = f"DISP:{tag}"
+        keys = []
         for s, p in secs.items():
-            self.open_package(ctx, f"{s}:{tag}", s, p, units[s], "debit", meta={"role": "sector"})
+            st = self.open_package(ctx, f"{s}:{tag}", s, p, units[s], "debit", meta={"role": "sector",
+                                                                                    "dispersion_id": did})
+            if st is None:
+                for k in keys:
+                    self.close_package(ctx, k, "sector_leg_rejected")
+                return
+            keys.append(st.key)
+        self.disp = {"id": did, "stage": "sectors", "submitted_at": ctx.now, "sector_keys": list(keys),
+                     "members": list(keys), "index_key": f"SPY:{tag}", "idx_pkg": idx, "n_idx": n_idx,
+                     "idx_meta": {"role": "index", "stress_per_unit": sl, "margin_per_unit": mg,
+                                  "implied_corr_proxy": rho}}

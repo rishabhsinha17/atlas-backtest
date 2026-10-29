@@ -229,24 +229,25 @@ S170T = sub(S170, universe=["SPY"] + TOP5_SECTORS)
 def test_synthetic_S170_dispersion_month_end():
     r = run(S170T(), s170_spec(), SESS[0], day(45))
     op = combo(r, "S170:open")
-    me = close_of(pd.Timestamp("2024-01-31"))
-    first = op[pd.to_datetime(op["submitted_at"], utc=True) == me]
-    assert len(first) == 6
-    later = op[pd.to_datetime(op["submitted_at"], utc=True) > me]
-    assert set(pd.to_datetime(later["submitted_at"], utc=True)) <= {close_of(pd.Timestamp("2024-02-29"))}
+    me, d1, d2 = (close_of(pd.Timestamp(x)) for x in ("2024-01-31", "2024-02-01", "2024-02-02"))
+    sub_ts = pd.to_datetime(op["submitted_at"], utc=True)
+    first = op[sub_ts == me]                                             # the five sector straddles first
+    assert len(first) == 5 and not first["symbol"].str.contains("SPY").any()
+    spy_open = op[(sub_ts == d1)]
+    assert len(spy_open) == 1 and spy_open["symbol"].str.contains("SPY").all()   # index leg after all five filled
     f = fills(r, "S170:open")
-    f = f[f["ts"] == close_of(pd.Timestamp("2024-02-01"))]
-    spy = f[f["symbol"].str.startswith("SPY")]
-    sec = f[~f["symbol"].str.startswith("SPY")]
-    assert (spy["quantity"] < 0).all() and (sec["quantity"] > 0).all()   # short index, long sector straddles
-    assert set(sec["symbol"].str[:6].str.strip()) == set(TOP5_SECTORS)
+    sec = f[f["ts"] == d1]
+    spy = f[f["ts"] == d2]
+    assert (spy["quantity"] < 0).all() and spy["symbol"].str.startswith("SPY").all() and len(spy) == 2
+    assert (sec["quantity"] > 0).all() and set(sec["symbol"].str[:6].str.strip()) == set(TOP5_SECTORS)
     hed = orders(r)
     hed = hed[hed["tag"] == "delta_hedge"]
-    assert len(hed) >= 1 and min(pd.to_datetime(hed["submitted_at"], utc=True)) == close_of(pd.Timestamp("2024-02-01"))
+    assert len(hed) >= 1 and min(pd.to_datetime(hed["submitted_at"], utc=True)) == d2   # only once complete
     cl = combo(r, "S170:close")
     assert len(cl) == 6 and set(cl["tag"]) == {"S170:close:dte"}
     t_close = max(pd.to_datetime(cl["submitted_at"], utc=True))
     assert t_close == close_of(pd.Timestamp("2024-02-23"))                # first close with DTE <= 7 (03-01 expiry)
+    later = op[sub_ts > d1]
     assert len(later) == 0 or min(pd.to_datetime(later["submitted_at"], utc=True)) > t_close   # no overlap
 
 

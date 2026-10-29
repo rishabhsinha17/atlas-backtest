@@ -32,7 +32,8 @@ Module-wide conventions (declared once, apply to every class of the family)
   snapshot; IV metrics are recomputed from mids on the parity forward
   (``atlasbt.options.metrics.chain_metrics``), never vendor IVs. Percentiles and
   z-scores use the previous ``LOOKBACK`` (252) VALID daily observations of the
-  metric (sessions without a usable real snapshot are skipped, not filled).
+  metric (sessions without a usable real snapshot are skipped, not filled); the
+  search walks back at most 2 x LOOKBACK + 10 sessions (cap), else the value is NaN.
   Constant-maturity values flagged ``extrap_flat`` are treated as missing.
 * When a held contract is missing from the real snapshot (DoltHub drops contracts
   below ~13 DTE), exit DECISIONS use ``options.marking.mark_contract`` on the same
@@ -61,6 +62,7 @@ from ..options.structures import OptLeg, Package
 from ..pricing.bsm import bsm_greeks
 from ..pricing.surface import constant_maturity_iv
 from ..pricing.time import simple_to_cc
+from ..risk import sizing as SZ
 
 ACTIVE = (OrderStatus.PENDING, OrderStatus.WORKING, OrderStatus.PARTIAL)
 
@@ -245,8 +247,21 @@ class OptionsEventBase(Strategy):
             self._flags.add(reason)
             ctx.flag_fidelity(tier, reason)
 
-    def skip(self, ctx, what: str, **kv) -> None:
-        ctx.log(f"{self.id} skip: {what}", **kv)
+    #: runner activity-diagnostics categories
+    ACTIVITY = ("selection_failure", "combo_cancelled", "order_rejected", "no_signal", "data_missing", "skip")
+
+    def skip(self, ctx, what: str, activity: Optional[str] = None, **kv) -> None:
+        """Log a skipped decision, tagged with an activity category (inferred when not given)."""
+        if activity is None:
+            w = what.lower()
+            if "rejected" in w:
+                activity = "order_rejected"
+            elif any(k in w for k in ("chain", "snapshot", "fidelity", "synthetic", "no underlying", "unavailable",
+                                      "no usable", "quotes", "no volume", "predates")):
+                activity = "data_missing"
+            else:
+                activity = "skip"
+        ctx.log(f"{self.id} skip: {what}", activity=activity, **kv)
 
     # ------------------------------------------------------------------ rates / spot
     def rate_cc(self, ctx, T: float = 0.25, as_of=None) -> float:
@@ -320,7 +335,7 @@ class OptionsEventBase(Strategy):
             ch = ctx.portal().option_chain(und, as_of=as_of) if as_of is not None else ctx.portal().option_chain(und)
         except Exception as e:
             if not quiet:
-                self.skip(ctx, f"{und}: chain error {type(e).__name__}: {e}")
+                self.skip(ctx, f"{und}: chain error {type(e).__name__}: {e}", activity="selection_failure")
             return None
         if ch is None or len(ch) == 0:
             if not quiet:
@@ -359,7 +374,7 @@ class OptionsEventBase(Strategy):
         try:
             x = prepare_chain(ch, now, r=r, spot=None if np.isfinite(self.chain_spot(ch)) else S)
         except Exception as e:
-            self.skip(ctx, f"{und}: prepare_chain failed {e}")
+            self.skip(ctx, f"{und}: prepare_chain failed {e}", activity="selection_failure")
             return None
         x = x[(x["dte"] >= 0) & (x["T"] > 0)].copy()
         # greeks missing from the snapshot (gamma/vega/theta): BSM on the IV used for delta (documented)
@@ -391,14 +406,19 @@ class OptionsEventBase(Strategy):
     # ------------------------------------------------------------------ orders / book
     def open_package(self, ctx, key: str, und: str, pkg: Package, units: int, kind: str,
                      limit: Optional[float] = None, meta: Optional[dict] = None,
-                     stock_legs: Optional[list] = None, tag: str = "") -> Optional[PkgState]:
+                     stock_legs: Optional[list] = None, tag: str = "",
+                     tif: TimeInForce = TimeInForce.DAY) -> Optional[PkgState]:
         if units <= 0:
             self.skip(ctx, f"{key}: size 0")
+            return None
+        ok, why = self.verify_legs(ctx, pkg)
+        if not ok:
+            self.skip(ctx, f"{key}: contract verification failed ({why})")
             return None
         legs = list(pkg.core_legs())
         for inst, sh in (stock_legs or []):
             legs.append(Leg(inst, int(sh)))
-        order = Order(None, float(units), OrderType.COMBO, limit_price=limit, tif=TimeInForce.DAY,
+        order = Order(None, float(units), OrderType.COMBO, limit_price=limit, tif=tif,
                       legs=tuple(legs), tag=tag or f"{self.id}:open")
         o = ctx.submit(order)
         if o.status == OrderStatus.REJECTED:
@@ -411,6 +431,22 @@ class OptionsEventBase(Strategy):
         ctx.log(f"{self.id} open {key}", pkg=pkg.describe(), units=units, kind=kind, **{k: v for k, v in (meta or {}).items()
                                                                                        if isinstance(v, (int, float, str))})
         return st
+
+    @staticmethod
+    def verify_legs(ctx, pkg: Package) -> tuple[bool, str]:
+        """OPT_* sizing: 'integer contracts, multiplier/deliverable verified'. Every leg is checked
+        against the instrument master (standard 100 multiplier / 100-share deliverable); a leg the
+        master does not know as an option is checked as built from the chain row."""
+        for inst in leg_instruments(pkg):
+            try:
+                m = ctx.instrument(inst.symbol)
+            except Exception:
+                m = None
+            ref = m if (m is not None and m.is_option) else inst
+            ok, why = SZ.verify_contract(ref, expected_multiplier=100.0, expected_deliverable=100.0)
+            if not ok:
+                return False, f"{inst.symbol}: {why}"
+        return True, ""
 
     def on_fill(self, ctx, fill) -> None:
         ref = self._oid.get(fill.order_id)
@@ -439,7 +475,11 @@ class OptionsEventBase(Strategy):
             entry_active = st.open_order.status in ACTIVE
             close_active = st.close_order is not None and st.close_order.status in ACTIVE
             if not pos_open and not entry_active and not close_active:
-                if st.filled_units > 0 and not st.close_reason:
+                if st.filled_units <= 0:
+                    stt = st.open_order.status
+                    ctx.log(f"{self.id} {key}: entry not filled ({stt.value})",
+                            activity="order_rejected" if stt == OrderStatus.REJECTED else "combo_cancelled")
+                elif not st.close_reason:
                     ctx.log(f"{self.id} {key} closed by option lifecycle (expiry/assignment)")
                 self.book.pop(key)
                 self.on_package_closed(ctx, st)
@@ -578,24 +618,28 @@ class OptionsEventBase(Strategy):
         return cache[session]
 
     def metric_series(self, ctx, und: str, name: str, extra: int = 0, fn=None) -> pd.Series:
-        """Valid daily values of metric ``name`` (or ``fn(metrics)``) for the previous
-        LOOKBACK(+extra)+10 sessions and today (if computable), oldest first."""
+        """Valid daily values of metric ``name`` (or ``fn(metrics)``): today (if computable) plus the
+        previous LOOKBACK(+extra) VALID observations, found by walking back session by session
+        (sessions without a usable real snapshot are skipped) up to a cap of
+        2 x (LOOKBACK + extra) + 10 sessions; oldest first."""
         cal = ctx.calendar()
         today = ctx.session_date()
-        n = self.LOOKBACK + extra + 10
+        need = self.LOOKBACK + extra + 1
+        cap = 2 * (self.LOOKBACK + extra) + 10
         try:
-            first = cal.prev_session(today, n)
+            first = cal.prev_session(today, cap)
         except Exception:
             first = today
         sessions = list(cal.sessions(first, today))
         vals = {}
-        for s in sessions:
+        for s in reversed(sessions):
             m = self.metrics_for_session(ctx, und, s)
-            if m is None:
-                continue
-            v = fn(m) if fn is not None else m.get(name, np.nan)
-            if v is not None and np.isfinite(v):
-                vals[s] = float(v)
+            if m is not None:
+                v = fn(m) if fn is not None else m.get(name, np.nan)
+                if v is not None and np.isfinite(v):
+                    vals[s] = float(v)
+            if len(vals) >= need:
+                break
         # keep the cache bounded
         cache = self._metrics.get(und, {})
         for s in [k for k in cache if k < first]:

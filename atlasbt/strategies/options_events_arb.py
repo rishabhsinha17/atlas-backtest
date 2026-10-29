@@ -53,6 +53,8 @@ def dividend_schedule(ctx, sym: str, until: pd.Timestamp, today: pd.Timestamp) -
 # ============================================================================ S171
 @register
 class S171(OptionsEventBase):
+    activity_note = ("Parity arbitrage after all costs on synchronized NBBO is rare by construction; needs T0 option "
+                     "and stock quotes (NOT_TESTABLE on free data); IOC entries often cancel when the edge vanishes.")
     id = "S171"
     name = NAMES["S171"]
     bar_freq = "1m"
@@ -62,7 +64,7 @@ class S171(OptionsEventBase):
     universe_name = None
     CHAIN_MAX_FID = Fidelity.T0_QUOTE
     QUOTE_MAX_AGE = pd.Timedelta(seconds=60)
-    params = {"min_edge_bp": 10.0, "borrow_fee": None, "max_dte": 60, "sync_s": 1.0, "fee_per_contract": 1.0,
+    params = {"min_edge_bp": 10.0, "borrow_fee": None, "max_dte": None, "sync_s": 1.0, "fee_per_contract": 1.0,
               "stock_fee_per_share": 0.005, "max_contracts": 10, "notional_frac": 0.10, "scan_every": 1,
               "megacaps": True, "allow_synthetic": False}
     grid = {"min_edge_bp": [10.0, 25.0, 50.0], "borrow_fee": [0.0, 0.05, 0.20]}
@@ -82,12 +84,21 @@ class S171(OptionsEventBase):
         "Baselines (sheet gives only the grid): min_edge_bp 10 (smallest tested), borrow from the portal.",
         "OPT_ARBITRAGE sizing: trade only if atlasbt.risk.sizing.arbitrage_edge is positive with locates; size = "
         "min(max_contracts, 10% NAV notional) contracts (displayed size not in chain frames).",
-        "Execution: option legs as one COMBO (first snapshot after the decision) and the stock leg as a separate "
-        "market order (first NBBO after the decision; the engine prices COMBO stock legs from bar opens, so they "
-        "are not used); a broken package (one side unfilled / early assignment) is unwound at the next scan.",
+        "Execution: the option legs are one IOC COMBO (first snapshot after the decision) with a net limit that "
+        "keeps the worst-case edge >= min_edge at the DECISION stock price: conversion cap on (P_ask - C_bid) = "
+        "min_t[K e^-rt + PV(divs before t)] - S_ask - fee_ps - min_edge_ps; reversal cap on (C_ask - P_bid) = "
+        "S_bid - fee_ps - max_t[(K + FV divs <= t) e^-(r-borrow)t] - min_edge_ps. The stock leg is NOT in the "
+        "combo (combo units are option packages; a 100-share stock ratio would mix units in the combo limit; the "
+        "engine would price a combo stock leg from the synchronized NBBO, with a bar-open fallback when no NBBO "
+        "lies within 5 s): it is sent only after "
+        "the combo fills, as a marketable LIMIT order priced so the locked edge stays >= 0 given the actual "
+        "option fill; if it is not filled by the next scan it is cancelled and the package unwound (broken-package "
+        "path). Early assignment is simulated by the engine's default option lifecycle (OccOptionLifecycle).",
         "'Hold until parity converges or expiration': closed when the natural unwind value >= the PV of the locked "
         "payoff (conversion) / unwind cost <= PV of the liability (reversal); otherwise held to expiry where the "
-        "engine's lifecycle exercises/assigns (early assignment needs the OccOptionLifecycle plug-in in the config).",
+        "engine's lifecycle exercises/assigns.",
+        "max_dte=None (default): every listed expiry is screened, as the sheet says ('same strike/expiry'); "
+        "max_dte is only an optional speed cap, never set by default.",
     )
     spec = SPECS["S171"]
 
@@ -116,6 +127,7 @@ class S171(OptionsEventBase):
 
     def on_bar(self, ctx) -> None:
         self.refresh(ctx)
+        self._send_stock_legs(ctx)
         if int(ctx.minutes_since_open()) % int(self.params["scan_every"]) != 0:
             return
         held = {st.und for st in self.book.values()}
@@ -163,7 +175,8 @@ class S171(OptionsEventBase):
         r = float(x.attrs.get("r_cc", 0.0))
         shortable, bfee = self._borrow(ctx, sym)
         best = None
-        x = x[(x["dte"] >= 1) & (x["dte"] <= self.params["max_dte"])]
+        mx = self.params["max_dte"]
+        x = x[(x["dte"] >= 1) & ((x["dte"] <= mx) if mx is not None else True)]
         good = x[(x["bid"] > 0) & (x["ask"] > x["bid"])]
         skeys = [c for c in ("expiry", "root", "settlement") if c in good.columns]
         for sk, g in good.groupby(skeys):
@@ -186,10 +199,10 @@ class S171(OptionsEventBase):
                     continue
                 e = res[sig]
                 if best is None or e.edge_bp_of_spot > best[0].edge_bp_of_spot:
-                    best = (e, sig, exp, float(K), T, divs, g)
+                    best = (e, sig, exp, float(K), T, divs, g, american)
         if best is None:
             return
-        e, sig, exp, K, T, divs, g = best
+        e, sig, exp, K, T, divs, g, american = best
         xe = pick_series(x, exp, settlement=str(g["settlement"].iloc[0]) if "settlement" in g.columns else None,
                          root=str(g["root"].iloc[0]) if "root" in g.columns else None)
         S_mid = 0.5 * (q.bid + q.ask)
@@ -201,20 +214,56 @@ class S171(OptionsEventBase):
                                 min_edge=self.params["min_edge_bp"] * 1e-4 * S_mid * mult * n)
         if n <= 0 or not chk.ok:
             return
+        conv_pv, rev_req = self._locked_bounds(K, T, r, divs, bfee, american)
+        min_edge_ps = self.params["min_edge_bp"] * 1e-4 * S_mid
+        # combo legs as built by `conversion`: conversion = -C +P (net = P - C); reversal = +C -P (net = C - P)
+        if sig == "conversion":
+            limit = conv_pv - q.ask - self._fee_ps() - min_edge_ps
+        else:
+            limit = q.bid - self._fee_ps() - rev_req - min_edge_ps
         key = f"{sym}:{sig}:{exp.date()}:{K:g}:{ctx.now.isoformat()}"
-        stock = ctx.instrument(sym)
-        st = self.open_package(ctx, key, sym, pkg, n, "arb",
+        st = self.open_package(ctx, key, sym, pkg, n, "arb", limit=float(np.round(limit, 4)), tif=TimeInForce.IOC,
                                meta={"signal": sig, "edge_bp": e.edge_bp_of_spot, "worst_case_ps": e.worst_case,
-                                     "K": K, "T": T, "expiry": exp, "divs": divs,
+                                     "K": K, "T": T, "expiry": exp, "divs": divs, "conv_pv": conv_pv,
+                                     "rev_req": rev_req, "stock_done": 0.0, "stock_orders": [],
                                      "root": str(xe["root"].iloc[0]) if "root" in xe.columns else None,
                                      "settlement": str(xe["settlement"].iloc[0]) if "settlement" in xe.columns
                                      else None})
         if st is None:
             return
-        sh = pkg.stock[0].shares * n
-        so = ctx.order(sym, sh, tag=f"{self.id}:stock_leg")
-        st.stock_legs = [(stock, pkg.stock[0].shares)]
-        st.meta["stock_order"] = so
+        st.stock_legs = [(ctx.instrument(sym), pkg.stock[0].shares)]
+
+    @staticmethod
+    def _locked_bounds(K, T, r, divs, borrow, american) -> tuple[float, float]:
+        """(conversion: min over stopping times of PV received; reversal: max over stopping times of the
+        liability discounted at the rebate rate r - borrow) per share."""
+        stops = [T] + ([t for t, _ in divs if 0 < t <= T] if american else [])
+        conv = min(K * np.exp(-r * t) + sum(a * np.exp(-r * tt) for tt, a in divs if 0 < tt < t) for t in stops)
+        rr = r - borrow
+        rstops = stops + ([0.0] if american else [])
+        rev = max((K + sum(a * np.exp(rr * (t - tt)) for tt, a in divs if 0 < tt <= t)) * np.exp(-rr * t)
+                  for t in rstops)
+        return float(conv), float(rev)
+
+    def _send_stock_legs(self, ctx) -> None:
+        """Stock leg of each filled combo: marketable LIMIT keeping the locked edge >= 0."""
+        for key, st in self.book.items():
+            if not st.stock_legs or st.filled_units <= 0 or st.close_order is not None:
+                continue
+            inst, sh = st.stock_legs[0]
+            todo = sh * st.filled_units - st.meta["stock_done"]
+            if abs(todo) < 1e-9:
+                continue
+            net = st.entry_net                                  # option net per share actually paid (+) / received
+            if st.meta["signal"] == "conversion":
+                lim = st.meta["conv_pv"] - self._fee_ps() - net         # buy stock at <= lim
+            else:
+                lim = st.meta["rev_req"] + self._fee_ps() + net         # short stock at >= lim
+            o = ctx.order(inst, todo, OrderType.LIMIT, limit_price=float(np.round(lim, 2 if sh > 0 else 2)),
+                          tag=f"{self.id}:stock_leg")
+            st.meta["stock_done"] += todo
+            st.meta["stock_orders"].append(o)
+            st.meta["stock_sent_at"] = ctx.now
 
     # ------------------------------------------------------------------ manage
     def _unwind_orphans(self, ctx, sym) -> None:
@@ -246,9 +295,15 @@ class S171(OptionsEventBase):
                 continue
             pos = self.positions_of(ctx, st)
             n_open = [abs(v) > 1e-9 for v in pos.values()]
-            so = st.meta.get("stock_order")
-            entry_live = st.open_order.status in ACTIVE or (so is not None and so.status in ACTIVE)
-            if entry_live:
+            if st.open_order.status in ACTIVE:
+                continue
+            live = [o for o in st.meta.get("stock_orders", []) if o.status in ACTIVE]
+            if live and st.meta.get("stock_sent_at") is not None and ctx.now > st.meta["stock_sent_at"]:
+                for o in live:
+                    ctx.cancel(o.id)                         # stock leg not filled by the next scan
+                self._close_all(ctx, key, st, "broken_package")
+                continue
+            if live:
                 continue
             exp_shares = st.stock_legs[0][1] * (st.filled_units or 0) if st.stock_legs else 0.0
             broken = (any(n_open) and not all(n_open)) or (abs(ctx.position(sym) - exp_shares) > 1e-6)
@@ -286,6 +341,8 @@ class S171(OptionsEventBase):
 # ============================================================================ S172
 @register
 class S172(OptionsEventBase):
+    activity_note = ("At most one SPX box per month, only when the executable box rate beats T-bills after fees; "
+                     "needs real SPX quotes (NOT_TESTABLE on free data).")
     id = "S172"
     name = NAMES["S172"]
     bar_freq = "1d"
@@ -308,6 +365,8 @@ class S172(OptionsEventBase):
         "positive edge after fees, OPT_ARBITRAGE). Margin: long box paid in full (no loan value, conservative).",
         "Size: cash_frac (50%) of NAV invested in boxes (sheet silent); fee_per_contract 1.40 (IBKR + Cboe SPX "
         "proprietary fee approx.).",
+        "The long-box COMBO (DAY) carries the net limit w e^-(tbill_cc + min_edge) T_fill - 4 fee/multiplier, T_fill "
+        "= horizon from the next close snapshot: it can only fill at a debit that still beats the bill.",
     )
     spec = SPECS["S172"]
 
@@ -330,7 +389,7 @@ class S172(OptionsEventBase):
         try:
             xe = choose_series(eu, dte, int(0.5 * dte), int(1.5 * dte))
         except SelectionError as e:
-            self.skip(ctx, str(e))
+            self.skip(ctx, str(e), activity="selection_failure")
             return
         exp = pd.Timestamp(xe["expiry"].iloc[0])
         xe = xe[(xe["bid"] > 0) & (xe["ask"] > xe["bid"])]
@@ -374,6 +433,13 @@ class S172(OptionsEventBase):
                                 executable_cost=debit * pkg.multiplier * n, fees=fees)
         if n <= 0 or not chk.ok:
             return
-        self.open_package(ctx, f"BOX:{exp.date()}:{k1:g}-{k2:g}", "SPX", pkg, n, "arb",
-                          meta={"lend_cc": res["lend_rate_cc"], "tbill_cc": tb_cc,
+        # net limit for the fill at the NEXT snapshot: width discounted at (T-bill + min edge) over the
+        # remaining horizon at that snapshot, minus the 4 legs' fees per share
+        cal = ctx.calendar()
+        t_fill = cal.open_close(cal.next_session(ctx.session_date()))[1]
+        T_fill = max(year_fraction(t_fill, exp, settle), 1e-6)
+        limit = w * np.exp(-(tb_cc + self.params["min_edge_bp"] * 1e-4) * T_fill) \
+            - 4.0 * self.params["fee_per_contract"] / pkg.multiplier
+        self.open_package(ctx, f"BOX:{exp.date()}:{k1:g}-{k2:g}", "SPX", pkg, n, "arb", limit=float(np.round(limit, 4)),
+                          meta={"limit": limit, "lend_cc": res["lend_rate_cc"], "tbill_cc": tb_cc,
                                 "edge_bp": res["lend_minus_tbill_bp"], "debit": debit})

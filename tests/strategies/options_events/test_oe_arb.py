@@ -26,7 +26,7 @@ def combo(res, prefix):
 
 # ---------------------------------------------------------------------------- S171
 def parity_spec(gap=0.25, converge_at="11:00"):
-    """XYZ at 100 (quotes 99.99/100.01); at 10:00 the 100-strike put is offered `gap` below the
+    """XYZ at 100 (quotes 99.99/100.01); at 10:00-10:01 the 100-strike put is offered `gap` below the
     call bid (conversion edge); at `converge_at` the call ask drops (unwind >= locked value)."""
     snaps = minute_snaps([DAY])
     t10, tc = T("10:00"), (T(converge_at) if converge_at else None)
@@ -36,8 +36,9 @@ def parity_spec(gap=0.25, converge_at="11:00"):
     c100 = [s for s, i in insts.items() if i.strike == 100.0 and i.right.value == "C"][0]
     p100 = [s for s, i in insts.items() if i.strike == 100.0 and i.right.value == "P"][0]
     c, p = optq[c100].copy(), optq[p100].copy()
-    p.loc[t10, "ask"] = c.loc[t10, "bid"] - gap
-    p.loc[t10, "bid"] = p.loc[t10, "ask"] - 0.10
+    for tt in (t10, t10 + pd.Timedelta(minutes=1)):           # the edge is still there at the fill snapshot
+        p.loc[tt, "ask"] = c.loc[tt, "bid"] - gap
+        p.loc[tt, "bid"] = p.loc[tt, "ask"] - 0.10
     if tc is not None:
         c.loc[tc, "ask"] = c.loc[tc, "bid"] - 0.40
         c.loc[tc, "bid"] = c.loc[tc, "ask"] - 0.10
@@ -54,15 +55,19 @@ def test_synthetic_S171_conversion_entry_and_convergence_exit():
     r = run(S171T(), parity_spec(), DAY, DAY)
     op = combo(r, "S171:open")
     assert len(op) == 1 and pd.Timestamp(op["submitted_at"].iloc[0]) == T("10:00")
-    st = combo(r, "S171:stock_leg")
-    assert len(st) == 1 and pd.Timestamp(st["submitted_at"].iloc[0]) == T("10:00")
+    assert float(op["limit_price"].iloc[0]) == pytest.approx(100.0 - 100.01 - 0.025 - 0.10)   # edge-keeping cap
+    assert op["tif"].iloc[0] == "IOC"
     f = fills(r, "S171:open")
     assert set(f["ts"]) == {T("10:01")}
+    st = combo(r, "S171:stock_leg")                                      # stock only after the combo fill
+    assert len(st) == 1 and pd.Timestamp(st["submitted_at"].iloc[0]) == T("10:01") and st["type"].iloc[0] == "LMT"
     side = dict(zip(f["symbol"].str[12:13], np.sign(f["quantity"])))
     assert side == {"C": -1, "P": 1}                                     # conversion: short call, long put
     n = int(abs(f["quantity"].iloc[0]))
     sf = fills(r, "S171:stock_leg")
-    assert float(sf["quantity"].sum()) == 100 * n and (sf["ts"] > T("10:00")).all()
+    assert float(sf["quantity"].sum()) == 100 * n and (sf["ts"] > T("10:01")).all()
+    outlay = (float((f["quantity"] * f["price"]).sum()) * 100 + float((sf["quantity"] * sf["price"]).sum())) / (100 * n)
+    assert 100.0 - outlay >= 0.0                                          # locked edge (r = 0, no dividends)
     cl = combo(r, "S171:close")
     assert pd.Timestamp(cl["submitted_at"].iloc[0]) == T("11:00") and cl["tag"].iloc[0] == "S171:close:converged"
     cs = combo(r, "S171:close_stock")

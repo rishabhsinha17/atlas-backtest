@@ -48,6 +48,9 @@ ZDTE_DEVIATIONS = COMMON_DEVIATIONS + (
 
 
 class _ZeroDTEBase(OptionsEventBase):
+    activity_note = ("SPX 0DTE: needs timestamped intraday SPXW quotes (T0/T1); with the free data (no SPX / no "
+                     "intraday option quotes) the run is NOT_TESTABLE, and EOD/synthetic chains are refused -> zero "
+                     "trades by design unless allow_synthetic=True.")
     bar_freq = "1m"
     universe = [SPX]
     CHAIN_MAX_FID = Fidelity.T1_BAR
@@ -80,7 +83,7 @@ class _ZeroDTEBase(OptionsEventBase):
         try:
             xe = pick_series(xe, today, settlement="CASH_PM")
         except SelectionError as e:
-            self.skip(ctx, str(e))
+            self.skip(ctx, str(e), activity="selection_failure")
             return None
         if not has_0dte(SPX, today):
             ctx.log(f"{self.id}: chain lists a 0DTE PM expiry the listing calendar does not model", day=str(today))
@@ -179,7 +182,7 @@ class S161(_ZeroDTEBase):
                 pkg = iron_condor(xe, self.params["short_delta"], wing_delta=self.params["wing_delta"],
                                   usable=self.usable(xe))
             except SelectionError as e:
-                self.skip(ctx, str(e))
+                self.skip(ctx, str(e), activity="selection_failure")
                 return
             credit = -pkg.natural_open()
             if not credit > 0:
@@ -205,6 +208,8 @@ class S162(_ZeroDTEBase):
     deviations = ZDTE_DEVIATIONS + (
         "'SPX above VWAP': SPX has no volume; evaluated as SPY last 1m close > SPY session VWAP (vwap_source='SPY', "
         "flagged T2_PROXY); 'open > prior close' on SPX 1m bars (first RTH bar open vs prior session's last 1m close).",
+        "Grid cell short_delta=0.10 / wing_delta=0.10 is degenerate (both legs collapse onto the same strike, "
+        "vertical() raises SelectionError -> no trade); kept so the grid reproduces the sheet's values exactly.",
         "'Close at 50% original credit' = credit - cost to close >= 50% of credit; '2x credit to close' = cost to "
         "close >= 2 x credit; 15:30 = closing order at the bar ending 15:30.",
     )
@@ -230,8 +235,9 @@ class S162(_ZeroDTEBase):
             self._done.add(day)
             c, vw = self.vwap_state(ctx)
             gap = self._gap_up(ctx)
-            ctx.log(f"{self.id} filters", close=c, vwap=vw, gap_up=gap)
-            if not (np.isfinite(vw) and c > vw and gap):
+            ok = bool(np.isfinite(vw) and c > vw and gap)
+            ctx.log(f"{self.id} filters", close=c, vwap=vw, gap_up=gap, **({} if ok else {"activity": "no_signal"}))
+            if not ok:
                 return
             xe = self.zero_dte(ctx)
             if xe is None:
@@ -240,7 +246,7 @@ class S162(_ZeroDTEBase):
                 pkg = vertical(xe, -abs(self.params["wing_delta"]), -abs(self.params["short_delta"]),
                                usable=self.usable(xe), name="put_credit_spread")
             except SelectionError as e:
-                self.skip(ctx, str(e))
+                self.skip(ctx, str(e), activity="selection_failure")
                 return
             credit = -pkg.natural_open()
             if not credit > 0:
@@ -307,7 +313,7 @@ class S163(_ZeroDTEBase):
             pkg = vertical(xe, abs(self.params["long_delta"]), abs(self.params["short_delta"]),
                            usable=self.usable(xe), name="call_debit_spread")
         except SelectionError as e:
-            self.skip(ctx, str(e))
+            self.skip(ctx, str(e), activity="selection_failure")
             return
         debit = pkg.natural_open()
         if not debit > 0:
@@ -328,6 +334,8 @@ class S163(_ZeroDTEBase):
 # ============================================================================ S164
 @register
 class S164(_ZeroDTEBase):
+    activity_note = ("FOMC 0DTE straddle: at most ~8 statements per year, only on days with a PM-settled SPX expiry; "
+                     "needs FOMC_SCHEDULE events and recorded SPXW NBBO (NOT_TESTABLE on free data).")
     id = "S164"
     name = NAMES["S164"]
     sizing = "OPT_DEBIT"
@@ -338,7 +346,8 @@ class S164(_ZeroDTEBase):
                             note="scheduled FOMC statement times known in advance (needed to act BEFORE the release)"),
                 Requirement("events", "FOMC", symbols=("*",), note="actual statement release timestamp"),
                 Requirement("options", "1m", symbols=(SPX,), min_fidelity=Fidelity.T0_QUOTE,
-                            note="recorded SPXW NBBO snapshots around the statement")]
+                            note="recorded SPXW NBBO snapshots around the statement"),
+                Requirement("bars", "1m", symbols=(SPX,), note="SPX 1-minute index bars (ATM reference price)")]
     deviations = COMMON_DEVIATIONS + (
         "Entering BEFORE a statement needs its scheduled time in advance: read from 'FOMC_SCHEDULE' events "
         "(effective_at = scheduled statement time, known before it); FOMC events (known_at = actual release) "
@@ -347,8 +356,8 @@ class S164(_ZeroDTEBase):
         "fill at the first NBBO snapshot after it); 'exit +15/+30/+60m' -> exit_offset after the ACTUAL release "
         "(closing order at the first bar ending at/after it, fill at the next snapshot). If the actual release is "
         "not published within 2 h of the schedule the straddle is closed (logged).",
-        "Locked quotes: the engine's ComboFillModel accepts ask == bid, so 'first nonlocked NBBO' is not enforced "
-        "by the fill model (reported engine issue).",
+        "'First available nonlocked NBBO': the engine's ComboFillModel WAITs on locked/crossed leg quotes "
+        "(reject_locked=True), so the exit fills at the first non-locked snapshot after the exit decision.",
         "Needs a PM-settled SPX expiry on the statement day (SPXW Wednesdays from 2016-03); otherwise skipped.",
     )
     spec = SPECS["S164"]
@@ -403,7 +412,7 @@ class S164(_ZeroDTEBase):
             try:
                 pkg = straddle(xe, 1, usable=self.usable(xe))
             except SelectionError as e:
-                self.skip(ctx, str(e))
+                self.skip(ctx, str(e), activity="selection_failure")
                 continue
             debit = pkg.natural_open()
             if not debit > 0:

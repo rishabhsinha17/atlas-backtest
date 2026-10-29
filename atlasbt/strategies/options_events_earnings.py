@@ -53,6 +53,8 @@ def _payload(ev, key, default=None):
 class _EarningsBase(OptionsEventBase):
     """Pre-release scheduler shared by S158/S159."""
 
+    activity_note = ("Pre-earnings entries need intraday timestamped option quotes (T0/T1) for each name; EOD (DoltHub "
+                     "T2) and synthetic chains are refused -> NOT_TESTABLE / zero trades on free data by design.")
     bar_freq = "5m"
     universe = ()
     universe_name = "SP500"
@@ -94,7 +96,7 @@ class _EarningsBase(OptionsEventBase):
             evs = ctx.portal().events("EARNINGS_SCHEDULE", None, ctx.now - pd.Timedelta(days=20),
                                       ctx.now + pd.Timedelta(days=30))
         except Exception as e:
-            self.skip(ctx, f"EARNINGS_SCHEDULE unavailable: {e}")
+            self.skip(ctx, f"EARNINGS_SCHEDULE unavailable: {e}", activity="selection_failure")
             return []
         members = self._members(ctx)
         out = []
@@ -214,7 +216,7 @@ class S158(_EarningsBase):
             xe = pick_series(x, exp)
             pkg = straddle(xe, 1, usable=self.usable(xe))
         except SelectionError as e:
-            self.skip(ctx, f"{sym}: {e}")
+            self.skip(ctx, f"{sym}: {e}", activity="selection_failure")
             return
         debit = pkg.natural_open()
         if not (debit > 0):
@@ -244,8 +246,8 @@ class S159(_EarningsBase):
         "the shorts, defined risk (no naked leg); the COMBO carries a limit of -0.01 (credit >= $0.01 at the fill).",
         "'Exit next day 09:45' = first 09:45 after the actual release; unfilled / held positions are settled by the "
         "engine's option lifecycle at expiry. Assignment after an extreme gap (early exercise of deep ITM American "
-        "legs) needs BacktestConfig(option_lifecycle=atlasbt.options.plugins.OccOptionLifecycle(...)) - a run "
-        "configuration, not strategy code; delivered shares are unwound at the next bar.",
+        "legs) is simulated by the engine's default option lifecycle (OccOptionLifecycle with early assignment); "
+        "delivered shares are unwound at the next bar.",
     )
     spec = SPECS["S159"]
 
@@ -269,7 +271,7 @@ class S159(_EarningsBase):
             pkg = iron_condor(xe, self.params["short_delta"], wing_delta=self.params["wing_delta"],
                               usable=self.usable(xe))
         except SelectionError as e:
-            self.skip(ctx, f"{sym}: {e}")
+            self.skip(ctx, f"{sym}: {e}", activity="selection_failure")
             return
         credit = -pkg.natural_open()
         if not (credit > 0):
@@ -290,6 +292,9 @@ class S159(_EarningsBase):
 # ============================================================================ S160
 @register
 class S160(OptionsEventBase):
+    activity_note = ("Needs intraday option quotes at 10:00 and 5m bars (or the T2 close timing proxy), a 252-day "
+                     "real IV history per name (real chains from 2020 -> first signals 2021), IV pct > 70 AND a "
+                     "break above the opening range: low activity expected.")
     id = "S160"
     name = NAMES["S160"]
     bar_freq = "5m"
@@ -444,7 +449,8 @@ class S160(OptionsEventBase):
         if x is None:
             return
         pct = self._iv_pct(ctx, sym, ch)
-        ctx.log(f"{self.id} {sym} post-release IV pct", pct=pct)
+        hit = bool(np.isfinite(pct) and pct > self.params["iv_pct"])
+        ctx.log(f"{self.id} {sym} post-release IV pct", pct=pct, **({} if hit else {"activity": "no_signal"}))
         if not (np.isfinite(pct) and pct > self.params["iv_pct"]):
             return
         a = {"sym": sym, "session": ctx.session_date(), "decided_at": ctx.now, "rel": rel, "pct": pct}
@@ -469,7 +475,7 @@ class S160(OptionsEventBase):
             pkg = vertical(xe, -abs(self.params["wing_delta"]), -abs(self.params["short_delta"]),
                            usable=self.usable(xe), name="put_credit_vertical")
         except SelectionError as e:
-            self.skip(ctx, f"{sym}: {e}")
+            self.skip(ctx, f"{sym}: {e}", activity="selection_failure")
             return
         credit = -pkg.natural_open()
         if not (credit > 0):
