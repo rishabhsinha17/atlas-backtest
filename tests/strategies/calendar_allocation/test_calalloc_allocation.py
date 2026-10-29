@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from atlasbt.core.types import RunStatus
+from atlasbt.core.types import ActionType, CorporateAction, RunStatus
 from atlasbt.engine.backtester import run_backtest
 from atlasbt.engine.testing import InMemoryPortal, synthetic_daily_bars
 from atlasbt.indicators import realized_vol
@@ -36,12 +36,20 @@ def path(ret_per_day: float, last: float = 100.0, n: int = len(HIST), wiggle: fl
     return c
 
 
-def portal_factory(spec: dict, rf=0.02):
+def old_divs(symbols, amount=0.01):
+    """Dividend history before the test window (portal serves distributions; window prices unchanged)."""
+    return [CorporateAction(s, ActionType.CASH_DIVIDEND, pd.Timestamp("2021-06-15"),
+                            pd.Timestamp("2021-06-01 20:00", tz="UTC"), amount=amount,
+                            pay_date=pd.Timestamp("2021-06-30")) for s in symbols]
+
+
+def portal_factory(spec: dict, rf=0.02, divs=True):
     """spec: sym -> close array over HIST."""
     bars = {(s, "1d"): daily_frame(HIST, c, spread=0.01) for s, c in spec.items()}
+    acts = old_divs(spec) if divs is True else list(divs or [])
 
     def make(cut=None):
-        return InMemoryPortal(bars=truncate(bars, cut) if cut is not None else bars, rf=rf)
+        return InMemoryPortal(bars=truncate(bars, cut) if cut is not None else bars, rf=rf, actions=acts)
     return make
 
 
@@ -340,7 +348,8 @@ def smoke_portal(cut=None):
     global _SPEC
     if _SPEC is None:
         _SPEC = {(s, "1d"): d for s, d in _smoke_spec().items()}
-    return InMemoryPortal(bars=truncate(_SPEC, cut) if cut is not None else _SPEC, rf=0.02)
+    return InMemoryPortal(bars=truncate(_SPEC, cut) if cut is not None else _SPEC, rf=0.02,
+                          actions=old_divs(sorted({s for s, _ in _SPEC})))
 
 
 ALLOC_IDS = ["S089", "S090", "S101", "S102", "S103", "S104", "S105", "S117", "S118", "S119", "S120", "S121",
@@ -397,8 +406,11 @@ def test_rf_fallback_is_flagged():
     assert any("1M T-bill rate unavailable" in r["reason"] for r in res.fidelity["reasons"])
 
 
-def test_missing_distributions_flagged():
-    mk = portal_factory({"XLK": path(UP), "XLE": path(0.0005), "BIL": path(0.0001)})
-    res = run(small(AL.S089, ["XLK", "XLE"])(), mk())
-    assert res.status == RunStatus.OK
-    assert any("distributions unavailable" in r["reason"] for r in res.fidelity["reasons"])
+def test_missing_distributions_flagged_or_not_testable():
+    spec = {"XLK": path(UP), "XLE": path(0.0005), "BIL": path(0.0001)}
+    res = run(small(AL.S089, ["XLK", "XLE"])(), portal_factory(spec, divs=old_divs(["XLK"]))())
+    assert res.status == RunStatus.OK                                  # portal serves distributions ...
+    assert any("distributions unavailable for XLE" in r["reason"] for r in res.fidelity["reasons"])
+    for sid in ("S089", "S101", "S102", "S105", "S117", "S121", "S122", "S124"):   # ... or not at all
+        r0 = run_backtest(get(sid)(), portal_factory(spec, divs=[])(), "2024-03-25", "2024-04-03", zero_cost())
+        assert r0.status == RunStatus.NOT_TESTABLE, sid

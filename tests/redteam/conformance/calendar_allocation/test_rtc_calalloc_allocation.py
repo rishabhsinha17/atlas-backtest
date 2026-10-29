@@ -30,6 +30,14 @@ def month_end_symbols(res, t=ME_CLOSE) -> set:
     return set(o["symbol"])
 
 
+def old_divs(symbols, amount=0.01):
+    """Realistic setup: every ETF has dividend history (a tiny distribution before the test window, so
+    adjusted prices inside the window are unchanged)."""
+    return [CorporateAction(s, ActionType.CASH_DIVIDEND, pd.Timestamp("2021-06-15"),
+                            pd.Timestamp("2021-06-01 20:00", tz="UTC"), amount=amount,
+                            pay_date=pd.Timestamp("2021-06-30")) for s in symbols]
+
+
 def wiggle_path(n, drift=0.0, w=0.004, last=100.0, seed=0):
     rng = np.random.default_rng(seed)
     r = drift + w * rng.standard_normal(n)
@@ -56,7 +64,7 @@ def test_s089_ranks_by_total_return_not_price_return():
             ("BIL", "1d"): daily_frame(HIST, np.full(len(HIST), 91.0), spread=0.01)}
     div = CorporateAction("XLE", ActionType.CASH_DIVIDEND, ex, pd.Timestamp("2023-09-01 20:00", tz="UTC"),
                           amount=6.0, pay_date=pd.Timestamp("2023-09-20"))
-    p = InMemoryPortal(bars=bars, actions=[div], rf=0.0)
+    p = InMemoryPortal(bars=bars, actions=[div] + old_divs(["XLK", "BIL"]), rf=0.0)
     res = run(small(AL.S089, ["XLK", "XLE"])(), p, "2024-03-25", "2024-04-03")
     assert month_end_symbols(res) == {"XLE"}
 
@@ -71,7 +79,8 @@ def test_s089_excess_over_tbill_gate():
     xlk[i_me + 1:] = 101.0
     bars = {("XLK", "1d"): daily_frame(HIST, xlk, spread=0.01),
             ("BIL", "1d"): daily_frame(HIST, np.full(len(HIST), 91.0), spread=0.01)}
-    res = run(small(AL.S089, ["XLK"])(), InMemoryPortal(bars=bars, rf=0.05), "2024-03-25", "2024-04-03")
+    res = run(small(AL.S089, ["XLK"])(), InMemoryPortal(bars=bars, rf=0.05, actions=old_divs(["XLK", "BIL"])),
+              "2024-03-25", "2024-04-03")
     assert month_end_symbols(res) == {"BIL"}
 
 
@@ -140,7 +149,7 @@ def test_s104_leverage_cap_and_daily_turnover_cap_hold_over_two_weeks():
 def test_s105_initial_buy_fills_at_first_session_open():
     bars = {(s, "1d"): daily_frame(HIST, np.full(len(HIST), px), spread=0.01) for s, px in (("SPY", 400.0),
                                                                                           ("IEF", 95.0))}
-    res = run(AL.S105(), InMemoryPortal(bars=bars), "2024-03-04", "2024-03-06")
+    res = run(AL.S105(), InMemoryPortal(bars=bars, actions=old_divs(["SPY", "IEF"])), "2024-03-04", "2024-03-06")
     f = fills(res)
     t0 = CAL.open_close(pd.Timestamp("2024-03-04"))[0]
     assert set(f[pd.DatetimeIndex(f["ts"]) == t0]["symbol"]) == {"SPY", "IEF"}

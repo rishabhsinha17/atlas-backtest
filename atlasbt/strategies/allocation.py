@@ -67,11 +67,10 @@ COMMON = (
     "T-bill proxy BIL (2007-05-30+) else SHV (2007-01-11+) else engine cash.",
     "Total return = adjusted closes as of now; k-month windows aligned to calendar month ends.",
     "Distributions are part of the test (total return / engine dividend bookings): ETF strategies that rank "
-    "on total-return series (S089, S101, S102, S105, S117, S121, S122, S124) declare "
-    "Requirement('actions') on their universe; symbols without any corporate-action data are flagged "
-    "T2_PROXY at run start ('distributions unavailable: price return used'). The requirement is "
-    "non-critical: making it critical conflicts with red-team tests test_s089_* / "
-    "test_s105_initial_buy (portals without dividend data must still run).",
+    "on total-return series (S089, S101, S102, S105, S117, S121, S122, S124) declare a CRITICAL "
+    "Requirement('actions') (portal must serve distributions, else NOT_TESTABLE); universe members without "
+    "any corporate-action data are flagged T2_PROXY at run start ('distributions unavailable: price return "
+    "used').",
     "An ETF is eligible only when its whole lookback window starts on/after its listing date.",
     "Targets are scaled to (1 - 1%) of the gross limit at each rebalance (cash buffer for next-open gaps and "
     "fees; the engine's pre-trade margin check gives pending sells no credit).",
@@ -329,7 +328,7 @@ class S089(_Alloc):
     params = {"lookback": 12, "top": 1, "gate": 0.0}
     grid = {"lookback": [3, 6, 12], "top": [1, 2, 3], "gate": [0.0]}
     requires = [Requirement("bars", "1d"), Requirement("bars", "1d", symbols=TBILL_CHAIN, critical=False),
-                Requirement("actions", critical=False, note="distributions for total return")]
+                Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Predefined sector list = the 11 Select Sector SPDRs (frozen; XLRE/XLC only after listing).",
         "Excess = k-month total return minus the compounded 1M T-bill return over the same dates; each of the "
@@ -403,7 +402,7 @@ class S101(_Alloc):
     universe = DEFENSIVE_4
     params = {"lookback": 3, "top": 1, "gate": True}
     grid = {"lookback": [1, 3, 6, 12], "top": [1, 2], "gate": [True, False]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Frozen universe SPY (broad equity), IEF (intermediate T-note), GLD (gold), SHY (short Treasury); "
         "ranked among those listed with full lookback history (>= 2 required).",
@@ -433,7 +432,7 @@ class S102(_Alloc):
     universe = SECTOR_SPDR
     params = {"lookback": 6, "top": 3}
     grid = {"lookback": [3, 6, 12], "top": [1, 3, 5]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Fixed universe = 11 Select Sector SPDRs (listing-gated). 'return > 3m Tbill' = k-month total return > "
         "compounded 3M T-bill return over the same k months; each slot 1/N; unfilled slots -> T-bill ETF.",
@@ -560,7 +559,7 @@ class S105(_Alloc):
     universe = ["SPY", "IEF"]
     params = {"equity": 0.60, "freq": "monthly"}
     grid = {"equity": [0.40, 0.60, 0.80], "freq": ["quarterly", "monthly"]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Equity ETF = SPY, T-note ETF = IEF (intermediate Treasuries; listed 2002-07-26): nothing is bought "
         "before both are listed. Initial purchase: market orders at the open of the first possible session "
@@ -610,7 +609,7 @@ class S117(_Alloc):
     universe = SECTOR_SPDR
     params = {"lookback": 1, "top": 2}
     grid = {"lookback": [1, 3, 6], "top": [1, 2, 3]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Frozen universe = 11 Select Sector SPDRs (listing-gated). 'Prior calendar-month total return' = "
         "return from the previous month-end close to this month-end close (lookback 1); equal weight 1/N.",
@@ -763,7 +762,7 @@ class S121(_Alloc):
     universe = ["SPY"]
     params = {"trend": 12, "vol_max": 0.20, "vol_n": 63}
     grid = {"trend": [6, 12], "vol_max": [0.15, 0.20, 0.25]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Excess = k-month SPY total return minus compounded 3M T-bill return; 63d vol = sample stdev of the "
         "last 63 daily returns x sqrt(252); '1-3m Treasury ETF' = BIL (else SHV, else cash).",
@@ -791,7 +790,7 @@ class S122(_Alloc):
     universe = CROSS_ASSET
     params = {"window": 6, "top": 3}
     grid = {"window": [3, 6, 12], "top": [2, 3, 4]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Frozen basket: SPY (US equity), EFA (intl equity), BIL (T-bills), TLT (long Treasuries), GLD (gold), "
         "VNQ (REITs); listing-gated.",
@@ -835,7 +834,7 @@ class S124(_Alloc):
     universe = TREASURY_DURATION
     params = {"lookback": 3, "max_duration": "TLT"}
     grid = {"lookback": [1, 3, 6], "max_duration": ["IEF", "TLT"]}
-    requires = [Requirement("bars", "1d"), Requirement("actions", critical=False, note="distributions for total return")]
+    requires = [Requirement("bars", "1d"), Requirement("actions", symbols=("*",), note="distributions for total return (portal-wide; members without dividend data are flagged T2 at run start)")]
     deviations = COMMON + (
         "Frozen basket SHY (1-3y), IEF (7-10y), TLT (20+y), all listed 2002-07-26. 'max duration class' is "
         "read as the longest duration ETF admitted to the basket (IEF -> SHY/IEF only; TLT -> all three).",
