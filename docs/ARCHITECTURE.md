@@ -148,3 +148,9 @@ published number, or hand computation in the test). Lookahead tests: perturb dat
 ## 11. Contract changes
 
 Only the integrator edits `atlasbt/core`. Put requested changes in your final report under "CONTRACT CHANGE REQUESTS".
+
+## 12. Network etiquette & privacy (binding for every agent)
+
+* User-Agent for every request: `atlasbt-research/0.1` (override only via env `ATLASBT_USER_AGENT`; SEC via env `SEC_USER_AGENT`).
+* NEVER put any personal email address or other personal identifier in requests, headers, URLs, payloads, code, docs, tests or data
+  files - including addresses seen in git metadata. Never spoof browser user agents or bypass bot checks; respect rate limits.
