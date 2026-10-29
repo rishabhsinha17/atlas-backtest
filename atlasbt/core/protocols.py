@@ -81,6 +81,15 @@ class DataPortal(Protocol):
         """(shortable/locate available, annualized borrow fee decimal, fidelity)."""
         ...
 
+    def risk_free_rate_info(self, as_of: pd.Timestamp, tenor: str = "3M") -> tuple:
+        """(rate, series_used, fidelity, observation_date); fidelity T2 when a fallback series is used."""
+        ...
+
+    def fundamentals_history(self, symbols: Optional[Iterable[str]], fields: Sequence[str],
+                             as_of: pd.Timestamp, start: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        """Every filed value (incl. restatements/comparatives) with known_at <= as_of."""
+        ...
+
     def fundamentals(self, symbols: Optional[Iterable[str]], fields: Sequence[str],
                      as_of: pd.Timestamp) -> pd.DataFrame:
         """Latest values per (symbol, field) whose filing/known_at <= as_of."""

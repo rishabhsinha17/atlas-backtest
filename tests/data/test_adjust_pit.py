@@ -312,3 +312,60 @@ def test_top_dollar_volume_uses_prior_sessions_only(store):
     p = Portal(store)
     assert p.universe("SP500_TOP1_DV", utc(f"{d[-1].date()} 20:30")) == ["A"]
     assert p.universe("SP500_TOP1_DV", utc(f"{d[-1].date() + pd.Timedelta(days=4)} 15:00")) == ["B"]
+
+
+def test_fundamentals_history_pit(store, portal):
+    """synthetic_: quarterly facts incl. a restatement and a prior-year comparative."""
+    f = pd.DataFrame({"symbol": "X", "field": "revenue_q", "value": [10.0, 11.0, 12.0, 10.5],
+                      "period_end": pd.to_datetime(["2023-03-31", "2023-06-30", "2024-03-31", "2023-03-31"]),
+                      "period_start": pd.to_datetime(["2023-01-01", "2023-04-01", "2024-01-01", "2023-01-01"]),
+                      "known_at": [utc("2023-05-01 20:00"), utc("2023-08-01 20:00"), utc("2024-05-01 20:00"),
+                                   utc("2024-05-01 20:00")],          # comparative restated in the 2024 10-Q
+                      "fp": ["Q1", "Q2", "Q1", "Q1"], "fy": [2023, 2023, 2024, 2024], "form": "10-Q",
+                      "accn": ["a1", "a2", "a3", "a3"], "source": "sec"})
+    store.write("fundamentals", "sec", "X", f, key=["field", "period_start", "period_end", "accn"])
+    h = portal.fundamentals_history(["X"], ["revenue_q"], as_of=utc("2023-12-31"))
+    assert list(h["value"]) == [10.0, 11.0] and "fiscal_period" in h.columns
+    h = portal.fundamentals_history(["X"], ["revenue_q"], as_of=utc("2024-06-01"))
+    assert len(h) == 4 and (h["known_at"] <= utc("2024-06-01")).all()
+    q1 = h[h["period_end"] == pd.Timestamp("2023-03-31")]
+    assert list(q1["value"]) == [10.0, 10.5]                     # both vintages, in known_at order
+    h = portal.fundamentals_history(["X"], ["revenue_q"], as_of=utc("2024-06-01"), start="2024-01-01")
+    assert list(h["value"]) == [12.0]
+    # fundamentals() unchanged: latest period only
+    assert portal.fundamentals(["X"], ["revenue_q"], utc("2024-06-01"))["value"].iloc[0] == 12.0
+
+
+def test_sec_book_equity_fields_from_fixture():
+    import json
+    from atlasbt.data.providers import sec
+    from .conftest import FIX
+    assert {"preferred_stock", "deferred_taxes", "short_term_debt", "stock_issuance_proceeds",
+            "repurchase"} <= set(sec.FIELD_MAP)
+    facts = json.load(open(FIX / "sec_companyfacts_AAPL_subset.json"))
+    facts["facts"]["us-gaap"]["DeferredTaxLiabilitiesNoncurrent"] = {"units": {"USD": [
+        {"end": "2023-09-30", "val": 123, "accn": "x1", "fy": 2023, "fp": "FY", "form": "10-K", "filed": "2023-11-03"}]}}
+    facts["facts"]["us-gaap"]["DeferredIncomeTaxLiabilitiesNet"] = {"units": {"USD": [
+        {"end": "2023-09-30", "val": 999, "accn": "x1", "fy": 2023, "fp": "FY", "form": "10-K", "filed": "2023-11-03"}]}}
+    fund = sec.parse_companyfacts("AAPL", facts, {})
+    dt = fund[fund["field"] == "deferred_taxes"]
+    assert list(dt["value"]) == [123.0] and dt["concept"].iloc[0] == "DeferredTaxLiabilitiesNoncurrent"   # fallback order
+
+
+def test_earnings_gaap_vs_street_eps(store, portal):
+    """ZipLime gives GAAP diluted EPS; DoltHub eps_history gives street EPS + consensus. Both are
+    exposed; eps_actual (for surprise vs consensus) is the street figure when available."""
+    from atlasbt.data.providers import ziplime
+    from .conftest import FIX
+    ev = ziplime.build_events(pd.read_parquet(FIX / "ziplime_announcements_subset.parquet"),
+                              pd.read_parquet(FIX / "ziplime_earnings_subset.parquet"))
+    store.write("events", "ziplime", "EARNINGS", ev, partition="year", time_col="known_at", key=["accession", "symbol"])
+    import json
+    h = pd.DataFrame(json.load(open(FIX / "dolthub_earnings_AAPL.json"))["eps_history"])
+    store.write("reference", "dolthub", "eps_history", h, key=["act_symbol", "period_end_date"])
+    out = portal.events("EARNINGS", ["AAPL"], "2023-01-01", "2023-03-01", as_of=utc("2023-03-01"))
+    p = out[0].payload
+    assert p["eps_actual_gaap"] == 1.88 and p["eps_actual_street"] == 1.88   # AAPL reports no adjustments
+    assert p["eps_actual_basis"] == "street" and p["eps_actual"] == p["eps_actual_street"]
+    assert p["eps_estimate"] == 1.93 and p["estimate_fidelity"] == 2         # final consensus, post hoc
+    assert p["estimate_reason"] == "consensus recorded post hoc; revisions not PIT"

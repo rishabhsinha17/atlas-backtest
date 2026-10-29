@@ -7,9 +7,11 @@ Eastern, converted to UTC), `session` (pre_market / market_hours / after_close /
 non_session) and `first_tradeable_session` (first NYSE session whose close is after the
 acceptance; honours half days and closures). Tickers are resolved as of the day
 (`ticker_confidence` in {as_of, carried_back, ...}); includes since-delisted companies.
-Figures (eps_basic/diluted, revenue, net income, SUE) come from XBRL company facts, matched
+Figures (eps_basic/diluted, revenue, net income, SUE) are GAAP (XBRL company facts), matched
 to the release; they are attached with known_at = announcement (the press release carries
-them) and the statement acceptance time is kept in `statement_accepted_at`.
+them) and the statement acceptance time is kept in `statement_accepted_at`. `figure_quarters`
+gives the span of the figures: 1 = the quarter, 4 = full fiscal year (typical for Q4 releases, e.g.
+JPM 2024-01-12 FY EPS 16.23) -- events.py only uses quarter-span figures as eps_actual_gaap.
 
 Verification: EDGAR submissions-JSON `acceptanceDateTime` ("...Z") is Eastern local time for
 a large share of pre-2021 filings (ZipLime README); we checked our own SEC-API rows against
@@ -39,7 +41,7 @@ SESSION_TO_TIMING = {"pre_market": "BMO", "after_close": "AMC", "market_hours": 
 def build_events(announcements: pd.DataFrame, earnings: pd.DataFrame) -> pd.DataFrame:
     a = announcements[announcements["form"].str.startswith("8-K")].copy()
     fig = earnings[["accession_number", "period_end", "fiscal_year", "fiscal_period", "eps_basic", "eps_diluted",
-                    "revenue", "net_income", "sue", "eps_quality", "statement_accepted_at"]]
+                    "revenue", "net_income", "sue", "eps_quality", "statement_accepted_at", "quarters"]]
     a = a.merge(fig, on="accession_number", how="left")
     known = a["announced_at"]
     out = pd.DataFrame({
@@ -50,6 +52,8 @@ def build_events(announcements: pd.DataFrame, earnings: pd.DataFrame) -> pd.Data
         "eps_estimate": np.nan, "estimate_known_at": pd.NaT,
         "fiscal_period": a["fiscal_period"], "period_end": pd.to_datetime(a["period_end"], errors="coerce"),
         "fiscal_year": a["fiscal_year"], "revenue": a["revenue"], "net_income": a["net_income"], "sue": a["sue"],
+        # number of quarters the figures cover: Q4 releases usually carry FULL-YEAR figures (4)
+        "figure_quarters": a["quarters"],
         "eps_quality": a["eps_quality"], "statement_accepted_at": a["statement_accepted_at"],
         "first_tradeable_session": pd.to_datetime(a["first_tradeable_session"], errors="coerce"),
         "accession": a["accession_number"], "cik": a["cik"], "ticker_confidence": a["ticker_confidence"],

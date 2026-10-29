@@ -80,6 +80,16 @@ FIELD_MAP: dict[str, list[str]] = {
     "ppe_net": ["PropertyPlantAndEquipmentNet"],
     "retained_earnings": ["RetainedEarningsAccumulatedDeficit"],
     "shares_outstanding": ["dei:EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding"],
+    # Fama-French book equity = SE + deferred taxes (- investment tax credit) - preferred.
+    # Lists are in fallback order: the first concept a filing reports for a period wins.
+    "preferred_stock": ["PreferredStockValue", "PreferredStockCarryingAmount",
+                        "PreferredStockValueOutstanding", "PreferredStockIncludingAdditionalPaidInCapital"],
+    "deferred_taxes": ["DeferredTaxLiabilitiesNoncurrent", "DeferredIncomeTaxLiabilitiesNet",
+                       "DeferredTaxLiabilities", "DeferredIncomeTaxLiabilities"],
+    "short_term_debt": ["DebtCurrent", "ShortTermBorrowings", "LongTermDebtCurrent",
+                        "LongTermDebtAndCapitalLeaseObligationsCurrent"],
+    "stock_issuance_proceeds": ["ProceedsFromIssuanceOfCommonStock", "ProceedsFromStockOptionsExercised"],
+    "repurchase": ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"],
 }
 FORMS = {"10-K", "10-Q", "10-K/A", "10-Q/A", "20-F", "40-F", "10-KT", "20-F/A", "8-K", "6-K"}
 

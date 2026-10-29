@@ -139,9 +139,21 @@ def _attach_estimates(portal, df: pd.DataFrame) -> pd.DataFrame:
         hg = {s: g for s, g in h.groupby("act_symbol")}
     else:
         hg = {}
-    vals, kas, srcs, fids, reasons = [], [], [], [], []
+    vals, kas, srcs, fids, reasons, street = [], [], [], [], [], []
     for s, p, r, ka in zip(syms, pe, rel, df["known_at"]):
         v, k, src = np.nan, pd.NaT, None
+        # street (adjusted, consensus-basis) actual EPS for the same fiscal period: DoltHub eps_history
+        st_v = np.nan
+        h = hg.get(s)
+        if h is not None:
+            if pd.notna(p):
+                mh = h[(h["period_end_date"] - p).abs() <= pd.Timedelta(days=7)]
+            else:
+                lag = (r.normalize() - h["period_end_date"]).dt.days
+                mh = h[(lag >= 10) & (lag <= 120)].sort_values("period_end_date").tail(1)
+            if len(mh) and pd.notna(mh["reported"].iloc[-1]):
+                st_v = float(mh["reported"].iloc[-1])
+        street.append(st_v)
         g = eg.get(s)
         if g is not None and pd.notna(p):
             m = g[((g["period_end_date"] - p).abs() <= pd.Timedelta(days=7)) & (g["date"] < r.normalize())]
@@ -169,6 +181,20 @@ def _attach_estimates(portal, df: pd.DataFrame) -> pd.DataFrame:
         else:
             fids.append(None)
             reasons.append(None)
+    # EPS bases: ZipLime figures are GAAP diluted EPS (XBRL); DoltHub `reported` and all consensus
+    # values are street (adjusted) EPS. A surprise must compare street vs street:
+    #   surprise = eps_actual_street - eps_estimate.  eps_actual = street when available, else GAAP
+    #   (eps_actual_basis says which).
+    gaap = pd.to_numeric(df["eps_actual"], errors="coerce") if "eps_actual" in df else pd.Series(np.nan, index=df.index)
+    if "source" in df:
+        gaap = gaap.where(df["source"] == "ziplime")
+    if "figure_quarters" in df:          # Q4 releases carry full-year GAAP figures -> not a quarter EPS
+        gaap = gaap.where(pd.to_numeric(df["figure_quarters"], errors="coerce") == 1)
+    df["eps_actual_gaap"] = gaap.to_numpy()
+    df["eps_actual_street"] = street
+    has_street = pd.notna(df["eps_actual_street"])
+    df["eps_actual"] = np.where(has_street, df["eps_actual_street"], df["eps_actual_gaap"])
+    df["eps_actual_basis"] = np.where(has_street, "street", np.where(pd.notna(df["eps_actual_gaap"]), "gaap", None))
     df["eps_estimate"] = vals
     df["estimate_known_at"] = pd.to_datetime(pd.Series(kas), utc=True).to_numpy()
     df["estimate_source"] = srcs

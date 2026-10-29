@@ -37,3 +37,22 @@ def test_portal_risk_free_rate_pit(store, portal):
     assert r == pytest.approx(rates.discount_to_money_market(0.0522, 91), abs=1e-9)
     # 1M tenor falls back to 3M when DTB4WK is absent
     assert portal.risk_free_rate(utc("2024-01-03 21:30"), "1M") == pytest.approx(r)
+
+
+def test_risk_free_rate_info_fallback_flagged(store, portal):
+    """3M from the real DTB3 fixture; synthetic_ DTB4WK starting 2024-01-02: before it exists the
+    1M request falls back to 3M and is flagged T2; afterwards the native series is T1."""
+    from atlasbt.core.types import Fidelity
+    store.write("rates", "fred", "DTB3", fred.parse_csv("DTB3", (FIX / "fred_DTB3.csv").read_bytes()))
+    wk = pd.DataFrame({"value": [5.27, 5.28]}, index=pd.DatetimeIndex(["2024-01-02", "2024-01-03"], name="date"))
+    wk["known_at"] = fred.known_at_for(wk.index)
+    store.write("rates", "fred", "DTB4WK", wk)
+    r, sid, fid, obs = portal.risk_free_rate_info(utc("2024-01-02 22:00"), "1M")
+    assert sid == "DTB3" and fid == Fidelity.T2_PROXY
+    r, sid, fid, obs = portal.risk_free_rate_info(utc("2024-01-03 21:30"), "1M")
+    assert sid == "DTB4WK" and fid == Fidelity.T1_BAR and obs == pd.Timestamp("2024-01-02")
+    assert r == pytest.approx(rates.discount_to_money_market(0.0527, 28))
+    assert portal.risk_free_rate(utc("2024-01-03 21:30"), "1M") == r
+    # every series stale (> 10 days): freshest value returned, flagged T2
+    r, sid, fid, obs = portal.risk_free_rate_info(utc("2024-02-15"), "1M")
+    assert fid == Fidelity.T2_PROXY and obs == pd.Timestamp("2024-01-09") and sid == "DTB3"

@@ -46,7 +46,8 @@ INDEX_SYMBOLS = {"VIX", "VIX9D", "VIX3M", "VIX6M", "VIX1Y", "VIX1D", "VVIX", "SK
                  "VXAPL", "VXAZN", "VXGOG", "VXGS", "VXIBM", "VXGDX", "VXSLV"}
 _OCC = re.compile(r"^(?P<root>[A-Z0-9.\- ]{1,6})\s*(?P<d>\d{6})(?P<r>[CP])(?P<k>\d{8})$")
 RATE_SERIES = {"1M": ("DTB4WK", "discount", 28), "3M": ("DTB3", "discount", 91), "6M": ("DTB6", "discount", 182),
-               "1Y": ("DTB1YR", "discount", 364), "ON": ("DFF", "mm", 1), "SOFR": ("SOFR", "mm", 1),
+               "1Y": ("DTB1YR", "discount", 364), "1Y_CMT": ("DGS1", "be", None),
+               "ON": ("DFF", "mm", 1), "SOFR": ("SOFR", "mm", 1),
                "2Y": ("DGS2", "be", None), "5Y": ("DGS5", "be", None), "10Y": ("DGS10", "be", None),
                "30Y": ("DGS30", "be", None)}
 
@@ -848,16 +849,23 @@ class Portal:
     def rate_series(self, series_id: str) -> pd.DataFrame:
         return self._read("rates", "fred", series_id)
 
-    def risk_free_rate(self, as_of, tenor: str = "3M") -> float:
-        """Simple annualized money-market (ACT/360) rate in decimals, known at as_of.
-        T-bill discount quotes are converted (atlasbt.data.rates); DGS* are bond-equivalent
-        and returned rebased to 360 days; DFF/SOFR are already ACT/360."""
+    MAX_RATE_STALE_DAYS = 10
+    # per requested tenor: series tried in order (first = the native series for that tenor)
+    RATE_CHAINS = {"1M": ["1M", "3M"], "3M": ["3M"], "6M": ["6M", "3M"], "1Y": ["1Y", "1Y_CMT", "3M"],
+                   "ON": ["ON"], "SOFR": ["SOFR", "ON"], "2Y": ["2Y"], "5Y": ["5Y"], "10Y": ["10Y"], "30Y": ["30Y"]}
+
+    def risk_free_rate_info(self, as_of, tenor: str = "3M") -> tuple[float, str, Fidelity, pd.Timestamp]:
+        """(rate, series_used, fidelity, observation_date). Rate as in risk_free_rate().
+        fidelity T1_BAR when the native series for `tenor` was used (e.g. DTB4WK for 1M, available
+        from 2001-07-31), T2_PROXY when a fallback tenor was substituted (e.g. 3M for 1M before
+        2001-07-31, or 3M for 1Y after DTB1YR ended in 2001 if DGS1 is missing). A series whose
+        latest value known at as_of is older than MAX_RATE_STALE_DAYS is treated as unavailable."""
         as_of = _utc(as_of)
         t = tenor.upper()
-        if t not in RATE_SERIES:
-            raise KeyError(f"tenor {tenor!r}; known {list(RATE_SERIES)}")
-        chain = [t] + (["3M"] if t in ("1M", "1Y") else [])
-        for tt in chain:
+        if t not in self.RATE_CHAINS:
+            raise KeyError(f"tenor {tenor!r}; known {list(self.RATE_CHAINS)}")
+        stale = None
+        for i, tt in enumerate(self.RATE_CHAINS[t]):
             sid, kind, days = RATE_SERIES[tt]
             df = self.rate_series(sid)
             if not len(df):
@@ -865,13 +873,29 @@ class Portal:
             df = df[df["known_at"] <= as_of]
             if not len(df):
                 continue
+            obs = pd.Timestamp(df.index[-1])
             v = float(df["value"].iloc[-1]) / 100.0
             if kind == "discount":
-                return rates.discount_to_money_market(v, days)
-            if kind == "be":
-                return rates.bond_equivalent_to_money_market(v)
-            return v
+                r = rates.discount_to_money_market(v, days)
+            elif kind == "be":
+                r = rates.bond_equivalent_to_money_market(v)
+            else:
+                r = v
+            if (_session_date(as_of) - obs).days > self.MAX_RATE_STALE_DAYS:
+                if stale is None or obs > stale[3]:
+                    stale = (r, sid, Fidelity.T2_PROXY, obs)
+                continue
+            return r, sid, (Fidelity.T1_BAR if i == 0 else Fidelity.T2_PROXY), obs
+        if stale is not None:          # every candidate is stale: freshest value, flagged T2
+            return stale
         raise DataUnavailableError(f"no {tenor} rate known at {as_of}")
+
+    def risk_free_rate(self, as_of, tenor: str = "3M") -> float:
+        """Simple annualized money-market (ACT/360) rate in decimals, known at as_of.
+        T-bill discount quotes are converted (atlasbt.data.rates); DGS* are bond-equivalent
+        and returned rebased to 360 days; DFF/SOFR are already ACT/360. Fallback tenors are
+        possible -- use risk_free_rate_info() to see which series was used and its fidelity."""
+        return self.risk_free_rate_info(as_of, tenor)[0]
 
     def borrow(self, symbol: str, as_of) -> tuple[bool, float, Fidelity]:
         from .providers import borrow as B
@@ -912,6 +936,39 @@ class Portal:
             return pd.DataFrame(columns=cols)
         out = pd.concat(parts, ignore_index=True)
         out = out[[c for c in cols if c in out.columns]].reset_index(drop=True)
+        out.attrs.update({"source": "sec", "fidelity": int(Fidelity.T1_BAR)})
+        return out
+
+    def fundamentals_history(self, symbols: Optional[Iterable[str]], fields: Sequence[str], as_of,
+                             start=None) -> pd.DataFrame:
+        """EVERY filed value (all periods, all filings incl. restatements and prior-year
+        comparatives) with known_at <= as_of [and period_end >= start], sorted by symbol, field,
+        period_end, known_at. Columns: symbol, field, value, period_start, period_end,
+        fiscal_period, fy, form, known_at, accn, concept, duration_days, source.
+        To rebuild a PIT TTM / YoY value at time t, use rows with known_at <= t and, per period,
+        the latest known_at (that is what fundamentals() does for the latest period)."""
+        as_of = _utc(as_of)
+        syms = list(symbols) if symbols is not None else self.store.symbols("fundamentals", "sec")
+        st = pd.Timestamp(start) if start is not None else None
+        if st is not None and st.tzinfo is not None:
+            st = st.tz_convert(ET).tz_localize(None)
+        parts = []
+        for s in syms:
+            f = self._read("fundamentals", "sec", s)
+            if not len(f):
+                continue
+            m = f["field"].isin(list(fields)) & (pd.to_datetime(f["known_at"], utc=True) <= as_of)
+            if st is not None:
+                m &= pd.to_datetime(f["period_end"]) >= st
+            if m.any():
+                parts.append(f[m])
+        cols = ["symbol", "field", "value", "period_start", "period_end", "fiscal_period", "fy", "form", "known_at",
+                "accn", "concept", "duration_days", "source"]
+        if not parts:
+            return pd.DataFrame(columns=cols)
+        out = pd.concat(parts, ignore_index=True).rename(columns={"fp": "fiscal_period"})
+        out = out[[c for c in cols if c in out.columns]]
+        out = out.sort_values(["symbol", "field", "period_end", "known_at"]).reset_index(drop=True)
         out.attrs.update({"source": "sec", "fidelity": int(Fidelity.T1_BAR)})
         return out
 

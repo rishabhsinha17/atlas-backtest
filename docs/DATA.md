@@ -60,6 +60,13 @@ summaries: `cache/logs/`. QA reports: `cache/qa/qa_<freq>_<date>.csv`.
   weeks earlier). Fidelity T2_PROXY (timing approximate; ex-dates/amounts are real).
   `pay_date` is unknown (None) for Yahoo actions -> ENGINE must assume a lag (typ. 2-4 weeks).
   `CorporateAction.ex_date` is returned as a naive ET date (ARCHITECTURE §2 convention).
+* **EARNINGS actuals -- GAAP vs street**: `eps_actual_gaap` = ZipLime GAAP diluted EPS (XBRL),
+  only when the figures cover the quarter (`figure_quarters` == 1; Q4 releases usually carry
+  full-year figures, e.g. JPM 2024-01-12 FY 16.23, which are NOT used as a quarter EPS);
+  `eps_actual_street` = DoltHub eps_history `reported` (adjusted / street basis, 2016+);
+  `eps_actual` = street when available else GAAP, `eps_actual_basis` says which.
+  **Surprise must be street vs street**: `eps_actual_street - eps_estimate` (all consensus values are
+  street basis). GAAP vs consensus mixes bases (one-offs, amortization) and is wrong.
 * **EARNINGS estimates**: preferred = DoltHub weekly consensus snapshot ('Current Quarter', same
   fiscal period end +-7 d) dated before the release, estimate_known_at = snapshot date 23:59 ET,
   payload `estimate_fidelity` 1 ("weekly consensus snapshot dated before the release (PIT)"),
@@ -167,6 +174,20 @@ User-Agent: `atlasbt-research/0.1` (override `ATLASBT_USER_AGENT`); **no persona
   (duration fields suffixed `_q` 80-100 d / `_fy` 350-380 d / `_ytd`), and instant fields
   total_assets, total_liabilities, current_assets/liabilities, stockholders_equity, cash,
   long_term_debt, inventory, receivables, ppe_net, retained_earnings, shares_outstanding.
+  Book-equity / factor fields (fallback order = list order; the first concept a filing reports for
+  a period wins, the concept used is kept in `concept`):
+  `preferred_stock` = PreferredStockValue > PreferredStockCarryingAmount >
+  PreferredStockValueOutstanding > PreferredStockIncludingAdditionalPaidInCapital;
+  `deferred_taxes` = DeferredTaxLiabilitiesNoncurrent > DeferredIncomeTaxLiabilitiesNet >
+  DeferredTaxLiabilities > DeferredIncomeTaxLiabilities; `short_term_debt` = DebtCurrent >
+  ShortTermBorrowings > LongTermDebtCurrent > LongTermDebtAndCapitalLeaseObligationsCurrent;
+  `stock_issuance_proceeds` = ProceedsFromIssuanceOfCommonStock > ProceedsFromStockOptionsExercised;
+  `repurchase` = PaymentsForRepurchaseOfCommonStock > PaymentsForRepurchaseOfEquity (`buyback`
+  is kept as the original name; like all flow fields these carry the `_q` / `_fy` / `_ytd` suffix,
+  e.g. `repurchase_fy`, `stock_issuance_proceeds_ytd`). Fama-French book equity: stockholders_equity + deferred_taxes -
+  preferred_stock; a missing preferred/deferred field means "not reported" (usually zero) -- the
+  strategy decides the default. Post-ASU 2015-17 most filers report only a net deferred-tax
+  figure, so deferred_taxes is sparse after 2016.
   known_at = acceptance of the reporting filing (note EDGAR dates filings accepted after 17:30 ET
   as the next day: AAPL 10-K accepted 2022-10-27 18:01 ET has filed=2022-10-28); fallback when the
   accession is not in the index: filed date 17:30 ET (never early). Restatements: all (period,
@@ -361,8 +382,19 @@ kept outside the cache (scratch) and can be deleted after loading.
 * `option_chain(underlying, as_of, min_dte, max_dte)` (latest snapshot <= as_of; `attrs`
   snapshot_ts, stale_days), `option_quote(instrument, as_of)` (None if older than 4 days),
   `option_quotes(instrument, start, end, as_of)` (all snapshots in (start, end], ts <= as_of).
-* `risk_free_rate(as_of, tenor)` tenors 1M 3M 6M 1Y ON SOFR 2Y 5Y 10Y 30Y.
-* `borrow()`, `fundamentals()`, `security_master(as_of)` (SIC sector, current GICS, sector SPDR if
+* `risk_free_rate(as_of, tenor)` tenors 1M 3M 6M 1Y ON SOFR 2Y 5Y 10Y 30Y, and
+  `risk_free_rate_info(as_of, tenor) -> (rate, series_used, fidelity, observation_date)`:
+  T1 when the tenor's native series was used (1M = DTB4WK from 2001-07-31, 6M = DTB6, 1Y = DTB1YR
+  until 2001 then DGS1 CMT), T2_PROXY when a fallback tenor was substituted (1M -> DTB3 before
+  2001-07-31) or when every candidate's last print is older than 10 days (freshest value returned).
+  `risk_free_rate()` returns the same rate; strategies that care should call the `_info` variant
+  and flag T2.
+* `fundamentals(symbols, fields, as_of)`: latest period known at as_of (latest filed value).
+  `fundamentals_history(symbols, fields, as_of, start=None)`: every filed value (all periods,
+  restatements and prior-year comparatives as separate rows) with known_at <= as_of (and
+  period_end >= start): symbol, field, value, period_start, period_end, fiscal_period, fy, form,
+  known_at, accn, concept, duration_days, source -- for PIT TTM / YoY rebuilding.
+* `borrow()`, `security_master(as_of)` (SIC sector, current GICS, sector SPDR if
   it existed at as_of; NOT fully PIT), `universe(name, as_of)`: `SP500` (PIT), `SECTOR_SPDR`,
   `SECTOR_SPDR_9`, `BROAD_INDEX_ETF`, `GEM_DUAL_MOMENTUM`, `ACCEL_DUAL_MOM`, `CROSS_ASSET`,
   `TREASURY_DURATION`, `TBILL_PROXY`, `LEVERAGED`, `EQUAL_WEIGHT_PAIR`, `CORE_ETF`, `MEGACAP`
