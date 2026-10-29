@@ -140,7 +140,8 @@ class Portal:
             # session's open SOQ; SPXW = PM). Vendor symbols are converted at ingestion.
             from .option_meta import AM_INDEX_ROOTS
             root = m.group("root").strip()
-            exp = pd.Timestamp("20" + m.group("d"))
+            d = m.group("d")
+            exp = pd.Timestamp(("19" if int(d[:2]) >= 70 else "20") + d)   # listed options exist since 1973
             strike = int(m.group("k")) / 1000.0
             right = Right(m.group("r"))
             und = {"SPXW": "SPX", "NDXP": "NDX", "RUTW": "RUT", "XSP": "XSP"}.get(root, root)
