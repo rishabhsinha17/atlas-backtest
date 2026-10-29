@@ -169,7 +169,7 @@ def test_early_close_session_flattens_5min_before_close():
     assert_status_ok(r)
     e = orders(r, "entry")
     assert len(e) == 1 and e.iloc[0].submitted_at == et(sc.day, "10:01")
-    fx = r.fills[r.fills.tag == "flat_early_close"]
+    fx = r.fills[r.fills.tag.isin(["flat_early_close", "flat_by"])]      # engine or module, same time
     assert len(fx) == 1 and fx.iloc[0].ts == et(sc.day, "12:55")
     assert r.positions.empty or (r.positions.quantity == 0).all()
 

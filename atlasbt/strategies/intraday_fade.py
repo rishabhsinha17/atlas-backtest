@@ -7,6 +7,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from ..core.types import Fidelity
 from ..indicators.patterns import double_bottom
 from ..indicators.volatility import overnight_variance_share, realized_vol, vol_scaled_to_time
 from .intraday_base import (
@@ -133,6 +134,20 @@ class _VwapSigma(IntradayStrategy):
     side = 1
     daily_n = 210
 
+    def degenerate(self) -> bool:
+        """stop_z at/beyond the entry z threshold: every signal already sits at/beyond its stop."""
+        p = self.params
+        return p["stop_z"] >= p["z"] if self.side > 0 else p["stop_z"] <= p["z"]
+
+    def init(self, ctx):
+        self.skipped_beyond_stop = 0
+        if self.degenerate():
+            msg = (f"{self.id} degenerate grid cell z={self.params['z']}/stop_z={self.params['stop_z']}: stop_z is "
+                   f"at/beyond the entry threshold, every signal has z at/beyond stop_z (no positive risk distance) "
+                   f"-> never traded")
+            ctx.flag_fidelity(Fidelity.NA, msg)
+            ctx.log(msg)
+
     def step(self, ctx):
         p = self.params
         now = int(ctx.now.value)
@@ -155,6 +170,11 @@ class _VwapSigma(IntradayStrategy):
                 continue
             r = d["rsi"].sync(ctx, tp, self.base_min)[i]
             if self.signal(ctx, sym, z, r, c):
+                if (z <= p["stop_z"]) if self.side > 0 else (z >= p["stop_z"]):
+                    self.skipped_beyond_stop += 1
+                    ctx.log("signal skipped: z already at/beyond stop_z (no positive risk distance)", symbol=sym,
+                            z=z, stop_z=p["stop_z"])
+                    continue
                 stop_px = vw + p["stop_z"] * sd
                 if self.enter(ctx, sym, self.side, c, stop_px, resting_stop=False,
                               why=f"VWAP sigma z={z:.2f}") is not None:
@@ -176,6 +196,9 @@ class S023(_VwapSigma):
         "Exits evaluated at each 5m close and executed at the next bar open: close >= VWAP (exit), z <= stop_z "
         "('next-bar stops conservative'), or after 12 bars (time exit at the open of the 12th bar after entry). "
         "No resting stop order; the planned stop for sizing/R = VWAP + stop_z x sd at the signal bar.",
+        "Signals whose z is already at/beyond stop_z are not traded (no positive risk distance for DAY_RISK sizing); "
+        "each skip is logged. Grid cells with stop_z at/beyond the entry z (z=-2.5/stop_z=-2.5) can never trade and "
+        "are surfaced with an NA fidelity flag ('degenerate grid cell') instead of reading as a plain 0-trade run.",
         "No 'first' clause: may re-enter after being flat.",
     )
     spec = 'After 10:00 z=(price-VWAP)/weighted intraday std <=-2; require price> SMA200 daily and 5m RSI(2)<10. || Exit on first 5m close >=VWAP or after 12 bars; stop at z=-3 (next-bar stops conservative).'
@@ -209,6 +232,8 @@ class S024(_VwapSigma):
         "'Exit at VWAP' = a buy limit at the current session VWAP, replaced at every 5m close (fills only when "
         "traded through); 12-bar time exit; stop z >= +3 evaluated at the 5m close, executed next bar open "
         "(mirror of S023's next-bar stop). Planned stop for sizing/R = VWAP + 3 sd at the signal bar.",
+        "Signals whose z is already at/beyond stop_z are not traded (no positive risk distance); each skip is "
+        "logged; a cell with stop_z at/beyond the entry z would be flagged NA ('degenerate grid cell').",
         "No 'first' clause: may re-enter after being flat. Borrow/SSR applied by the engine.",
     )
     spec = 'After 10:00 z>=+2 and daily close<SMA200 or no-trend filter; 5m RSI(2)>90; short next bar. || Exit at VWAP/12 bars; stop z=+3.'

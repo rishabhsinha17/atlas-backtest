@@ -160,3 +160,18 @@ def test_s019_requires_benchmark_and_ranks_cross_section():
     from ._scenarios import s019
     r = _check_trigger("S019", s019())
     assert set(orders(r, "entry").symbol) == {"N0"}
+
+
+def test_s005_missing_premarket_midpoint_is_flagged_per_day():
+    from dataclasses import replace
+    from ._scenarios import _quote, s005
+    from ._synth import SYM
+    trig, _ = s005()
+    st = registry.get("S005")()
+    assert any(q.kind == "quotes" and q.sessions == ("PRE",) and q.critical for q in st.requires)
+    # an older premarket quote is still "the last quote at/before 09:29:59"
+    _check_trigger("S005", replace(trig, quotes={SYM: _quote("09:10:00", 102.9, 103.1)}))
+    r = run(registry.get("S005"), replace(trig, quotes={SYM: _quote("10:00:30", 102.9, 103.1)}))
+    assert len(orders(r, "entry")) == 0
+    assert any("midpoint missing for XYZ on 2024-04-17" in x["reason"] and x["tier"] == "NA"
+               for x in r.fidelity["reasons"])

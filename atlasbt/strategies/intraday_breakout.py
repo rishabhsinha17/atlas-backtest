@@ -40,8 +40,8 @@ class _PremarketMixin:
     def pm_midpoint(self, ctx, sym, tp) -> float:
         t0, t1 = self.at("09:29"), self.open_ns
         mid = NAN
-        try:
-            q = ctx.portal().quotes(sym, pd.Timestamp(t0, tz="UTC"), pd.Timestamp(t1, tz="UTC"))
+        try:   # last quote at or before 09:29:59 ET (premarket from 04:00)
+            q = ctx.portal().quotes(sym, pd.Timestamp(self.at("04:00"), tz="UTC"), pd.Timestamp(t1, tz="UTC"))
         except Exception:  # pragma: no cover - portal without quotes
             q = None
         if q is not None and len(q):
@@ -54,6 +54,9 @@ class _PremarketMixin:
             if w.stop > w.start:
                 mid = float(tp.pc[w.stop - 1])
                 ctx.flag_fidelity(Fidelity.T2_PROXY, "09:29 midpoint proxied by last premarket 1m close (no quote)")
+        if mid != mid:
+            ctx.flag_fidelity(Fidelity.NA, f"09:29 premarket midpoint missing for {sym} on {self._session.date()}: "
+                                           f"no quote at/before 09:29:59 ET (no signal that day)")
         return mid
 
     def pm_stats(self, tp, start: str, end: str) -> dict:
@@ -286,7 +289,7 @@ class _GapAndGo(_PremarketMixin, IntradayStrategy):
     side = 1
 
     def build_requires(self):
-        return requires_intraday("1m", pre=True, quotes=not self.params.get("pm_mid_proxy"))
+        return requires_intraday("1m", pre=True, quotes=not self.params.get("pm_mid_proxy"), quote_sessions=("PRE",))
 
     def step(self, ctx):
         p = self.params
@@ -319,9 +322,11 @@ class _GapAndGo(_PremarketMixin, IntradayStrategy):
 
 
 _GAP_DEV = (
-    "Gap = 09:29 quote midpoint (last NBBO quote stamped 09:29:00-09:29:59 ET) / prior adjusted close - 1. "
-    "Quotes are a CRITICAL requirement (NOT_TESTABLE without them) unless the opt-in pm_mid_proxy=True, which "
-    "uses the close of the 09:29 premarket 1m bar (last premarket trade) and flags T2_PROXY.",
+    "Gap = 09:29 quote midpoint (last NBBO quote at or before 09:29:59 ET, premarket from 04:00) / prior adjusted "
+    "close - 1. PRE-session quotes are a CRITICAL requirement (Requirement('quotes', sessions=('PRE',)); "
+    "NOT_TESTABLE without them) unless the opt-in pm_mid_proxy=True, which "
+    "uses the close of the 09:29 premarket 1m bar (last premarket trade) and flags T2_PROXY. A day whose midpoint "
+    "is still missing gets no signal and an NA fidelity flag naming the symbol and date.",
     "Premarket = PRE-session bars 04:00-09:29 ET (bars starting in [04:00, 09:30)); premarket VWAP = volume-"
     "weighted typical price (indicators.intraday.window_stats); premarket turnover/volume = PRE share volume vs "
     "20d ADV in shares. PRE bars are a critical requirement; a day without PRE bars gives no signal.",
@@ -337,7 +342,7 @@ class S005(_GapAndGo):
     side = 1
     params = {"gap": 0.02, "pm_turnover": 0.2, "target_r": 2.0, "pm_mid_proxy": False}
     grid = {"gap": [0.01, 0.02, 0.04], "pm_turnover": [0.1, 0.2, 0.5]}
-    requires = requires_intraday("1m", pre=True, quotes=True)
+    requires = requires_intraday("1m", pre=True, quotes=True, quote_sessions=("PRE",))
     deviations = MODULE_DEVIATIONS + _GAP_DEV + ("Stop = low of the 09:30-09:34 bucket.",)
     spec = 'Premarket 09:29 midpoint / prior adjusted close -1 >=+2%; premarket turnover >=0.2*20d ADV; enter on first 5m close >09:30 open and above premarket VWAP. || Stop 09:30-09:34 low; exit 15:55 or 2R.'
 
@@ -349,7 +354,7 @@ class S006(_GapAndGo):
     side = -1
     params = {"gap": -0.02, "pm_turnover": 0.2, "target_r": 2.0, "pm_mid_proxy": False}
     grid = {"gap": [-0.01, -0.02, -0.04], "target_r": [1.5, 2.0]}
-    requires = requires_intraday("1m", pre=True, quotes=True)
+    requires = requires_intraday("1m", pre=True, quotes=True, quote_sessions=("PRE",))
     deviations = MODULE_DEVIATIONS + _GAP_DEV + (
         "Stop = high of the opening 5m bucket (09:30-09:34). 'profit 1.5/2R' => target_r grid; baseline 2R.",
         "Borrow/locate and SSR are applied by the engine.",
@@ -839,9 +844,11 @@ class S017(IntradayStrategy):
     deviations = MODULE_DEVIATIONS + (
         "Break = first 1m bar starting at/after 10:00 whose high exceeds the high of day through the prior bar. "
         "Impulse = peak - session low at the break; peak = running high (a new high restarts the pullback).",
-        "Pullback = bars after the peak bar (high < peak); valid when it has pb_bars..10 bars and (peak - pullback "
-        "low) / impulse < retrace; entry signal = first close above the pullback high after at least pb_bars "
-        "pullback bars. 'Pullback bars 3/5/10' = the minimum pullback length (maximum stays 10).",
+        "Pullback = bars after the peak bar; valid when it has pb_bars..10 bars and (peak - pullback low) / impulse "
+        "< retrace; entry signal = first close above the pullback high after at least pb_bars pullback bars (checked "
+        "before the new-high test, so a confirmation bar whose high exceeds the peak still enters). A new high on a "
+        "bar that does not confirm (pullback shorter than pb_bars, or no close above the pullback high) extends the "
+        "impulse and restarts the pullback. 'Pullback bars 3/5/10' = the minimum pullback length (maximum stays 10).",
         "A pullback longer than 10 bars or deeper than the retrace limit ends the day (first pullback only).",
     )
     spec = 'First break of daily high after 10:00; wait first 3-10 1m bars with <0.5*impulse retracement; buy next 1m close >pullback high. || Stop pullback low; profit 1.5R or 15:55.'
@@ -865,18 +872,20 @@ class S017(IntradayStrategy):
                     if tp.h[i] > tp.h[:i].max():
                         d["peak"], d["pt"], d["base"] = float(tp.h[i]), i, float(tp.l[:i + 1].min())
                     continue
-                if tp.h[i] > d["peak"]:
-                    d["peak"], d["pt"] = float(tp.h[i]), i
-                    continue
                 pbs = slice(d["pt"] + 1, i)                  # pullback bars before bar i
                 npb = i - d["pt"] - 1
                 imp = d["peak"] - d["base"]
+                # entry test FIRST: a confirmation close above the pullback high counts even if the same bar's
+                # high prints above the prior peak
                 if npb >= p["pb_bars"] and tp.c[i] > tp.h[pbs].max():
                     low = float(tp.l[pbs].min())
                     d["dead"] = True
                     if imp > 0 and (d["peak"] - low) / imp < p["retrace"] and i == tp.n - 1 and tp.end(i) == now:
                         self.enter(ctx, sym, 1, float(tp.c[i]), low, target_r=p["target_r"], why="first pullback")
                     break
+                if tp.h[i] > d["peak"]:                      # new high without a valid confirmation: impulse
+                    d["peak"], d["pt"] = float(tp.h[i]), i   # extends, the pullback restarts
+                    continue
                 lowi = float(tp.l[d["pt"] + 1:i + 1].min())
                 if npb + 1 > p["pb_max"] or imp <= 0 or (d["peak"] - lowi) / imp >= p["retrace"]:
                     d["dead"] = True
@@ -892,7 +901,8 @@ class S018(IntradayStrategy):
     grid = {"day_chg": [0.005, 0.01, 0.015], "ema": [10, 20, 30]}
     requires = requires_intraday("5m")
     deviations = MODULE_DEVIATIONS + (
-        "Trend day = some 5m bar closing by 11:00 with close >= open x (1+day_chg) and close > VWAP; the entry may "
+        "Trend day = some 5m bar closing by 11:00 with close > open x (1+day_chg) (strictly) and close > VWAP; the "
+        "entry may "
         "come any time after that bar.",
         "'daily VWAP breach since 10:00' = a 5m close below session VWAP on a bar starting at/after 10:00.",
         "EMA = SMA-seeded EMA of 5m closes spanning sessions. Signal: close_t > EMA_t and low_t-1 <= EMA_t-1; "
@@ -926,7 +936,7 @@ class S018(IntradayStrategy):
                 continue
             for j in range(d.get("k", 0), tp.n):
                 d["k"] = j + 1
-                if tp.end(j) <= t11 and tp.c[j] >= tp.first_open() * (1 + p["day_chg"]) and tp.c[j] > tp.vwap[j]:
+                if tp.end(j) <= t11 and tp.c[j] > tp.first_open() * (1 + p["day_chg"]) and tp.c[j] > tp.vwap[j]:
                     d["trend"] = True
                 if tp.start[j] >= t10 and tp.c[j] < tp.vwap[j]:
                     d["dead"] = True                       # VWAP breach since 10:00

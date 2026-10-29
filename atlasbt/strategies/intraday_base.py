@@ -55,8 +55,9 @@ MEGACAP_UNIVERSE = "SP500_TOP50_DV"     # MEGACAP_STK = PIT top-N S&P 500 by 20d
 #: Interpretations shared by every strategy of the family (declared once, module-wide).
 MODULE_DEVIATIONS = (
     "Early closes: '15:55 exit' = 5 min before the close and 'no new entries after 15:15' = 45 min before the "
-    "close (STRATEGY_GUIDE §1); the engine's fixed 15:55/15:15 rules do not reach a 13:00 close, so the module "
-    "flattens itself at close-5min on early-close sessions.",
+    "close (STRATEGY_GUIDE §1). The engine shifts its flat_by / entry cutoff with the actual close, and the module "
+    "also flattens at close-5min on early-close sessions (only positions without a working engine flat_by order) "
+    "and applies the shifted cutoff in its own sizing.",
     "Universe: 'STK/ETF' intraday = ETF_CORE + MEGACAP_STK (portal 'SP500_TOP50_DV', PIT); 'STK' = MEGACAP_STK; "
     "'ETF' intraday = ETF_CORE (STRATEGY_GUIDE §3; the guide names no intraday ETF set, the most liquid ETFs are "
     "used).",
@@ -455,7 +456,8 @@ class IntradayStrategy(Strategy):
             if not self._self_flattened:
                 self._self_flattened = True
                 for sym, q in sorted(ctx.positions().items()):
-                    if q and not ctx.instrument(sym).is_option:
+                    if q and not ctx.instrument(sym).is_option \
+                            and not any(o.tag == "flat_by" for o in ctx.open_orders(sym)):
                         ctx.flatten(sym, tag="flat_early_close")
             return
         if now >= self.engine_flat_ns:
@@ -636,11 +638,13 @@ class IntradayStrategy(Strategy):
             self._limit_exit[sym] = t.id
 
 
-def requires_intraday(freq: str, *, pre: bool = False, quotes: bool = False, daily: bool = True) -> list[Requirement]:
+def requires_intraday(freq: str, *, pre: bool = False, quotes: bool = False, daily: bool = True,
+                      quote_sessions: tuple = ("RTH",)) -> list[Requirement]:
     out = [Requirement("bars", freq, sessions=("PRE", "RTH") if pre else ("RTH",),
                        note="premarket + RTH bars" if pre else "")]
     if daily:
         out.append(Requirement("bars", "1d", sessions=("RTH",), note="prior close / ADV / daily filters"))
     if quotes:
-        out.append(Requirement("quotes", None, note="quote midpoint at the decision time"))
+        out.append(Requirement("quotes", None, sessions=tuple(quote_sessions),
+                               note="quote midpoint at the decision time"))
     return out
