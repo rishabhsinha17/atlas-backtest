@@ -137,3 +137,30 @@ class CoverageFilteredPortal(FastPortal):
                 "first": {"date": first[0][1], "members": first[1][0], "kept": first[1][1]},
                 "last": {"date": last[0][1], "members": last[1][0], "kept": last[1][1]},
                 "most_dropped": sorted(dropped.items(), key=lambda kv: -kv[1])[:15]}
+
+
+# ---------------------------------------------------------------------------------------------------
+# Per-session memo of PIT stock universes (performance only, identical results).
+# Portal._universe('SP500', as_of) is a function of the SESSION DATE of as_of only (membership interval
+# test + _member_key(ticker, d)), but rebuilding ~500 security keys costs ~4 s per call; Portal.borrow()
+# calls it on EVERY call (S&P membership decides the default fee) and the engine calls borrow() for every
+# short position at every session end -> ~500 s per simulated year for a 1-symbol strategy that shorts
+# (f9702e1). Static universes depend on as_of itself (listing known_at) and are NOT memoized; neither are
+# require_bars=True calls (bars known within the day).
+_SESSION_KEYED = ("SP500", "S&P500", "SPX_MEMBERS")
+
+
+def _universe_memo(self, name: str, as_of, require_bars: bool = False):
+    n = str(name).upper()
+    if require_bars or n not in _SESSION_KEYED:
+        return Portal.universe(self, name, as_of, require_bars) if require_bars else Portal.universe(self, name, as_of)
+    memo = self.__dict__.setdefault("_univ_memo", {})
+    key = (n, _session_date(_utc(as_of)))
+    hit = memo.get(key)
+    if hit is None:
+        hit = list(Portal.universe(self, name, as_of))
+        memo[key] = hit
+    return list(hit)
+
+
+FastPortal.universe = _universe_memo
