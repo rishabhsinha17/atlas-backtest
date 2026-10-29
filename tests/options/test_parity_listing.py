@@ -94,3 +94,19 @@ def test_box_rate():
     out = box_vs_tbill(q, 4000, 4100, T, tbill_cc=float(tbill_discount_to_cc(0.05, 182)), fee_per_contract=0.5)
     assert out["lend_rate_cc"] < out["mid_rate_cc"] < out["borrow_rate_cc"]
     assert out["terminal_value_usd"] == 10000.0
+
+
+def test_index_product_listing_rules():
+    from atlasbt.core.types import Fidelity
+    rut = listed_expiries("RUT", "2023-06-13", horizon_days=40)
+    assert set(rut["root"]) == {"RUT", "RUTW"}
+    assert set(rut.loc[rut["root"] == "RUT", "settlement"]) == {"CASH_AM"}
+    assert set(rut.loc[rut["root"] == "RUTW", "settlement"]) == {"CASH_PM"}
+    assert has_0dte("RUT", "2023-06-14") and not has_0dte("RUT", "2023-06-13")   # Wed yes, Tue (pre-2024) no
+    assert has_0dte("RUT", "2024-06-11")                                          # Tuesday after 2024 dailies
+    ndx = listed_expiries("NDX", "2023-06-13", horizon_days=40)
+    assert set(ndx["root"]) == {"NDX"} and set(ndx["settlement"]) == {"CASH_AM"}  # NDXP unverified -> not modeled
+    xsp = listed_expiries("XSP", "2023-06-13", horizon_days=40)
+    assert set(xsp["root"]) == {"XSP"} and set(xsp["settlement"]) == {"CASH_PM"}
+    vix = listed_expiries("VIX", "2023-06-13")
+    assert vix.empty and vix.attrs["fidelity"] == Fidelity.NA

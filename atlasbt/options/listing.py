@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from atlasbt.core import clock
+from atlasbt.core.types import Fidelity
 
 D = pd.Timestamp
 
@@ -72,7 +73,46 @@ LISTING_FACTS = {
                        src="SEC Rel. 34-93157 (2021-09-28) approving IWM Mon/Wed expirations; first expiry assumed "
                            "next week", confidence="low"),
     "LEAPS": dict(first=D("1990-10-01"), src="Cboe LEAPS introduced 1990", confidence="high"),
+    # XSP (Mini-SPX): single PM-settled root (integrator rule); weeklies modeled only once Cboe
+    # stated XSP had expirations every weekday (2022-09-19 release); earlier XSP weeklies existed
+    # but their start dates are unverified -> NOT modeled (conservative).
+    "XSP_TUE": dict(first=D("2022-10-11"), listed=D("2022-10-03"),
+                    src="Cboe 2022-09-19 release: XSP Tuesday expirations from 2022-10-03 (first expiry +1wk inferred)",
+                    confidence="medium"),
+    "XSP_THU": dict(first=D("2022-10-20"), listed=D("2022-10-12"),
+                    src="Cboe 2022-09-19 release: XSP Thursday expirations from 2022-10-12", confidence="medium"),
+    "XSP_MWF": dict(first=D("2022-10-12"), src="UNVERIFIED start: existed before; modeled only from the date XSP "
+                    "dailies were complete (conservative)", confidence="low"),
+    # RUT: AM monthlies (root RUT) + PM weeklies (root RUTW)
+    "RUTW_MONWED": dict(first=D("2021-03-08"), listed=D("2021-03-01"),
+                        src="Cboe release 'Cboe Exchanges to List Monday and Wednesday Expiring Weekly Options on RUTW' "
+                            "(2021-03-01)", confidence="medium"),
+    "RUTW_FRI": dict(first=D("2021-03-12"), listed=D("2021-03-01"),
+                     src="UNVERIFIED start: Friday RUTW existed before 2021; modeled from 2021-03 (conservative)",
+                     confidence="low"),
+    "RUTW_TUE": dict(first=D("2024-01-16"), listed=D("2024-01-08"),
+                     src="Cboe 2023-12-21 release: RUT daily expiries (Tue/Thu) from 2024-01-08", confidence="medium"),
+    "RUTW_THU": dict(first=D("2024-01-18"), listed=D("2024-01-08"),
+                     src="Cboe 2023-12-21 release", confidence="medium"),
+    "RUTW_3RDFRI": dict(first=D("2024-11-15"), listed=D("2024-10-01"),
+                        src="Cboe notice: standard third-Friday PM RUTW listed as of October 2024", confidence="low"),
+    # NDX: AM monthlies only; PM weeklies (NDXP) launch date not verified -> not modeled.
+    "NDX_AM_MONTHLY": dict(first=D("1994-01-01"), src="NDX index options AM-settled monthlies (long-standing)",
+                           confidence="medium"),
+    "RUT_AM_MONTHLY": dict(first=D("1994-01-01"), src="RUT index options AM-settled monthlies (long-standing)",
+                           confidence="medium"),
 }
+
+# Index products with a listing model.  Any other index -> empty frame, Fidelity.NA.
+INDEX_LISTING = {
+    "XSP": {"monthly": ("XSP", "CASH_PM", None), "weekly_root": "XSP",
+            "weekly": {0: "XSP_MWF", 1: "XSP_TUE", 2: "XSP_MWF", 3: "XSP_THU", 4: "XSP_MWF"}, "third_fri_pm": "XSP_MWF"},
+    "NDX": {"monthly": ("NDX", "CASH_AM", "NDX_AM_MONTHLY"), "weekly_root": "NDXP", "weekly": {}, "third_fri_pm": None},
+    "RUT": {"monthly": ("RUT", "CASH_AM", "RUT_AM_MONTHLY"), "weekly_root": "RUTW",
+            "weekly": {0: "RUTW_MONWED", 1: "RUTW_TUE", 2: "RUTW_MONWED", 3: "RUTW_THU", 4: "RUTW_FRI"},
+            "third_fri_pm": "RUTW_3RDFRI"},
+}
+KNOWN_INDEXES = {"SPX", "SPXW", "XSP", "NDX", "RUT", "VIX", "DJX", "OEX", "XEO", "MRUT", "NANOS", "NDXP", "RUTW"}
 
 INDEX_ROOTS = {"SPX", "SPXW", "XSP", "NDX", "RUT"}
 WEEKLY_ETFS = {"SPY", "QQQ", "IWM", "DIA"}
@@ -88,10 +128,14 @@ class ProductSpec:
 
 
 def product_spec(underlying: str) -> ProductSpec:
-    u = underlying.upper()
+    u = underlying.upper().lstrip("^$")
     if u in ("SPX", "SPXW"):
         return ProductSpec("SPX", True, "EUROPEAN", 100.0, True)
-    if u in ("XSP", "NDX", "RUT"):
+    if u in ("NDXP",):
+        return ProductSpec("NDX", True, "EUROPEAN", 100.0, True)
+    if u in ("RUTW",):
+        return ProductSpec("RUT", True, "EUROPEAN", 100.0, True)
+    if u in KNOWN_INDEXES:
         return ProductSpec(u, True, "EUROPEAN", 100.0, True)
     broad = u in {"SPY", "QQQ", "IWM", "DIA", "EEM", "EFA", "VTI", "VOO", "IVV", "MDY"}
     return ProductSpec(u, False, "AMERICAN", 100.0, broad)
@@ -167,12 +211,20 @@ def listed_expiries(underlying: str, as_of, horizon_days: int = 800, include_wee
     as_of = pd.Timestamp(as_of).normalize()
     if as_of.tzinfo is not None:
         as_of = as_of.tz_localize(None)
-    u = underlying.upper()
+    u = underlying.upper().lstrip("^$")
     spec = product_spec(u)
+    u = spec.underlying if spec.is_index else u
     end = as_of + pd.Timedelta(days=horizon_days)
     rows: list[ExpiryRow] = []
+    cols = ["expiry", "settlement_date", "kind", "root", "settlement", "exercise"]
+    is_spx = u == "SPX"
+    cfg = INDEX_LISTING.get(u)
+    if spec.is_index and not is_spx and cfg is None:
+        out = pd.DataFrame(columns=cols)
+        out.attrs.update(fidelity=Fidelity.NA, reason=f"no listing model for index {u}")
+        return out
     if include_weeklies is None:
-        include_weeklies = (u in ("SPX", "SPXW") or u in WEEKLY_ETFS)
+        include_weeklies = (spec.is_index or u in WEEKLY_ETFS)
     # ---------------- monthlies / quarterlies / LEAPS
     months = set()
     for yy, mm in _months_ahead(as_of, 4):          # 4 nearest serial months
@@ -194,7 +246,20 @@ def listed_expiries(underlying: str, as_of, horizon_days: int = 800, include_wee
             if mm == 1 and as_of >= LISTING_FACTS["LEAPS"]["first"]:
                 months.add((yy, mm))
     for yy, mm in sorted(months):
-        if spec.is_index:
+        if cfg is not None:
+            root_m, st_m, fact = cfg["monthly"]
+            settle = _prev_business(third_friday(yy, mm))
+            if fact is not None and as_of < LISTING_FACTS[fact]["first"]:
+                continue
+            if st_m == "CASH_AM":
+                rows.append(ExpiryRow(_cal().prev_session(settle), settle, "MONTHLY", root_m, "CASH_AM", "EUROPEAN"))
+            else:
+                rows.append(ExpiryRow(settle, settle, "MONTHLY", root_m, st_m, "EUROPEAN"))
+            tf = cfg.get("third_fri_pm")
+            if tf and st_m == "CASH_AM" and settle >= LISTING_FACTS[tf]["first"] \
+                    and as_of >= LISTING_FACTS[tf].get("listed", LISTING_FACTS[tf]["first"]):
+                rows.append(ExpiryRow(settle, settle, "MONTHLY", cfg["weekly_root"], "CASH_PM", "EUROPEAN"))
+        elif is_spx:
             settle = _prev_business(third_friday(yy, mm))
             if as_of >= LISTING_FACTS["SPX_AM_MONTHLY"]["first"]:
                 ltd = _cal().prev_session(settle)
@@ -219,7 +284,14 @@ def listed_expiries(underlying: str, as_of, horizon_days: int = 800, include_wee
             if wd > 4:
                 continue
             types = []
-            if spec.is_index:
+            if cfg is not None:
+                key = cfg["weekly"].get(wd)
+                if key:
+                    f = LISTING_FACTS[key]
+                    is3 = wd == 4 and d == third_friday(d.year, d.month)
+                    if d >= f["first"] and as_of >= f.get("listed", f["first"]) and not is3:
+                        types.append("IDX_PM")
+            elif is_spx:
                 if wd == 4:
                     if LISTING_FACTS["SPXW_FRI_AM"]["first"] <= d <= LISTING_FACTS["SPXW_FRI_AM"]["last"]:
                         types.append("FRI_AM")
@@ -260,11 +332,13 @@ def listed_expiries(underlying: str, as_of, horizon_days: int = 800, include_wee
                         rows.append(ExpiryRow(ltd, e, "WEEKLY", "SPX", "CASH_AM", "EUROPEAN"))
                 elif t == "PM":
                     rows.append(ExpiryRow(e, e, "WEEKLY", "SPXW", "CASH_PM", "EUROPEAN"))
+                elif t == "IDX_PM":
+                    rows.append(ExpiryRow(e, e, "WEEKLY", cfg["weekly_root"], "CASH_PM", "EUROPEAN"))
                 else:
                     rows.append(ExpiryRow(e, e, "WEEKLY", u, "PHYSICAL", "AMERICAN"))
     df = pd.DataFrame([r.__dict__ for r in rows])
     if df.empty:
-        return pd.DataFrame(columns=["expiry", "settlement_date", "kind", "root", "settlement", "exercise"])
+        return pd.DataFrame(columns=cols)
     df = df[(df["expiry"] >= as_of) & (df["expiry"] <= end)]
     # a weekly that coincides with a monthly of the same root+settlement collapses onto the monthly
     df["_rank"] = df["kind"].map({"MONTHLY": 0, "QUARTERLY": 0, "LEAPS": 0, "WEEKLY": 1})
@@ -280,8 +354,8 @@ def has_0dte(underlying: str, session) -> bool:
         return False
     df = listed_expiries(underlying, s, horizon_days=1)
     df = df[df["expiry"] == s]
-    if underlying.upper() in ("SPX", "SPXW"):
-        df = df[df["settlement"] == "CASH_PM"]
+    if product_spec(underlying).is_index and len(df):
+        df = df[df["settlement"] == "CASH_PM"]   # AM series stop trading the session before
     return len(df) > 0
 
 
@@ -302,6 +376,10 @@ def strike_increment(underlying: str, strike: float, as_of, dte: int) -> float:
         return 5.0 if dte <= 400 else 25.0
     if u in ("XSP",):
         return 1.0
+    if u in ("NDX", "NDXP"):
+        return 25.0 if dte <= 400 else 100.0
+    if u in ("RUT", "RUTW"):
+        return 5.0 if dte <= 400 else 25.0
     if u in WEEKLY_ETFS:
         return 1.0 if dte <= 400 else 5.0
     if as_of < D("2012-01-01"):
@@ -344,7 +422,7 @@ def tick_size(underlying: str, price, as_of) -> np.ndarray:
     p = np.asarray(price, float)
     u = underlying.upper()
     as_of = pd.Timestamp(as_of)
-    if u in ("SPX", "SPXW") or as_of < D("2007-01-26"):
+    if u in ("SPX", "SPXW", "NDX", "NDXP", "RUT", "RUTW") or as_of < D("2007-01-26"):
         return np.where(p < 3.0, 0.05, 0.10)
     if u in PENNY_ALL:
         return np.full(p.shape, 0.01)

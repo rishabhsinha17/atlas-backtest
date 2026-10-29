@@ -101,6 +101,9 @@ class SyntheticParams:
     atm_ratio_index: float = 0.88        # SPX-family ATM IV / vol index (30d) at index level 20
     atm_ratio_logvix: float = 0.0        # d ratio / d ln(index level)  (regime dependence)
     atm_ratio_schedule: list = field(default_factory=list)   # point-in-time [{from, c0, c1, ...}]
+    atm_ratio_obs: list = field(default_factory=list)        # per-roll PUT-implied {R, R2, vix, ratio}
+    # window of the chain data behind skew/wing/spread parameters (NOT point-in-time)
+    fit_window: list = field(default_factory=lambda: ["2019-08-15", "2026-09-16"])
     atm_ratio_single: float = 0.95       # single-name ATM IV / its vol index
     skew_a0: float = -0.30               # index products slope at SKEW=130
     skew_a1: float = -0.03               # per +10 SKEW points
@@ -190,20 +193,47 @@ class VolSource:
         return v
 
 
+ATM_RATIO_PRIOR = (0.88, 0.0)   # judgmental prior (c0, c1) fixed BEFORE looking at post-2007 data
+ATM_RATIO_PRIOR_N = 24          # rolls needed before the data fully replace the prior
+
+
+def _huber_ratio_fit(obs: list) -> tuple[float, float]:
+    import statsmodels.api as sm
+    v = np.array([o["vix"] for o in obs], float)
+    y = np.array([o["ratio"] for o in obs], float)
+    if len(obs) < 8:
+        return float(np.median(y)), 0.0
+    X = sm.add_constant(np.log(v / 0.20))
+    r = sm.RLM(y, X, M=sm.robust.norms.HuberT()).fit()
+    return float(r.params[0]), float(r.params[1])
+
+
 def atm_ratio_params(p: SyntheticParams, as_of=None) -> tuple[float, float, str]:
-    """(c0, c1, label) valid at ``as_of``: the latest point-in-time schedule entry
-    with from <= as_of (parameters estimated only from earlier PUT-index rolls);
-    before the first entry the earliest fit is used and labelled 'pre-sample'."""
+    """(c0, c1, label) valid at ``as_of``.
+
+    * From the first schedule entry on: the latest entry with from <= as_of
+      (fitted only on PUT-index rolls settled before that year) -> 'PIT fit through ...'.
+    * Before it: only rolls whose NEXT roll (settlement) is <= as_of are used; with
+      n < ATM_RATIO_PRIOR_N such rolls the fit is blended with the prior
+      ATM_RATIO_PRIOR (weight n/N) -> label starts with 'prior' and synthetic
+      chains carry the fidelity reason 'atm_ratio_prior'."""
     sch = p.atm_ratio_schedule
     if not sch or as_of is None:
         return p.atm_ratio_index, p.atm_ratio_logvix, "static"
     d = clock.session_date_of(clock.to_utc(as_of)) if pd.Timestamp(as_of).tzinfo is not None else pd.Timestamp(as_of)
     ok = [e for e in sch if pd.Timestamp(e["from"]) <= d]
-    if not ok:
-        e = sch[0]
-        return e["c0"], e["c1"], f"pre-sample (fit through {e['fitted_through']})"
-    e = ok[-1]
-    return e["c0"], e["c1"], f"PIT fit through {e['fitted_through']}"
+    if ok:
+        e = ok[-1]
+        return e["c0"], e["c1"], f"PIT fit through {e['fitted_through']}"
+    obs = [o for o in getattr(p, "atm_ratio_obs", []) if pd.Timestamp(o["R2"]) <= d]
+    c0p, c1p = ATM_RATIO_PRIOR
+    if not obs:
+        return c0p, c1p, "prior (no PUT-index roll settled before as_of)"
+    c0f, c1f = _huber_ratio_fit(obs)
+    w = min(len(obs) / ATM_RATIO_PRIOR_N, 1.0)
+    last = max(pd.Timestamp(o["R2"]) for o in obs)
+    return ((1 - w) * c0p + w * c0f, (1 - w) * c1p + w * c1f,
+            f"prior-blend w={w:.2f} (n={len(obs)} rolls; fit through {last.date()})")
 
 
 def atm_ratio(level, p: SyntheticParams, single: bool = False, as_of=None):
@@ -256,8 +286,21 @@ def skew_params(underlying: str, skew_index: float, p: SyntheticParams, dte: flo
 SPX_SPREAD_PROXY = ("SPY", 10.0)   # fallback only if SPX/SPXW were not in the calibration data
 
 
+def params_fit_reasons(p: SyntheticParams, session) -> tuple[list, bool]:
+    """(fidelity reasons, use_symbol_fe) for a session date.  Skew, wing and spread
+    parameters were fitted on chains in ``p.fit_window``: sessions before the window
+    END get 'params_fit_post_as_of'; before the window START the per-symbol spread
+    fixed effects are not used (class defaults instead)."""
+    d = pd.Timestamp(session).normalize()
+    if d.tzinfo is not None:
+        d = d.tz_convert("America/New_York").tz_localize(None).normalize()
+    start, end = (pd.Timestamp(x) for x in p.fit_window)
+    reasons = ["params_fit_post_as_of"] if d < end else []
+    return reasons, d >= start
+
+
 def model_spread(mid, dte, absdelta, underlying: str, p: SyntheticParams, is_etf: bool = False, vix: float = 0.20,
-                 root: str | None = None):
+                 root: str | None = None, use_symbol_fe: bool = True):
     """Median quoted spread (ask - bid, $) from the calibrated log-linear model:
     log s = FE[key] + b1 log(mid) + b2 log(mid)^2 + b3 |delta| + b4 log(dte) + b5 log(VIX) (VIX decimal).
     key = option root if calibrated (SPX AM vs SPXW PM), else the underlying, else the
@@ -265,6 +308,15 @@ def model_spread(mid, dte, absdelta, underlying: str, p: SyntheticParams, is_etf
     price/10 and scaled x10 (SPX_SPREAD_PROXY)."""
     u = underlying.upper()
     scale = 1.0
+    if not use_symbol_fe:   # before the calibration window: no per-symbol fixed effects
+        c = p.spread_coef
+        fe = p.spread_default_fe["etf" if is_etf else "stock"]
+        lm = np.log(np.maximum(np.asarray(mid, float), 0.005))
+        ls = (fe + c.get("log_mid", 0.0) * lm + c.get("log_mid2", 0.0) * lm * lm
+              + c.get("absdelta", 0.0) * np.asarray(absdelta, float)
+              + c.get("log_dte", 0.0) * np.log(np.maximum(np.asarray(dte, float), 1.0))
+              + c.get("log_vix", 0.0) * np.log(max(float(vix), 0.05)))
+        return np.exp(ls)
     key = (root or u).upper()
     if key not in p.spread_symbol_fe and u in p.spread_symbol_fe:
         key = u
@@ -292,12 +344,93 @@ class SyntheticChainGenerator:
     def params(self) -> SyntheticParams:
         return self.vol.params
 
+    # ------------------------------------------------------------------ shared pricing
+    def _price_strikes(self, u, spec, sess, spot, K, T, dte, r, q, F, atm, sk, right, is_etf, vix30, root, use_fe):
+        """Model mid / iv / greeks / tick-rounded bid-ask for strikes K of one series
+        (shared by ``chain`` and ``quote_contract`` so both are identical)."""
+        K = np.asarray(K, float)
+        Tm = max(T, 60.0 / (365 * 86400))           # smile coordinates need T > 0 (expiry-day close)
+        a, b, wp, wc = skew_params(u, sk, self.params, Tm * 365.0)
+        x = np.log(K / F) / (atm * np.sqrt(Tm))
+        iv = atm * smile_g(x, a, b, wp, wc)
+        cp = right == "C"
+        if spec.exercise == "EUROPEAN":
+            px = bsm_price(spot, K, T, r, q, iv, cp)
+        else:
+            px = bs2002_price(spot, K, T, r, q, iv, cp)
+        px = np.atleast_1d(np.asarray(px, float))
+        g = bsm_greeks(spot, K, Tm, r, q, iv, cp)
+        spr = model_spread(px, max(dte, 1), np.abs(g.delta), u, self.params, is_etf, vix30, root=root,
+                           use_symbol_fe=use_fe)
+        tick = tick_size(u, px, sess)
+        bid = np.floor((px - spr / 2) / tick + 1e-9) * tick
+        ask = np.ceil((px + spr / 2) / tick - 1e-9) * tick
+        ask = np.maximum(ask, bid + tick)
+        bid = np.where(bid < tick - 1e-12, 0.0, bid)
+        return {"mid": px, "iv": np.atleast_1d(iv), "bid": np.atleast_1d(bid), "ask": np.atleast_1d(ask),
+                "greeks": g}
+
+    def _context(self, u, as_of, rv_ratio):
+        """PIT model inputs shared by chain/quote: term structure, SKEW, VIX, reasons."""
+        sess = clock.session_date_of(as_of)
+        term = self.vol.atm_term(u, as_of, rv_ratio)
+        reasons = []
+        ratio_label = atm_ratio_params(self.params, as_of)[2]
+        uses_index_ratio = u in SPX_LIKE or u in ("QQQ", "NDX", "IWM", "RUT", "DIA", "DJX") or u not in INDEX_MAP
+        if ratio_label.startswith("prior") and uses_index_ratio:
+            reasons.append("atm_ratio_prior")
+        if u in ("NDX", "RUT", "NDXP", "RUTW"):
+            reasons.append("spread model uncalibrated for this index (no free quotes)")
+        pf_reasons, use_fe = params_fit_reasons(self.params, sess)
+        reasons += pf_reasons
+        fam = self.vol.vix_family(as_of)
+        vix30 = float(fam.loc[fam["index"] == "VIX", "level"].iloc[0]) if (fam["index"] == "VIX").any() else 0.20
+        return dict(sess=sess, term=term, reasons=reasons, ratio_label=ratio_label, use_fe=use_fe,
+                    sk=self.vol.skew_index(as_of), vix30=vix30)
+
+    def quote_contract(self, underlying: str, as_of, spot: float, r: float, q: float, expiry, strike: float,
+                       right: str, root: str | None = None, settlement: str | None = None,
+                       rv_ratio: float | None = None, strict: bool = False) -> dict | None:
+        """Synthetic quote of ONE contract at ``as_of`` with exactly the model used by
+        ``chain`` (same series, smile, spread model, ticks).  Returns dict(bid, ask, mid,
+        iv, delta, gamma, vega, theta, underlying_price, reasons) or None when the model
+        has no inputs (or ``strict`` and the ATM ratio is a prior).  At/after the
+        settlement instant returns None (the lifecycle settles the position)."""
+        as_of = clock.to_utc(as_of)
+        u = underlying.upper()
+        spec = product_spec(u)
+        ctx = self._context(u, as_of, rv_ratio)
+        if ctx["term"].empty or (strict and "atm_ratio_prior" in ctx["reasons"]):
+            return None
+        st = settlement or ("CASH_PM" if spec.is_index else "PHYSICAL")
+        T = year_fraction(as_of, pd.Timestamp(expiry), st)
+        from atlasbt.pricing.time import settlement_instant
+        if as_of > settlement_instant(pd.Timestamp(expiry), st):
+            return None
+        atm, _ = atm_vol_at(ctx["term"], max(T, 1e-6))
+        if not np.isfinite(atm):
+            return None
+        F = spot * np.exp((r - q) * T)
+        dte = (pd.Timestamp(expiry).normalize() - ctx["sess"]).days
+        is_etf = (not spec.is_index) and spec.broad_based
+        qd = self._price_strikes(u, spec, ctx["sess"], spot, [float(strike)], T, dte, r, q, F, atm, ctx["sk"],
+                                 right.upper()[0], is_etf, ctx["vix30"], root, ctx["use_fe"])
+        g = qd["greeks"]
+        return {"bid": float(qd["bid"][0]), "ask": float(qd["ask"][0]), "mid": float(qd["mid"][0]),
+                "iv": float(qd["iv"][0]), "delta": float(np.atleast_1d(g.delta)[0]),
+                "gamma": float(np.atleast_1d(g.gamma)[0]), "vega": float(np.atleast_1d(g.vega)[0]),
+                "theta": float(np.atleast_1d(g.theta)[0]), "underlying_price": float(spot),
+                "reasons": list(ctx["reasons"])}
+
     def chain(self, underlying: str, as_of, spot: float, r: float, q: float = 0.0, max_dte: int = 400,
               min_dte: int = 0, rv_ratio: float | None = None, include_weeklies: bool | None = None,
-              n_sd: float = 4.0) -> pd.DataFrame:
+              n_sd: float = 4.0, strict: bool = False) -> pd.DataFrame:
         """Canonical option_chain frame (fidelity T3_MODELED) at ``as_of`` (UTC).
         ``spot`` raw underlying price at as_of; ``r``/``q`` continuous.
-        Returns an empty frame (attrs['reason']) if the vol inputs are missing."""
+        Returns an empty frame (attrs['reason']) if the vol inputs are missing.
+        ``attrs['fidelity_reasons']`` lists caveats; 'atm_ratio_prior' when the ATM
+        ratio still leans on the pre-sample prior (before 2010); with ``strict=True``
+        such dates return an empty frame with Fidelity.NA instead."""
         as_of = clock.to_utc(as_of)
         sess = clock.session_date_of(as_of)
         u = underlying.upper()
@@ -310,10 +443,28 @@ class SyntheticChainGenerator:
             out = pd.DataFrame(columns=cols)
             out.attrs.update(fidelity=Fidelity.NA, source="synthetic", reason=f"no vol index inputs for {u} at {as_of}")
             return out
+        ratio_label = atm_ratio_params(self.params, as_of)[2]
+        reasons = []
+        uses_index_ratio = u in SPX_LIKE or u in ("QQQ", "NDX", "IWM", "RUT", "DIA", "DJX") or u not in INDEX_MAP
+        if ratio_label.startswith("prior") and uses_index_ratio:
+            reasons.append("atm_ratio_prior")
+            if strict:
+                out = pd.DataFrame(columns=cols)
+                out.attrs.update(fidelity=Fidelity.NA, source="synthetic", reason=f"atm_ratio_prior: {ratio_label}",
+                                 fidelity_reasons=reasons)
+                return out
+        if u in ("NDX", "RUT", "NDXP", "RUTW"):
+            reasons.append("spread model uncalibrated for this index (no free quotes)")
+        pf_reasons, use_fe = params_fit_reasons(self.params, sess)
+        reasons += pf_reasons
         sk = self.vol.skew_index(as_of)
         fam = self.vol.vix_family(as_of)
         vix30 = float(fam.loc[fam["index"] == "VIX", "level"].iloc[0]) if (fam["index"] == "VIX").any() else 0.20
         exps = listed_expiries(u, sess, horizon_days=max_dte, include_weeklies=include_weeklies)
+        if exps.attrs.get("fidelity") == Fidelity.NA:
+            out = pd.DataFrame(columns=cols)
+            out.attrs.update(fidelity=Fidelity.NA, source="synthetic", reason=exps.attrs.get("reason", "no listing model"))
+            return out
         rows = []
         is_etf = (not spec.is_index) and spec.broad_based
         from atlasbt.core.types import Instrument, Right, ExerciseStyle, SettlementType
@@ -327,31 +478,20 @@ class SyntheticChainGenerator:
                 continue
             F = spot * np.exp((r - q) * T)
             K = strike_grid(u, spot, sess, dte, atm, n_sd)
-            a, b, wp, wc = skew_params(u, sk, self.params, T * 365.0)
-            x = np.log(K / F) / (atm * np.sqrt(T))
-            iv = atm * smile_g(x, a, b, wp, wc)
             for right in ("C", "P"):
-                cp = right == "C"
-                if spec.exercise == "EUROPEAN":
-                    px = bsm_price(spot, K, T, r, q, iv, cp)
-                else:
-                    px = bs2002_price(spot, K, T, r, q, iv, cp)
-                g = bsm_greeks(spot, K, T, r, q, iv, cp)
-                spr = model_spread(px, dte, np.abs(g.delta), u, self.params, is_etf, vix30, root=e.root)
-                tick = tick_size(u, px, sess)
-                bid = np.floor((px - spr / 2) / tick + 1e-9) * tick
-                ask = np.ceil((px + spr / 2) / tick - 1e-9) * tick
-                ask = np.maximum(ask, bid + tick)
-                bid = np.where(bid < tick - 1e-12, 0.0, bid)
+                qd = self._price_strikes(u, spec, sess, spot, K, T, dte, r, q, F, atm, sk, right, is_etf, vix30,
+                                         e.root, use_fe)
+                px, iv, bid, ask = qd["mid"], qd["iv"], qd["bid"], qd["ask"]
+                g = qd["greeks"]
                 for j, k in enumerate(K):
-                    ins = Instrument.option(u if not spec.is_index else "SPX", e.expiry, float(k), Right(right),
+                    ins = Instrument.option(spec.underlying if spec.is_index else u, e.expiry, float(k), Right(right),
                                             ExerciseStyle(e.exercise), SettlementType(e.settlement), root=e.root)
                     rows.append((as_of, u, ins.symbol, e.root, e.expiry, e.settlement_date, e.kind, float(k), right,
                                  float(bid[j]), float(ask[j]), float(px[j]), float(iv[j]), float(g.delta[j]),
                                  float(g.gamma[j]), float(g.vega[j]), float(g.theta[j]), float(spot), np.nan, np.nan,
                                  e.exercise, e.settlement, spec.multiplier, int(Fidelity.T3_MODELED)))
         out = pd.DataFrame(rows, columns=cols)
-        out.attrs.update(fidelity=Fidelity.T3_MODELED,
+        out.attrs.update(fidelity=Fidelity.T3_MODELED, fidelity_reasons=reasons,
                          source=f"synthetic: listing calendar + {term['source'].iloc[0]} term structure x atm_ratio "
                                 f"({atm_ratio_params(self.params, as_of)[2]}), "
                                 f"smile a30={skew_params(u, sk, self.params, 30.0)[0]:.3f} (SKEW={sk}), calibrated spread model",

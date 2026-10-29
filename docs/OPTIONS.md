@@ -18,7 +18,7 @@ Everything here is a pure function or a small dataclass; the engine plugs it in 
 | `options/chain.py` | chain preparation (dte, T, mid, delta source), quality filters, stale detection, expiry/delta/ATM/wing selection |
 | `options/structures.py` | `OptLeg`/`StockLeg`/`Package`, builders for every S126–S172 structure, mid/natural valuation, payoff, max P/L, breakevens, COMBO orders, greeks, hedge & vega-match helpers |
 | `options/metrics.py` | `chain_metrics`: ATM 30D/60D, 25Δ put/call IV & skew, term spread, forwards |
-| `options/marking.py` | mark any contract from a snapshot: quoted → same-day surface (T2) → extrapolated (T3) |
+| `options/marking.py` | mark any contract from a snapshot: quoted → same-day surface (T2) → extrapolated (T3); `synthetic_option_quotes` fallback quote stream for `Portal.option_quotes` |
 | `options/listing.py` | historical listed-expiry calendar (SPX AM/PM, SPXW weekdays, SPY/QQQ/IWM weeklies), strike grids, tick sizes |
 | `options/synthetic.py` | synthetic chain generator (T3_MODELED) from Cboe vol indices + SKEW + calibrated spread model |
 | `options/calibrate.py` | calibration on DoltHub chains + validation vs Cboe PUT index |
@@ -56,10 +56,16 @@ Everything here is a pure function or a small dataclass; the engine plugs it in 
 * Discrete dividends: Hull Ex. 15.10 (c = 3.67, S* = 39.0259); CRR European with dividends → escrowed BSM.
 * CRR: Hull Ex. 21.1 5-step American put 4.49; convergence to BSM (1000 steps, < 2e-3).
   At very low vol (p ∉ (0,1)) the tree switches to a drift-centred lattice.
+* Bjerksund-Stensland 2002 assumes r ≥ 0; elements with r < 0 are priced by CRR (400 steps).
 * Bjerksund-Stensland: the shared φ function reproduces Haug's BS-1993 value 5.2704 exactly;
   BS-2002 (5.2869 for the same inputs) is checked within 0.6% of a 2000-step CRR for calls and puts
   and above BS-1993. Numerical overflow at tiny vol falls back to CRR.
 * Bivariate normal: Genz (2004) with 20-point Gauss-Legendre, |err| < 1e-7 vs scipy.
+* American IV fast path (`american_implied_vol_fast`, used by `deamericanize`): European IV of the
+  American price as start, Newton then secant steps with one vectorized BS-2002 call each, Brent
+  fallback; same reason codes as the Brent inverter (tested equal; IV within 2e-4, price within 1e-6).
+  Forward inference batches de-Americanization across all expiries; `chain_metrics` caches per
+  snapshot content + session (≈0.1 s cold on a DoltHub SPY snapshot, ~ms warm; was ≈1.2–1.9 s).
 * IV: vectorized safeguarded Newton-bisection (bracket kept, cannot diverge) + `brentq` fallback on
   [1e-4, 5]. NaN with reason: `BELOW_INTRINSIC` (below discounted-forward intrinsic), `ABOVE_MAX`,
   `NONPOSITIVE_PRICE`, `EXPIRED`, `VOL_BELOW_MIN`, `VOL_ABOVE_MAX`, `NO_CONVERGENCE`, `BAD_INPUT`.
@@ -76,7 +82,8 @@ Everything here is a pure function or a small dataclass; the engine plugs it in 
 * Constant maturity (S143/S165/S168): linear interpolation in total variance w=σ²T between
   bracketing expiries; flat-vol extrapolation flagged `extrap_flat`.
 * Delta-space (S166/S167): IV vs forward delta interpolated per expiry, total variance across expiries;
-  `skew_25d` = IV(−25Δ put) − IV(+25Δ call) at 30D.
+  `skew_25d` = IV(−25Δ put) − IV(+25Δ call) at 30D; its flag (and `chain_metrics['flag_skew']`) is the
+  WORSE of the two legs' flags (exact/interp < extrap_flat < none).
 * SVI raw per expiry (least squares in total variance, multi-start); `ok` only if: min variance ≥ 0,
   Lee bound b(1+|ρ|) ≤ 4, Gatheral-Jacquier g(k) ≥ 0 on a grid (no butterfly arbitrage), RMSE ≤ 2 vol
   pts. `calendar_arbitrage_free` checks w non-decreasing in T. Fallback: smoothing spline in call-delta.
@@ -91,6 +98,11 @@ Everything here is a pure function or a small dataclass; the engine plugs it in 
   (quoted delta → BSM from quoted iv → BSM from mid IV; `delta_source` column).
 * `choose_expiry(target_dte, min, max)`: min |dte−target| → earlier expiry → standard monthly before
   weekly → root.
+* **Expiry identity = (expiry, root/settlement)**. `slice_expiry(df, e)` raises `SelectionError` when the
+  date carries several series (e.g. SPX AM monthly LTD Thursday and SPXW Thursday PM) and neither
+  `root=` nor `settlement=` is given; calls that pass `root=`/`settlement=` behave as before.
+  `Package.same_expiry` compares settlement instants; forwards/smiles/metrics group by
+  (expiry, root, settlement); `mark_contract(..., root=)` restricts to the contract's series.
 * `select_by_delta`: min |Δ−target| → strike closer to spot → lower strike. Optional `max_delta_error`.
 * `nearest_atm`: min |K−ref| → lower strike; `both_rights=True` for straddles/flies.
 * Wings by points use ACTUAL listed strikes: exact, else `outward` (default; wider → defined risk
@@ -98,6 +110,8 @@ Everything here is a pure function or a small dataclass; the engine plugs it in 
 * Quality (`QualityRules`): two-sided, uncrossed/unlocked, nonzero bid, rel. spread ≤ 50% (default),
   optional abs spread / quote age / OI. `flag_stale_vs_previous`: unchanged bid & ask while the
   underlying moved ≥ 0.5% and |Δ| ≥ 0.05.
+* `chain_metrics` output carries `fidelity` (worst input tier) and `synthetic`; `allow_synthetic=False`
+  raises on T3 input (synthetic skew/term metrics are not valid signals).
 * `SelectionError` (subclass of `AtlasError`) when no listed contract satisfies a rule — strategies
   should skip the trade, never invent a strike.
 
@@ -110,7 +124,9 @@ Builders: `single`, `atm_single`, `vertical` (deltas), `vertical_by_points`, `st
 `protective_put`, `collar`, `covered_strangle`, `calendar`, `diagonal`, `box`, `conversion`/reversal.
 `Package`: `mid_value`, `natural_open/close`, `price_with_improvement(frac)`, `payoff`,
 `max_profit_loss` (∞ when unbounded; same-expiry only), `breakevens`, `greeks`/`dollar_greeks`,
-`to_order(units, limit)` → core `Order(COMBO)` (stock legs submitted separately).
+`to_order(units, limit)` → core `Order(COMBO)` (stock legs submitted separately). `OptLeg` carries the
+chain row's multiplier, `deliverable_shares`, `tick_size`, root, settlement and exercise into
+`instrument()` (non-standard contracts keep their terms); intrinsic uses deliverable×S/multiplier.
 Helpers: `hedge_shares` (delta-hedge with band, S146/S147/S167/S170), `vega_match_units` (S170).
 
 ## 7. Synthetic chains (fidelity T3_MODELED)
@@ -136,6 +152,10 @@ Every frame has `fidelity = 3` and `attrs['source']`.
 | SPY/QQQ Tue/Thu | 2022-11-15 / 2022-11-17 | MIAX alert 2022-11-14 (high) |
 | QQQ Mon/Wed | 2021-01-04 | UNVERIFIED start (conservative; existed per 2021 filings) (low) |
 | IWM Mon/Wed | 2021-10-04 | SEC Rel. 34-93157 (2021-09-28) (low) |
+| XSP (single PM root `XSP`) | monthlies PM; Tue 2022-10-11, Thu 2022-10-20, Mon/Wed/Fri modeled from 2022-10-12 | Cboe 2022-09-19 release (medium); earlier XSP weeklies existed but start unverified → not modeled |
+| RUT AM monthlies (root `RUT`) + RUTW PM weeklies | RUTW Mon/Wed 2021-03-08, Fri 2021-03-12 (earlier start unverified), Tue/Thu 2024-01-16/18, 3rd-Fri PM 2024-11 | Cboe release 2021-03-01 (Mon/Wed RUTW); Cboe 2023-12-21 (dailies from 2024-01-08) |
+| NDX AM monthlies (root `NDX`) | NDXP PM weeklies NOT modeled (launch date unverified) | — |
+| any other index (VIX, DJX, OEX…) | no listing model → empty frame, `Fidelity.NA` | never emits SPX roots/symbols for other underlyings |
 
 Rules: monthlies = 3rd Friday, holiday → prior session (Good Friday); weekly holiday shifts:
 Monday → next session, other days → prior session; SPX Weeklys not listed in standard-expiration
@@ -151,7 +171,9 @@ SPX $0.05/$0.10. (Approximations; documented, tested.)
 
 ### 7.2 Volatility
 
-* ATM ratio (index products) is point-in-time (§7.4): `atm_ratio_params(p, as_of)`.
+* ATM ratio (index products): `atm_ratio_params(p, as_of)` (§7.4). From 2010 point-in-time; before
+  2010 a labelled prior blend (`attrs['fidelity_reasons']` contains `atm_ratio_prior`;
+  `chain(..., strict=True)` returns an empty `Fidelity.NA` frame instead).
 * ATM term structure, point-in-time (an index close is used only after 16:15 ET of its session;
   older than 5 days → missing): VIX1D(1d), VIX9D(9), VIX(30), VIX3M(93), VIX6M(183), VIX1Y(365),
   total-variance interpolation, flat extrapolation. VIX1D history before its 2023-04-24 launch is
@@ -200,7 +222,7 @@ Results (205 snapshots, 71,030 two-sided quotes):
 
 | item | value |
 |---|---|
-| ATM ratio, index products | **point-in-time schedule** (`atm_ratio_schedule`): for year Y, Huber fit of PUT-implied ATM IV / VIX = c0 + c1 ln(VIX/0.20) on rolls settled before Y (2010: c0 .934, c1 −.030; 2026: c0 .840, c1 .162). Dates before 2010 use the 2007–09 fit ("pre-sample", labelled in `attrs['source']`). Regime dependence is strong: PUT-implied ratio 0.73 at VIX≈11 vs 0.92 at VIX>24. Cross-check on SPY/DIA/QQQ/IWM/SPX chains 2019–2026: c0 .870, c1 .073 (n = 43). |
+| ATM ratio, index products | **point-in-time schedule** (`atm_ratio_schedule`): for year Y, Huber fit of PUT-implied ATM IV / VIX = c0 + c1 ln(VIX/0.20) on rolls settled before Y (2010: c0 .934, c1 −.030; 2026: c0 .840, c1 .162). Before 2010 (no full-year schedule entry yet) only PUT rolls already SETTLED at the as-of date are used; with n < 24 such rolls the fit is blended with a fixed prior (c0 = 0.88, c1 = 0, chosen without post-2007 data) at weight n/24 — label `prior-blend …`, chain fidelity reason `atm_ratio_prior` (strict mode: NA). No 2010+ information reaches pre-2010 chains through this parameter. Regime dependence is strong: PUT-implied ratio 0.73 at VIX≈11 vs 0.92 at VIX>24. Cross-check on SPY/DIA/QQQ/IWM/SPX chains 2019–2026: c0 .870, c1 .073 (n = 43). |
 | ATM ratio, single names vs own vol index | 0.900 (n = 29; AAPL/VXAPL, AMZN/VXAZN, EEM/VXEEM, GLD/GVZ, TLT/VXTLT) |
 | smile (index products) | a(T) = −0.222 (DTE/30)^0.104, b = 0.003, put wing slope −0.174, call wing +0.329 (224 expiries; median |log resid| of a 0.13); SKEW dependence not significant → a1 = 0 |
 | smile (single names) | a(T) = −0.096 (DTE/30)^0.117, b = 0.034, wings −0.224 / +0.190 (439 expiries; noisier, 0.42) |
@@ -230,12 +252,30 @@ pts low at 6–29 DTE (0.6 at 92 DTE); 25Δ put-call skew 5.0–6.1 vs real 6.1�
 ≈ 75–80% of real); near-the-money spreads 0.70–1.70 vs real 0.60–0.90 (too wide for longer DTE);
 the real chain lists more SPXW Fridays (e.g. 57 DTE) than the modeled 50-day weekly horizon.
 
-**Parameter lookahead statement**: the spread model, smile shape and single-name ATM ratio are fitted
-on 2019–2026 data and applied to all dates (structural parameters; no free pre-2019 option quotes
-exist). The SPX ATM ratio — the parameter that drives short-premium returns — is point-in-time.
+**Parameter lookahead statement**: the spread model (coefficients and per-symbol fixed effects),
+smile shape/wings and single-name ATM ratio are fitted on chains from `fit_window` = 2019-08-15 …
+2026-09-16 (no free option quotes outside it). Chains are NOT blocked for earlier dates, but every
+synthetic chain (and every `mark_contract` model fallback) dated before the window END carries the
+distinct T3 reason **`params_fit_post_as_of`** in `attrs['fidelity_reasons']` / the mark reason, which
+reports must surface; before the window START the per-symbol spread fixed effects are dropped and the
+class defaults (`spread_default_fe` etf/stock) are used. The SPX ATM ratio — the parameter that drives short-premium returns — is point-in-time from 2010 and a
+labelled prior blend (only already-settled rolls) before that.
 Synthetic smiles are deterministic in (VIX family, SKEW-clipped), so **synthetic chains must not be
 used as a source of skew/term-structure SIGNALS** (S166/S167/S168 z-scores would be degenerate).
 
+
+### 7.5 Fallback quote stream (`marking.synthetic_option_quotes`)
+
+`synthetic_option_quotes(instrument, start, end, as_of, portal, real_first=True, include_open=False,
+generator=None, strict=False) -> DataFrame` (index ts UTC, `QUOTE_COLS`): snapshots of ONE contract at
+each NYSE session close (optionally open) in (start, end], ts ≤ as_of, up to the contract's last
+tradable close (expiry close for PM/physical, the Thursday LTD close for SPX AM; settlement is the
+lifecycle's job). Per snapshot: (1) the real quote (`portal.option_quotes`) → T2; (2) contract missing
+but a SAME-DAY real chain exists (DoltHub drops < ~13 DTE) → `mark_contract` on that surface → T2
+inside the quoted range, T3 if extrapolated; (3) else `SyntheticChainGenerator.quote_contract` with PIT
+spot / r / q / rv_ratio (the Portal's own `synthetic_chain` inputs), PIT VIX family and SKEW → T3,
+reasons (`params_fit_post_as_of`, `atm_ratio_prior`) in the `reason` column. `quote_contract` shares
+the pricing code with `chain()`, so a quote equals the chain row the strategy selected (tested).
 
 ## 8. Lifecycle (`options.lifecycle`, engine adapter `OccOptionLifecycle`)
 
@@ -245,8 +285,12 @@ used as a source of skew/term-structure SIGNALS** (S166/S167/S168 z-scores would
 * OCC exercise-by-exception: ITM ≥ $0.01 → long exercised, short assigned in full (aggregate holder
   behaviour assumed; conservative). Thresholds before 2008 (customer $0.75/$0.25 eras) are NOT
   reproduced (configurable `ExpiryPolicy.threshold`).
-* Physical delivery: shares = `deliverable_shares × |qty|` at the strike; cash-settled: intrinsic ×
-  multiplier. Events convert to core `Fill`s (`EXERCISE` / `ASSIGNMENT` / `SETTLEMENT`) or to the
+* Non-standard deliverables (OCC adjustments): ITM test on the per-contract value
+  deliverable×S − K×multiplier (calls; reverse for puts), i.e. effective underlying
+  S·deliverable/multiplier vs K with the $0.01 threshold; cash = ∓K×multiplier×|qty|; delivery price
+  per share = K×multiplier/deliverable (same convention as `portfolio.hooks.DefaultOptionLifecycle`).
+  Early-exercise dividend tests scale dividends by deliverable/multiplier.
+* Physical delivery: shares = `deliverable_shares × |qty|`; cash-settled: intrinsic × multiplier. Events convert to core `Fill`s (`EXERCISE` / `ASSIGNMENT` / `SETTLEMENT`) or to the
   portfolio's `OptionEvent`s. Exercise/assignment fees are the cost model's job.
 * Pin risk: `ExpiryPolicy(pin_band, pin_policy='adverse')` assigns short physical options within the
   band even when marginally OTM (after-hours move / contrarian exercise); default 'occ'.
@@ -255,6 +299,9 @@ used as a source of skew/term-structure SIGNALS** (S166/S167/S168 z-scores would
   put — ITM and extrinsic < K(1−e^{−rT}) − PV(dividends before expiry).
   Requires the dividend schedule known at the session (`dividends` callable); without it only the
   put rule runs (call/ex-div assignment then NOT modeled — flag it).
+  Extrinsic value comes ONLY from a same-session mark (`OptionMark(mid, ts, fidelity, model_value)`;
+  the plug-in uses `Position.mark`/`mark_ts`) or, if the engine supplies `model_value`, the PIT model
+  price. With neither, no assignment is generated — a missing price is never treated as zero extrinsic.
 * Corporate actions (OCC): integer forward split → contracts ×n, strike ÷n; other ratios (3:2,
   reverse splits) → same contracts/strike, deliverable 100×ratio shares, root `XYZ1`;
   special cash dividend ≥ $12.50/contract → strike − amount; ordinary dividends unadjusted.
@@ -265,11 +312,25 @@ Source: Cboe Margin Manual (Nov 30 2021, cdn.cboe.com/resources/membership/Margi
 Rule 10.3 / FINRA 4210(f)(2). Implemented: long ≤9m paid in full / >9m 75%; naked call/put
 (premium + 20% (15% broad index / broad-based ETF) − OTM, min premium + 10% of underlying (calls) /
 strike (puts)), leverage factor multiplies both; spreads by the maximum-potential-loss computation
-over every strike for whole same-expiry groups (verticals, iron condors/flies = riskier side,
-butterflies incl. broken wing, condors, boxes, ratio spreads with surplus longs), calendars/diagonals
-only if the long expires with/after the short, short straddle/strangle = greater side + other premium,
+over every strike for whole same-settlement-instant groups (verticals, iron condors/flies = riskier
+side, butterflies incl. broken wing, condors, boxes, ratio spreads with surplus longs), charged at the
+LESSER of that max loss and the shorts' naked requirement, with every long in a spread paid in full
+(75% loan value only for stand-alone longs > 9 months); calendars/diagonals only if the long settles
+with/after the short (settlement instant: an SPXW Thursday PM long does not cover an SPX AM short), short straddle/strangle = greater side + other premium,
 covered call/put, cash account (cash-secured puts at aggregate strike; proceeds not applied by
 default; naked calls and non-European spreads not permitted).
+**Dated rule versions** (`strategy_margin(..., as_of=)`, `rule_version()`; source: the manual's
+effective-date table, p. 4): short-option percentages (20%/10% equity & narrow index, 15%/10% broad
+index) effective 1988-06-06 (earlier dates: not modeled, 1988 rules applied and noted); put minimum on
+the EXERCISE price from 1997-06-02 (before: 10% of the underlying); 75% loan value on listed longs > 9
+months, limited-risk spreads (butterflies, boxes) and cash-account spreads from 1999-08-23; "Spreads: All
+Types — Maximum Potential Loss Computation" from 2012-08-29. Implemented regimes: `current`
+(≥ 2012-08-29, whole same-expiry group, riskier side of condors/flies), `side_groups` (1999-08-23 …
+2012-08-28: call and put sides each evaluated as a group and summed — no cross-side netting; a
+conservative reading, the manual does not document the pre-2012 iron-condor treatment), `pairwise`
+(1988-06-06 … 1999-08-22: two-leg verticals only). The naked formulas themselves are unchanged since
+1988 except the 1997 put-minimum base. `CboeStrategyMargin.as_of` (engine-settable; default = latest
+position mark time) selects the version. House/broker add-ons are not modeled.
 Every worked example on pp. 23–58 of the manual that falls in scope is a test
 (`tests/options/test_margin.py`), including the SMA debit figures.
 **Portfolio rule**: `net_requirement = requirement − short option market value`; compliant iff
@@ -293,7 +354,7 @@ day of decay, BSM or BS-2002 repricing → worst loss for OPT_NAKED sizing (a lo
 
 `atlasbt.options.plugins.OccOptionLifecycle(policy, rate, dividends)` implements
 `portfolio.hooks.OptionLifecycle` (`at_session_start`: AM settlement; `at_session_end`: PM/physical
-expiry + early assignment). `CboeStrategyMargin()` implements `portfolio.margin.OptionMarginModel`
+expiry + early assignment). `CboeStrategyMargin()` (attribute `includes_long_premium = True`) implements `portfolio.margin.OptionMarginModel`
 (per-underlying strategy margin on current marks; Cboe classes from `underlying_class`). Both are
 covered by `tests/options/test_plugins.py`.
 
@@ -319,7 +380,8 @@ vendor `vol`/greeks present. Underlyings: SPY, DIA, sector SPDRs (XLB…XLY), ~S
 Consequences: contracts drop out of the snapshot before DTE ≈ 13 (all "exit at DTE ≤ 7" rules), and
 long tenors (90–365 DTE) are never quoted. `options.marking.mark_contract` prices such contracts from
 the same day's real surface: T2_PROXY inside the quoted expiry/strike range, T3_MODELED when
-extrapolated in maturity or strike; bid/ask from the spread model.
+extrapolated in maturity or strike; bid/ask from the spread model at the point-in-time VIX, rounded
+outward to the tick grid.
 
 ## 13. Fidelity by strategy (best achievable with free data)
 

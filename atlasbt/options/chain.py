@@ -201,12 +201,25 @@ def choose_expiry(df: pd.DataFrame, target_dte: float, min_dte: int | None = Non
     return pd.Timestamp(e["expiry"].iloc[0])
 
 
+def series_keys(df: pd.DataFrame) -> list[str]:
+    """Columns identifying an expiry SERIES: expiry plus root / settlement when present
+    (SPX AM monthlies and SPXW PM Thursdays share an expiry date but are different series)."""
+    return ["expiry"] + [c for c in ("root", "settlement") if c in df.columns]
+
+
 def slice_expiry(df: pd.DataFrame, expiry, root: str | None = None, settlement: str | None = None) -> pd.DataFrame:
+    """Rows of ONE expiry series.  If the date carries several series (different
+    root or settlement type) and neither ``root`` nor ``settlement`` disambiguates,
+    raises SelectionError (never mixes AM- and PM-settled legs)."""
     s = df[df["expiry"] == pd.Timestamp(expiry)]
     if root is not None and "root" in s.columns:
         s = s[s["root"] == root]
-    if settlement is not None:
+    if settlement is not None and "settlement" in s.columns:
         s = s[s["settlement"].astype(str) == str(settlement)]
+    keys = [c for c in ("root", "settlement") if c in s.columns]
+    if keys and len(s[keys].astype(str).drop_duplicates()) > 1:
+        combos = sorted(map(tuple, s[keys].astype(str).drop_duplicates().values.tolist()))
+        raise SelectionError(f"expiry {pd.Timestamp(expiry).date()} has several series {combos}: pass root= or settlement=")
     return s
 
 
@@ -288,7 +301,9 @@ def wing_by_points(df_exp: pd.DataFrame, base_strike: float, points: float, righ
             raise SelectionError(f"no listed strike inside {target}")
         return float(inn.max() if right == "C" else inn.min())
     if policy == "nearest":
-        cand = ks[ks != base_strike]
+        cand = ks[ks > base_strike] if right == "C" else ks[ks < base_strike]   # wing side only
+        if cand.size == 0:
+            raise SelectionError(f"no listed {right} strike beyond base {base_strike}")
         dist = np.round(np.abs(cand - target), 10)
         return float(cand[np.lexsort((-cand if right == "C" else cand, dist))][0])
     raise ValueError(policy)

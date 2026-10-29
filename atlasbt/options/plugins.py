@@ -71,6 +71,7 @@ class OccOptionLifecycle:
     rate: Optional[Callable[[pd.Timestamp], float]] = None
     dividends: Optional[Callable[[str, pd.Timestamp], list]] = None
     early_assignment: bool = True
+    model_value: Optional[Callable[[object, pd.Timestamp], float]] = None   # PIT model price fallback
 
     def at_session_start(self, session, prev_session, options: Sequence, prices) -> list:
         """CASH_AM options settle at the SOQ of their settlement session; the
@@ -118,7 +119,16 @@ class OccOptionLifecycle:
                       and p.instrument not in pos}
             if shorts:
                 r = float(self.rate(session)) if self.rate else 0.0
-                marks = {p.instrument.symbol: (p.mark if p.mark == p.mark else np.nan) for p in options}
+                from .lifecycle import OptionMark
+                # only a mark observed in THIS session counts (Position.mark_ts); optional
+                # engine-supplied PIT model value via ``model_value(instrument, session)``
+                marks = {}
+                for p in options:
+                    mv = float(self.model_value(p.instrument, session)) if self.model_value else float("nan")
+                    marks[p.instrument.symbol] = OptionMark(
+                        mid=p.mark if p.mark == p.mark else float("nan"),
+                        ts=getattr(p, "mark_ts", None) if getattr(p, "mark_ts", None) is not None else pd.Timestamp("1900-01-01", tz="UTC"),
+                        fidelity=getattr(p, "mark_fidelity", None), model_value=mv)
                 spot = lambda u: prices.close(u, session)  # noqa: E731
                 divs = {}
                 if self.dividends:
@@ -137,6 +147,12 @@ class CboeStrategyMargin:
     option market value), i.e. the amount NAV must exceed on top of the stock
     Reg-T requirement (credits from covered calls are not used to reduce the
     stock requirement -> slightly conservative)."""
+
+    # The returned figure already includes 100% of long option premium (longs have no
+    # loan value), so the engine must not add long option value separately.
+    includes_long_premium: bool = True
+    # date whose rules apply (engine may set it each step); None -> latest position mark_ts
+    as_of: Optional[pd.Timestamp] = None
 
     def requirement(self, account, underlying_price: Callable[[str], float]) -> float:
         from atlasbt.portfolio.account import AccountType
@@ -158,6 +174,11 @@ class CboeStrategyMargin:
                                   (p.mark if p.mark == p.mark else p.avg_price), p.instrument.multiplier,
                                   p.instrument.exercise.value if p.instrument.exercise else "AMERICAN",
                                   p.instrument.settlement.value if p.instrument.settlement else "PHYSICAL") for p in ps]
-            res = strategy_margin(pos, S, stock.get(und, 0.0) * 1.0, cls, lev, account=acct)
+            when = self.as_of
+            if when is None:
+                ts = [getattr(p, "mark_ts", None) for p in ps]
+                ts = [t for t in ts if t is not None]
+                when = max(ts) if ts else None
+            res = strategy_margin(pos, S, stock.get(und, 0.0) * 1.0, cls, lev, account=acct, as_of=when, now=when)
             total += max(0.0, res.net_requirement)
         return float(total)

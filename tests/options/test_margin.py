@@ -173,3 +173,29 @@ def test_stress_loss_short_strangle_vs_condor():
     assert s1["worst_loss"] > s2["worst_loss"] > 0
     assert s2["worst_loss"] <= 1000.0 + 1e-6 + 100  # bounded by width (+ small time value effects)
     assert len(s1["table"]) == 8
+
+
+def test_dated_rule_versions():
+    from atlasbt.options.margin import rule_version
+    assert rule_version("2020-01-02") == "current" and rule_version("2005-01-03") == "side_groups"
+    assert rule_version("1995-01-03") == "pairwise" and rule_version("1987-01-02") == "pre1988"
+    # iron condor: current = riskier side only; 1999-2012 = both sides
+    ic = [P(1000, "P", E1, 1, 32.0), P(1025, "P", E1, -1, 35.10), P(1150, "C", E1, -1, 9.40), P(1175, "C", E1, 1, 6.30)]
+    assert m(ic, 1060).requirement == pytest.approx(6330.0)
+    assert m(ic, 1060, as_of="2005-06-01").requirement == pytest.approx(5000.0 + 3830.0)
+    # broken-wing call fly: whole-side group (1999-2012) vs pairwise verticals (pre-1999)
+    bw = [P(545, "C", E1, 1, 12.40), P(550, "C", E1, -2, 8.80), P(565, "C", E1, 1, 2.0)]
+    assert m(bw, 550, as_of="2005-06-01").requirement == pytest.approx(1000.0 + 1440.0)
+    assert m(bw, 550, as_of="1995-06-01").requirement == pytest.approx(1500.0 + 1440.0)
+    # put minimum on the underlying before 1997-06-02 (S=95, K=80: 10% x 95 instead of 10% x 80)
+    assert m([P(80, "P", E1, -1, 2.0)], 95, as_of="1996-01-02").requirement == pytest.approx(200 + 950.0)
+    # 75% loan value on > 9 month longs only from 1999-08-23
+    lp = [P(80, "C", pd.Timestamp("1999-06-18"), 1, 12.0)]
+    assert m(lp, 78, now=pd.Timestamp("1997-12-01")).requirement == pytest.approx(1200.0)
+    assert m(lp, 78, now=pd.Timestamp("1997-12-01"), as_of="2000-01-03").requirement == pytest.approx(900.0)
+
+
+def test_two_time_spreads_in_one_portfolio():
+    """Regression: several calendar/diagonal pairs in one call (helper-name shadowing bug)."""
+    r = m([P(100, "C", E1, -1, 2.0), P(100, "C", E2, 1, 3.5), P(95, "P", E1, -1, 1.5), P(95, "P", E2, 1, 2.5)], 100)
+    assert r.requirement == pytest.approx(350.0 + 250.0)

@@ -50,10 +50,20 @@ def test_lifecycle_am_and_pm():
 def test_lifecycle_early_assignment_hook():
     P = acct_mod.Position
     c = opt("XYZ", "2024-04-19", 90, "C")
-    pos = [P(c, -2, avg_price=5.0, mark=10.1)]
+    same = pd.Timestamp("2024-03-06 21:00", tz="UTC")
+    pos = [P(c, -2, avg_price=5.0, mark=10.1, mark_ts=same)]
     lc = OccOptionLifecycle(rate=lambda s: 0.05, dividends=lambda u, s: [(pd.Timestamp("2024-03-07"), 1.0)])
     ev = lc.at_session_end(pd.Timestamp("2024-03-06"), pos, Prices(100.0, 100.0))
     assert len(ev) == 1 and ev[0].kind == "ASSIGNMENT" and ev[0].underlying_qty == -200
+    # stale (previous-session) mark or missing mark -> no assignment; model fallback used if supplied
+    stale = [P(c, -2, avg_price=5.0, mark=10.1, mark_ts=pd.Timestamp("2024-03-05 21:00", tz="UTC"))]
+    assert lc.at_session_end(pd.Timestamp("2024-03-06"), stale, Prices(100.0, 100.0)) == []
+    nomark = [P(c, -2, avg_price=5.0)]
+    assert lc.at_session_end(pd.Timestamp("2024-03-06"), nomark, Prices(100.0, 100.0)) == []
+    lc2 = OccOptionLifecycle(rate=lambda s: 0.05, dividends=lambda u, s: [(pd.Timestamp("2024-03-07"), 1.0)],
+                             model_value=lambda ins, s: 10.05)
+    ev2 = lc2.at_session_end(pd.Timestamp("2024-03-06"), stale, Prices(100.0, 100.0))
+    assert len(ev2) == 1 and "PIT model value" in ev2[0].note
 
 
 def test_margin_plugin_values():
@@ -82,3 +92,23 @@ def test_underlying_class():
     assert underlying_class("SPY") == ("broad_etf", 1.0)
     assert underlying_class("XLE") == ("equity", 1.0)
     assert underlying_class("TQQQ") == ("broad_etf", 3.0)
+
+
+def test_plugin_nonstandard_deliverable_and_margin_attribute():
+    from atlasbt.options.lifecycle import adjust_for_split
+    P = acct_mod.Position
+    adj, q = adjust_for_split(opt("XYZ", "2024-03-15", 50.0, "C"), 2, 1.5)     # 3:2 split -> 150 sh
+    ev = OccOptionLifecycle().at_session_end(pd.Timestamp("2024-03-15"), [P(adj, q)], Prices(40.0, 40.0))
+    assert ev[0].kind == "EXERCISE" and ev[0].underlying_qty == 300
+    assert ev[0].underlying_price == pytest.approx(5000.0 / 150)              # K x multiplier / deliverable
+    assert CboeStrategyMargin().includes_long_premium is True
+
+
+def test_slice_expiry_requires_series_when_mixed():
+    from atlasbt.options.chain import SelectionError, slice_expiry
+    df = pd.DataFrame({"expiry": [pd.Timestamp("2024-03-14")] * 2, "root": ["SPX", "SPXW"],
+                       "settlement": ["CASH_AM", "CASH_PM"], "strike": [5000.0] * 2, "right": ["C"] * 2})
+    with pytest.raises(SelectionError):
+        slice_expiry(df, "2024-03-14")
+    assert len(slice_expiry(df, "2024-03-14", root="SPXW")) == 1
+    assert len(slice_expiry(df, "2024-03-14", settlement="CASH_AM")) == 1

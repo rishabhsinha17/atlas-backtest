@@ -22,6 +22,11 @@ def _wmedian(x, w):
     return float(x[np.searchsorted(c, 0.5 * c[-1])])
 
 
+def series_keys(df: pd.DataFrame) -> list:
+    """Expiry-series identity: expiry plus root/settlement columns when present."""
+    return ["expiry"] + [c for c in ("root", "settlement") if c in df.columns]
+
+
 def parity_forward(strikes, call_bid, call_ask, put_bid, put_ask, T: float, r: float,
                    n_strikes: int = 5) -> tuple[float, float, int]:
     """Forward from one expiry's quotes.  Returns (F, dispersion, n_used)
@@ -62,42 +67,67 @@ def infer_forwards(chain: pd.DataFrame, r, spot: float | None = None, now: pd.Ti
     if american is None:
         american = bool((df.get("exercise", pd.Series(["AMERICAN"])) .astype(str).str.upper() == "AMERICAN").any())
     rows = []
-    for exp, g in df.groupby("expiry", sort=True):
+    keys = series_keys(df)
+    recs = []   # per series: dict(sk, T, rr, F, disp, n, cand arrays) -- de-Americanized in ONE batch below
+    for kv, g in df.groupby(keys, sort=True):
+        kv = kv if isinstance(kv, tuple) else (kv,)
+        sk = dict(zip(keys, kv))
         T = float(g["T"].iloc[0])
         rr = float(r(T)) if callable(r) else float(r)
-        c = g[g["right"].astype(str).str.upper().str[0] == "C"].set_index("strike")
-        p = g[g["right"].astype(str).str.upper().str[0] == "P"].set_index("strike")
+        rt = g["right"].astype(str).str.upper().str[0]
+        c = g[rt == "C"].set_index("strike")
+        p = g[rt == "P"].set_index("strike")
         ks = c.index.intersection(p.index)
         if len(ks) == 0 or T <= 0:
-            rows.append(dict(expiry=exp, T=T, r=rr, F=np.nan, dispersion=np.nan, n=0, q_implied=np.nan))
+            recs.append(dict(sk=sk, T=T, rr=rr, F=np.nan, disp=np.nan, n=0))
             continue
-        c, p = c.loc[ks], p.loc[ks]
+        c = c.loc[ks]
+        p = p.loc[ks]
         c = c[~c.index.duplicated()]
         p = p[~p.index.duplicated()]
         ks = c.index
-        F, disp, n = parity_forward(ks.values, c["bid"].values, c["ask"].values, p["bid"].values, p["ask"].values, T, rr, n_strikes)
+        cb, ca, pb, pa = (np.asarray(x, float) for x in (c["bid"].values, c["ask"].values, p["bid"].values, p["ask"].values))
+        F, disp, n = parity_forward(ks.values, cb, ca, pb, pa, T, rr, n_strikes)
+        rec = dict(sk=sk, T=T, rr=rr, F=F, disp=disp, n=n)
         if american and spot and np.isfinite(F) and n > 0:
-            from .iv import deamericanize
-            cm_all = 0.5 * (c["bid"].values + c["ask"].values)
-            pm_all = 0.5 * (p["bid"].values + p["ask"].values)
-            two = (c["bid"].values > 0) & (p["bid"].values > 0)
+            cm_all, pm_all = 0.5 * (cb + ca), 0.5 * (pb + pa)
+            two = (cb > 0) & (pb > 0)
             # only the strikes nearest the forward are used -> de-Americanize just those
             cand = np.where(two)[0][np.argsort(np.abs(cm_all - pm_all)[two])[:2 * n_strikes]]
-            kc = ks.values[cand]
-            for _ in range(iterations):
-                q = rr - np.log(F / spot) / T
-                ce, _r1 = deamericanize(cm_all[cand], spot, kc, T, rr, q, True)
-                pe, _r2 = deamericanize(pm_all[cand], spot, kc, T, rr, q, False)
-                good = np.isfinite(ce) & np.isfinite(pe)
+            rec.update(kc=ks.values[cand].astype(float), cm=cm_all[cand], pm=pm_all[cand],
+                       hc=0.5 * (ca - cb)[cand], hp=0.5 * (pa - pb)[cand])
+        recs.append(rec)
+    if american and spot:
+        from .iv import deamericanize
+        act = [i for i, rc in enumerate(recs) if "kc" in rc and len(rc["kc"])]
+        for _ in range(iterations):
+            if not act:
+                break
+            sizes = [len(recs[i]["kc"]) for i in act]
+            K = np.concatenate([recs[i]["kc"] for i in act])
+            Tv = np.concatenate([np.full(m, recs[i]["T"]) for i, m in zip(act, sizes)])
+            Rv = np.concatenate([np.full(m, recs[i]["rr"]) for i, m in zip(act, sizes)])
+            Qv = np.concatenate([np.full(m, recs[i]["rr"] - np.log(recs[i]["F"] / spot) / recs[i]["T"])
+                                 for i, m in zip(act, sizes)])
+            ce, _ = deamericanize(np.concatenate([recs[i]["cm"] for i in act]), spot, K, Tv, Rv, Qv, True)
+            pe, _ = deamericanize(np.concatenate([recs[i]["pm"] for i in act]), spot, K, Tv, Rv, Qv, False)
+            off = np.cumsum([0] + sizes)
+            nxt = []
+            for j, i in enumerate(act):
+                rc = recs[i]
+                sl = slice(off[j], off[j + 1])
+                c_e, p_e = ce[sl], pe[sl]
+                good = np.isfinite(c_e) & np.isfinite(p_e)
                 if good.sum() == 0:
-                    break
-                hs_c = 0.5 * (c["ask"].values - c["bid"].values)[cand]
-                hs_p = 0.5 * (p["ask"].values - p["bid"].values)[cand]
-                F2, disp2, n2 = parity_forward(kc[good], (ce - hs_c)[good], (ce + hs_c)[good],
-                                               (pe - hs_p)[good], (pe + hs_p)[good], T, rr, n_strikes)
-                if not np.isfinite(F2):
-                    break
-                F, disp, n = F2, disp2, n2
-        q_impl = rr - np.log(F / spot) / T if (spot and np.isfinite(F) and F > 0) else np.nan
-        rows.append(dict(expiry=exp, T=T, r=rr, F=F, dispersion=disp, n=n, q_implied=q_impl))
+                    continue
+                F2, d2, n2 = parity_forward(rc["kc"][good], (c_e - rc["hc"])[good], (c_e + rc["hc"])[good],
+                                            (p_e - rc["hp"])[good], (p_e + rc["hp"])[good], rc["T"], rc["rr"], n_strikes)
+                if np.isfinite(F2):
+                    rc.update(F=F2, disp=d2, n=n2)
+                    nxt.append(i)
+            act = nxt
+    for rc in recs:
+        F, T, rr = rc["F"], rc["T"], rc["rr"]
+        q_impl = rr - np.log(F / spot) / T if (spot and np.isfinite(F) and F > 0 and T > 0) else np.nan
+        rows.append(dict(rc["sk"], T=T, r=rr, F=F, dispersion=rc["disp"], n=rc["n"], q_implied=q_impl))
     return pd.DataFrame(rows)

@@ -26,6 +26,7 @@ from scipy.interpolate import UnivariateSpline
 from scipy.optimize import least_squares
 
 from .bsm import as_is_call, bsm_delta
+from .forward import series_keys
 from .iv import implied_vol
 
 
@@ -39,7 +40,8 @@ def smile_frame(chain: pd.DataFrame, forwards: pd.DataFrame, use_quoted_iv: bool
     ``forwards`` from ``atlasbt.pricing.forward.infer_forwards`` (expiry,T,r,F).
     OTM side only is kept for fitting (puts K<F, calls K>=F) in ``otm`` column.
     """
-    df = chain.merge(forwards[["expiry", "T", "r", "F"]].rename(columns={"T": "T_fwd"}), on="expiry", how="inner")
+    keys = [k for k in series_keys(forwards) if k in chain.columns]
+    df = chain.merge(forwards[keys + ["T", "r", "F"]].rename(columns={"T": "T_fwd"}), on=keys, how="inner")
     if "T" not in df.columns:
         df["T"] = df["T_fwd"]
     df = df.drop(columns=["T_fwd"])
@@ -71,16 +73,20 @@ def _interp_w_at_k(k, w, k0=0.0):
 
 
 def atm_iv_per_expiry(smile: pd.DataFrame) -> pd.DataFrame:
+    """ATM IV per expiry SERIES (expiry + root/settlement when present)."""
     rows = []
-    for exp, g in smile.groupby("expiry"):
+    keys = series_keys(smile)
+    for kv, g in smile.groupby(keys):
+        kv = kv if isinstance(kv, tuple) else (kv,)
+        sk = dict(zip(keys, kv))
         g = g[g["otm"] & np.isfinite(g["iv_fit"])]
         T = float(g["T"].iloc[0]) if len(g) else np.nan
         if len(g) == 0:
-            rows.append(dict(expiry=exp, T=T, atm_iv=np.nan, flag="none"))
+            rows.append(dict(sk, T=T, atm_iv=np.nan, flag="none"))
             continue
         w = g["iv_fit"].values ** 2 * T
         wk, flag = _interp_w_at_k(g["k"].values, w, 0.0)
-        rows.append(dict(expiry=exp, T=T, atm_iv=float(np.sqrt(wk / T)), flag=flag))
+        rows.append(dict(sk, T=T, atm_iv=float(np.sqrt(wk / T)), flag=flag))
     return pd.DataFrame(rows)
 
 
@@ -127,7 +133,7 @@ def iv_at_delta(smile_expiry: pd.DataFrame, target_delta: float) -> float:
 
 def constant_maturity_delta_iv(smile: pd.DataFrame, target_delta: float, days: float) -> tuple[float, str]:
     Ts, vs = [], []
-    for exp, g in smile.groupby("expiry"):
+    for _, g in smile.groupby(series_keys(smile)):
         v = iv_at_delta(g, target_delta)
         if np.isfinite(v):
             Ts.append(float(g["T"].iloc[0]))
@@ -135,12 +141,20 @@ def constant_maturity_delta_iv(smile: pd.DataFrame, target_delta: float, days: f
     return interp_total_variance(Ts, vs, days / 365.0)
 
 
+FLAG_RANK = {"exact": 0, "interp": 0, "extrap_flat": 1, "none": 2}
+
+
+def worse_flag(*flags: str) -> str:
+    """Worst validity flag (exact/interp < extrap_flat < none); unknown flags count as 'none'."""
+    return max(flags, key=lambda f: FLAG_RANK.get(f, 2))
+
+
 def skew_25d(smile: pd.DataFrame, days: float = 30.0) -> tuple[float, str]:
-    """IV(25-delta put) - IV(25-delta call) at constant maturity (S166/S167)."""
+    """IV(25-delta put) - IV(25-delta call) at constant maturity (S166/S167); the flag
+    is the WORSE of the two legs' flags."""
     p, f1 = constant_maturity_delta_iv(smile, -0.25, days)
     c, f2 = constant_maturity_delta_iv(smile, 0.25, days)
-    flag = f1 if f1 != "interp" else f2
-    return p - c, flag
+    return p - c, worse_flag(f1, f2)
 
 
 # --------------------------------------------------------------------------

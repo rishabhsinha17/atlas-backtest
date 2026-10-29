@@ -188,9 +188,80 @@ def american_implied_vol(price, S, K, T, r, q, is_call, method: str = "bs2002", 
     return IVResult(iv.reshape(shape), reason.reshape(shape))
 
 
-def deamericanize(price, S, K, T, r, q, is_call, method: str = "bs2002"):
+def american_implied_vol_fast(price, S, K, T, r, q, is_call, max_iter: int = 8, tol: float = 1e-8) -> IVResult:
+    """Vectorized American IV (Bjerksund-Stensland 2002): start at the European IV of
+    the American price (>= the American IV, since Am >= Eu at equal vol), then
+    Newton steps sigma -= (Am(sigma) - P) / vega_European(sigma), each step ONE
+    vectorized BS-2002 call; elements not converged fall back to Brent
+    (``american_implied_vol``).  Same reason codes."""
+    cp = as_is_call(is_call)
+    price, S, K, T, r, q, cpb = np.broadcast_arrays(*[np.asarray(a, float) for a in (price, S, K, T, r, q)], cp)
+    shape = price.shape
+    price, S, K, T, r, q, cpb = (a.ravel() for a in (price, S, K, T, r, q, cpb.astype(bool)))
+    from .american import bs2002_price
+    iv = np.full(price.size, np.nan)
+    reason = np.full(price.size, OK, dtype=object)
+    bad = ~(np.isfinite(price) & np.isfinite(S) & np.isfinite(K) & np.isfinite(T)) | (S <= 0) | (K <= 0)
+    reason[bad] = BAD_INPUT
+    reason[~bad & (T <= 0)] = EXPIRED
+    reason[(reason == OK) & (price <= 0)] = NONPOSITIVE_PRICE
+    intr = np.where(cpb, np.maximum(S - K, 0), np.maximum(K - S, 0))
+    reason[(reason == OK) & (price < intr)] = BELOW_INTRINSIC
+    reason[(reason == OK) & (price >= np.where(cpb, S, K))] = ABOVE_MAX
+    w = np.where(reason == OK)[0]
+    if w.size:
+        # quotes at/below the value at the vol floor (e.g. exactly intrinsic deep in the exercise
+        # region) have no identifiable IV -> VOL_BELOW_MIN, as in the Brent path
+        amin = bs2002_price(S[w], K[w], T[w], r[w], q[w], VOL_MIN, cpb[w])
+        low = amin >= price[w] - 1e-12
+        reason[w[low]] = VOL_BELOW_MIN
+        w = w[~low]
+    if w.size:
+        P, s_, k_, t_, r_, q_, c_ = (a[w] for a in (price, S, K, T, r, q, cpb))
+        x = implied_vol(P, s_, k_, t_, r_, q_, c_, intrinsic_tol=1e9).iv   # European IV of the American price
+        x = np.where(np.isfinite(x), x, 0.3)
+        conv = np.zeros(w.size, dtype=bool)
+        xp = np.full(w.size, np.nan)     # previous iterate / residual (secant after the first step)
+        fp = np.full(w.size, np.nan)
+        for _ in range(max_iter):
+            a = ~conv
+            if not a.any():
+                break
+            idx = np.where(a)[0]
+            am = bs2002_price(s_[a], k_[a], t_[a], r_[a], q_[a], x[a], c_[a])
+            diff = am - P[a]
+            done = np.abs(diff) < tol * np.maximum(1.0, P[a])
+            vg = _vega_raw(s_[a], k_[a], t_[a], r_[a], q_[a], x[a])
+            with np.errstate(all="ignore"):
+                newton = np.where(vg > 1e-12, diff / vg, np.nan)
+                dx, df = x[a] - xp[a], diff - fp[a]
+                secant = np.where(np.isfinite(dx) & (np.abs(df) > 1e-14), diff * dx / df, np.nan)
+            # secant uses the AMERICAN slope (European vega overstates it deep in the exercise region)
+            step = np.where(np.isfinite(secant), secant, newton)
+            nx = np.clip(x[a] - step, VOL_MIN, VOL_MAX)
+            conv[idx[done]] = True
+            upd = ~done & np.isfinite(nx)
+            xp[idx[upd]], fp[idx[upd]] = x[idx[upd]], diff[upd]
+            x[idx[upd]] = nx[upd]
+        res = np.where(conv, x, np.nan)
+        left = np.where(~conv)[0]
+        if left.size:   # robust fallback
+            fb = american_implied_vol(P[left], s_[left], k_[left], t_[left], r_[left], q_[left], c_[left])
+            res[left] = fb.iv
+            rr = reason[w]
+            rr[left] = fb.reason
+            reason[w] = rr
+        iv[w] = res
+    return IVResult(iv.reshape(shape), reason.reshape(shape))
+
+
+def deamericanize(price, S, K, T, r, q, is_call, method: str = "bs2002", fast: bool = True):
     """European-equivalent price of an American quote: invert American IV then
-    price European at that IV.  Returns (euro_price, IVResult)."""
-    res = american_implied_vol(price, S, K, T, r, q, is_call, method=method)
+    price European at that IV.  Returns (euro_price, IVResult).  ``fast`` uses the
+    vectorized Newton inverter (bs2002 only)."""
+    if fast and method == "bs2002":
+        res = american_implied_vol_fast(price, S, K, T, r, q, is_call)
+    else:
+        res = american_implied_vol(price, S, K, T, r, q, is_call, method=method)
     eu = bsm_price(S, K, T, r, q, np.where(res.ok, res.iv, np.nan), is_call)
     return eu, res

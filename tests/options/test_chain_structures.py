@@ -197,3 +197,81 @@ def test_mark_contract_quoted_interpolated_extrapolated(chain):
     # before the nearest listed expiry -> extrapolated (T3)
     m4 = mark_contract(ch, NOW, 0.04, "2024-03-08", 100, "P", exercise="EUROPEAN")
     assert m4.fidelity == Fidelity.T3_MODELED and m4.bid <= m4.mid <= m4.ask
+
+
+def test_fast_american_iv_matches_brent_and_metrics_fast():
+    """Vectorized American IV (Newton/secant) agrees with per-element Brent; chain_metrics
+    on a real DoltHub American snapshot is fast and matches the slow path."""
+    import time
+    from atlasbt.pricing import bs2002_price
+    from atlasbt.pricing.iv import american_implied_vol, american_implied_vol_fast
+    rng = np.random.default_rng(5)
+    n = 120
+    S, K = 100.0, rng.uniform(60, 140, n)
+    T, v = rng.uniform(0.02, 1.0, n), rng.uniform(0.1, 0.8, n)
+    cp = rng.random(n) < 0.5
+    q = rng.uniform(0, 0.08, n)
+    px = bs2002_price(S, K, T, 0.04, q, v, cp)
+    a = american_implied_vol(px, S, K, T, 0.04, q, cp)
+    b = american_implied_vol_fast(px, S, K, T, 0.04, q, cp)
+    assert (a.reason == b.reason).all()            # incl. VOL_BELOW_MIN for quotes at exercise value
+    ok = a.ok & b.ok
+    assert ok.mean() > 0.85
+    np.testing.assert_allclose(b.iv[ok], a.iv[ok], atol=2e-4)          # vol ill-determined where vega ~ 0
+    np.testing.assert_allclose(bs2002_price(S, K[ok], T[ok], 0.04, q[ok], b.iv[ok], cp[ok]), px[ok], atol=1e-6)
+    from atlasbt.options.calibrate import SAMPLE_PATH, from_dolthub
+    from atlasbt.options.metrics import _chain_metrics, chain_metrics
+    df = from_dolthub(pd.read_csv(SAMPLE_PATH))
+    snap = df[(df.underlying == "SPY") & (df.date == "2023-03-15")].copy()
+    snap["underlying_price"], snap["settlement"], snap["fidelity"] = 389.3, "PHYSICAL", 2
+    now = pd.Timestamp("2023-03-15 20:30", tz="UTC")
+    m1 = chain_metrics(snap, now, 0.045, use_cache=False)
+    t = time.time()
+    m2 = chain_metrics(snap, now, 0.045, use_cache=False)
+    cold = time.time() - t
+    chain_metrics(snap, now, 0.045)
+    t = time.time()
+    m3 = chain_metrics(snap, now, 0.045)
+    warm = time.time() - t
+    assert cold < 1.5 and warm < 0.05 and warm < cold / 5   # loose: CI load varies; ~0.1 s cold in isolation
+    for k in ("atm_iv_30", "atm_iv_60", "skew25_30"):
+        assert m2[k] == pytest.approx(m1[k]) and m3[k] == pytest.approx(m1[k])
+    # vs the slow per-element Brent de-Americanization
+    import atlasbt.pricing.iv as ivm
+    orig = ivm.deamericanize
+    try:
+        ivm.deamericanize = lambda *a, **k: orig(*a, **{**k, "fast": False})
+        slow = _chain_metrics(snap, now, 0.045)
+    finally:
+        ivm.deamericanize = orig
+    for k in ("atm_iv_30", "atm_iv_60", "skew25_30"):
+        assert m1[k] == pytest.approx(slow[k], abs=2e-4)
+
+
+def test_skew_flag_is_worse_of_put_and_call():
+    from atlasbt.pricing.surface import worse_flag
+    assert worse_flag("exact", "extrap_flat") == "extrap_flat"
+    assert worse_flag("interp", "exact") in ("interp", "exact")
+    assert worse_flag("extrap_flat", "none") == "none"
+    assert worse_flag("interp", "interp") == "interp"
+    import atlasbt.pricing.surface as sf
+    orig = sf.constant_maturity_delta_iv
+    try:
+        sf.constant_maturity_delta_iv = lambda sm, d, days: (0.2, "exact") if d < 0 else (0.18, "extrap_flat")
+        v, f = sf.skew_25d(None, 30)
+        assert f == "extrap_flat" and v == pytest.approx(0.02)
+    finally:
+        sf.constant_maturity_delta_iv = orig
+
+
+def test_optleg_carries_contract_terms(chain):
+    e = slice_expiry(prep(chain), "2024-04-19")
+    row = e[(e.strike == 100) & (e.right == "C")].iloc[0].copy()
+    row["deliverable_shares"], row["tick_size"], row["multiplier"], row["root"] = 150.0, 0.05, 100.0, "XYZ1"
+    leg = st.OptLeg.from_row(row, 1)
+    ins = leg.instrument()
+    assert ins.deliverable_shares == 150.0 and ins.tick_size == 0.05 and ins.symbol.startswith("XYZ1")
+    assert ins.settlement.value == leg.settlement and ins.exercise.value == leg.exercise
+    assert leg.intrinsic(np.array([80.0]))[0] == pytest.approx(120.0 - 100.0)   # 150*80/100 - 100
+    plain = st.OptLeg.from_row(e[(e.strike == 100) & (e.right == "C")].iloc[0], 1).instrument()
+    assert plain.deliverable_shares == 100.0 and plain.tick_size == 0.01

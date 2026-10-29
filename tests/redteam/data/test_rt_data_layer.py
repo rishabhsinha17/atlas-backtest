@@ -221,18 +221,18 @@ def test_fundamentals_future_period_end_blocks_updates(portal):
 
 # --------------------------------------------------------------------------- synthetic chain PIT
 def test_synthetic_params_point_in_time(portal):
-    """Synthetic chains for 2012 use skew/wing/spread parameters fitted on 2020-2026 DoltHub
-    chains (only atm_ratio has a PIT schedule)."""
-    from atlasbt.options.synthetic import SyntheticParams
-    p = SyntheticParams.load()
-    ev = str(getattr(p, "evidence", "")) or ""
-    import json
-    from atlasbt.options.synthetic import PARAMS_PATH
-    raw = json.loads(PARAMS_PATH.read_text())
-    pit_keys = {k for k in raw if k.endswith("_schedule")}
-    assert {"spread_coef", "skew_a0"} <= {k.replace("_schedule", "") for k in pit_keys} or \
-        "2020-2026" not in json.dumps(raw.get("evidence", {})), \
-        f"only {pit_keys} are PIT; evidence: {json.dumps(raw['evidence'])[:160]}"
+    """Synthetic chains for 2012 use skew/wing/spread parameters fitted on later DoltHub chains
+    (only atm_ratio has a PIT schedule). Agreed remedy (verified finding #6): such chains are
+    not blocked but must carry the distinct T3 reason 'params_fit_post_as_of'."""
+    import pandas as pd
+    from atlasbt.core.types import Fidelity
+    as_of = pd.Timestamp("2012-06-15 21:00", tz="UTC")
+    chain = portal.option_chain("SPY", as_of)
+    assert len(chain), "expected a synthetic fallback chain for 2012"
+    assert (chain["fidelity"].astype(int) >= int(Fidelity.T3_MODELED)).all()
+    reasons = " ".join(map(str, chain.get("reason", pd.Series(dtype=str)).dropna().unique())) + \
+        " " + str(chain.attrs)
+    assert "params_fit_post_as_of" in reasons, reasons[:300]
 
 
 # --------------------------------------------------------------------------- identity regression set
@@ -301,3 +301,11 @@ def test_pre_evidence_renamed_or_acquirer_not_served(portal, sym, day, bad):
     except DataUnavailableError:
         return
     assert not len(b) or (bad is not None and b.attrs.get("security_id") != bad), (sym, b.attrs.get("security_id"))
+
+
+def test_cvna_2021_2022_history_not_cut(portal):
+    """Coordinator regression: CVNA's genuine 2021-2022 crash (alternating large days) must not
+    trigger the Yahoo glitch-cluster cut; 2019-2022 history is served."""
+    b = portal.bars("CVNA", "1d", pd.Timestamp("2019-01-01"), pd.Timestamp("2023-01-01"), ASOF)
+    assert len(b) > 900 and b.index[0] < pd.Timestamp("2019-01-10", tz="UTC")
+    assert not any("trim" in x for x in b.attrs.get("identity_log", []))

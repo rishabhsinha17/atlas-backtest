@@ -115,3 +115,17 @@ def test_known_answer_put_index_replication():
     assert res["correlation"] > 0.9
     assert res["tracking_error_ann"] < 0.04
     assert abs(res["ann_return_synthetic"] - res["ann_return_put_index"]) < 0.035
+
+
+def test_params_fit_window_reasons_and_fe_cutoff(gen):
+    from atlasbt.options.synthetic import params_fit_reasons
+    p = gen.params
+    early = gen.chain("SPY", clock.et("2015-06-10", "16:30"), 210.0, 0.001, 0.02, max_dte=40)
+    assert "params_fit_post_as_of" in early.attrs["fidelity_reasons"]
+    assert params_fit_reasons(p, "2015-06-10") == (["params_fit_post_as_of"], False)   # pre-window: no symbol FE
+    assert params_fit_reasons(p, "2022-06-15") == (["params_fit_post_as_of"], True)    # inside window
+    late = pd.Timestamp(p.fit_window[1]) + pd.Timedelta(days=10)
+    assert params_fit_reasons(p, late) == ([], True)
+    s_fe = model_spread(1.0, 30, 0.3, "SPY", p, True, 0.2, use_symbol_fe=True)
+    s_def = model_spread(1.0, 30, 0.3, "SPY", p, True, 0.2, use_symbol_fe=False)
+    assert s_fe != s_def

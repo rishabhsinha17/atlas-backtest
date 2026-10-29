@@ -100,7 +100,7 @@ def snapshot_stats(snap: pd.DataFrame, r: float, spot: float | None = None) -> d
     if spot is None:
         # European parity on the nearest expiry gives a spot proxy (q ~ 0 over 2-3 weeks)
         fw0 = infer_forwards(s0, r=r, spot=1.0, american=False)
-        fw0 = fw0[np.isfinite(fw0["F"])]
+        fw0 = fw0[np.isfinite(fw0["F"])] if "F" in fw0.columns else fw0
         if fw0.empty:
             return {}
         near = fw0.sort_values("T").iloc[0]
@@ -286,6 +286,7 @@ def calibrate(sample: pd.DataFrame, write: bool = True, path: Path = PARAMS_PATH
     out["spread_default_fe"] = sm["default_fe"]
     q = df[(df["bid"] > 0) & (df["ask"] > df["bid"])]
     out["spread_resid_sd"] = sm["evidence"]["resid_sd_log"]
+    out["fit_window"] = [str(pd.Timestamp(min(dates)).date()), str(pd.Timestamp(max(dates)).date())]
     out["evidence"] = {
         "data": {"source": "DoltHub post-no-preference/options option_chain (EOD, 2020-2026 sample) + "
                            "historicaloptiondata.com L3 full-market EOD 2019-08-15 (data_raw)", "n_rows": int(len(df)),
@@ -386,7 +387,7 @@ def put_implied_atm(start="2008-01-01", end="2016-12-31", q_spx: float = 0.018) 
             payoff = max(K - float(g.loc[R2, "Open"]), 0.0)
             prem = ((put.loc[R2] / put.loc[R] - 1 - rf) * K + payoff) / (1 + rf)
             iv = float(implied_vol(prem, S, K, T, r, q_spx, "P").iv)
-            rows.append(dict(R=R, vix=float(vix.loc[:R].iloc[-1]) / 100, iv=iv))
+            rows.append(dict(R=R, R2=R2, vix=float(vix.loc[:R].iloc[-1]) / 100, iv=iv))
     d = pd.DataFrame(rows).dropna()
     d["ratio"] = d["iv"] / d["vix"]
     return d
@@ -572,6 +573,9 @@ def main():  # pragma: no cover
                                                       "note": "cross-check only (SPY/DIA/QQQ/IWM/SPX chains)"}
     d["evidence"]["atm_ratio_put_implied_full_fit"] = fit_atm_ratio(put_implied_atm("2007-01-01", "2026-12-31"))
     d["atm_ratio_schedule"] = sched
+    obs = put_implied_atm("2007-01-01", f"{pd.Timestamp.today().year}-12-31")
+    d["atm_ratio_obs"] = [{"R": str(r.R.date()), "R2": str(r.R2.date()), "vix": round(float(r.vix), 6),
+                           "ratio": round(float(r.ratio), 6)} for r in obs.itertuples()]
     # static fallback (used when as_of is unknown) = latest PIT fit
     d["atm_ratio_index"], d["atm_ratio_logvix"] = sched[-1]["c0"], sched[-1]["c1"]
     PARAMS_PATH.write_text(json.dumps(d, indent=1, default=str))

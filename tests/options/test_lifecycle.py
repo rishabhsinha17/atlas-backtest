@@ -107,3 +107,16 @@ def test_split_and_special_dividend_adjustments():
     assert ev.stock_qty == 150
     assert adjust_for_special_dividend(c, 0.10).strike == 300      # $10/contract < $12.50
     assert adjust_for_special_dividend(c, 5.00).strike == 295
+
+
+def test_early_exercise_never_treats_missing_mark_as_zero_extrinsic():
+    from atlasbt.options.lifecycle import OptionMark
+    p = opt(150, "P", "2024-09-20")
+    assert not early_exercise_rational(p, 100.0, float("nan"), "2024-03-06", 0.05)[0]
+    stale = OptionMark(50.05, pd.Timestamp("2024-03-05 21:00", tz="UTC"))
+    assert not early_exercise_rational(p, 100.0, stale, "2024-03-06", 0.05)[0]
+    same = OptionMark(50.05, pd.Timestamp("2024-03-06 20:00", tz="UTC"))
+    assert early_exercise_rational(p, 100.0, same, "2024-03-06", 0.05)[0]
+    model = OptionMark(float("nan"), None, model_value=50.05)
+    ok, why = early_exercise_rational(p, 100.0, model, "2024-03-06", 0.05)
+    assert ok and "PIT model value" in why

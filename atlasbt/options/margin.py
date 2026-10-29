@@ -10,8 +10,10 @@ and the full cost of long options:
   * naked short put : 100% premium + pct*S - OTM amount, min premium + 10%*K.
     pct = 20% equity / narrow index, 15% broad-based index & broad-based ETF;
     both percentages are multiplied by the leverage factor of leveraged ETFs.
-  * spreads (long expires with/after short): maximum potential loss from the
-    intrinsic-value payoff evaluated at every strike, plus longs paid in full.
+  * spreads (long settles with/after short, compared by settlement INSTANT so
+    AM vs PM series differ): the LESSER of the maximum potential loss (intrinsic
+    payoff at every strike) and the shorts' naked requirement, plus longs paid
+    in full (the 75% loan value applies only to stand-alone longs > 9 months).
     A whole same-expiry group (iron condors, butterflies incl. broken wing,
     boxes, ratio spreads with surplus longs) is evaluated together, so iron
     condors/flies are charged the riskier side only.
@@ -83,6 +85,39 @@ class MarginResult:
     components: list = field(default_factory=list)   # (description, USD)
     cash_account_ok: Optional[bool] = None
     notes: list = field(default_factory=list)
+    rule_version: str = "current"
+
+
+# Effective dates of the strategy-based rules (Cboe Margin Manual, Nov-2021, p.4 table and notes).
+RULE_DATES = {
+    "short_option_pcts": pd.Timestamp("1988-06-06"),     # 20%/10% equity & narrow index, 15%/10% broad index
+    "put_min_on_strike": pd.Timestamp("1997-06-02"),     # put minimum 10% of EXERCISE price (before: of underlying)
+    "long_over_9m_75pct": pd.Timestamp("1999-08-23"),    # loan value on listed longs > 9 months
+    "limited_risk_spreads": pd.Timestamp("1999-08-23"),  # butterflies/boxes, cash-account spreads, hedged maintenance
+    "all_spreads_max_loss": pd.Timestamp("2012-08-29"),  # "Spreads: All Types - Maximum Potential Loss Computation"
+}
+
+
+def _asof(as_of) -> pd.Timestamp | None:
+    if as_of is None:
+        return None
+    t = pd.Timestamp(as_of)
+    if t.tzinfo is not None:
+        t = t.tz_convert("America/New_York").tz_localize(None)
+    return t.normalize()
+
+
+def rule_version(as_of=None) -> str:
+    """'current' (>= 2012-08-29), 'side_groups' (1999-08-23 .. 2012-08-28),
+    'pairwise' (1988-06-06 .. 1999-08-22), 'pre1988' (not modeled; 1988 rules applied)."""
+    d = _asof(as_of)
+    if d is None or d >= RULE_DATES["all_spreads_max_loss"]:
+        return "current"
+    if d >= RULE_DATES["limited_risk_spreads"]:
+        return "side_groups"
+    if d >= RULE_DATES["short_option_pcts"]:
+        return "pairwise"
+    return "pre1988"
 
 
 UNDERLYING_CLASSES = {"equity": 0.20, "narrow_index": 0.20, "broad_index": 0.15, "broad_etf": 0.15,
@@ -90,14 +125,16 @@ UNDERLYING_CLASSES = {"equity": 0.20, "narrow_index": 0.20, "broad_index": 0.15,
 
 
 def naked_requirement(right: str, strike: float, price: float, S: float, underlying_class: str = "equity",
-                      leverage: float = 1.0, multiplier: float = 100.0, qty: float = 1.0) -> float:
+                      leverage: float = 1.0, multiplier: float = 100.0, qty: float = 1.0, as_of=None) -> float:
     """Cboe naked short requirement per |qty| contracts (USD, incl. premium)."""
     pct = UNDERLYING_CLASSES[underlying_class] * leverage
     minpct = 0.10 * leverage
     c = right.upper()[0] == "C"
     otm = max(strike - S, 0.0) if c else max(S - strike, 0.0)
     basic = price + pct * S - otm
-    minimum = price + minpct * (S if c else strike)
+    d = _asof(as_of)
+    put_base = strike if (d is None or d >= RULE_DATES["put_min_on_strike"]) else S
+    minimum = price + minpct * (S if c else put_base)
     return max(basic, minimum) * multiplier * abs(qty)
 
 
@@ -110,9 +147,12 @@ def _months(now, expiry) -> float:
     return (pd.Timestamp(expiry).normalize() - n.normalize()).days / 30.4375
 
 
-def long_requirement(p: OptionPosition, now=None, account: str = "margin", equity_based: bool = True) -> float:
+def long_requirement(p: OptionPosition, now=None, account: str = "margin", equity_based: bool = True,
+                     as_of=None) -> float:
     cost = p.price * p.multiplier * abs(p.qty)
-    if account == "margin" and equity_based and _months(now, p.expiry) > 9:
+    d = _asof(as_of if as_of is not None else now)
+    loan_ok = d is None or d >= RULE_DATES["long_over_9m_75pct"]
+    if account == "margin" and equity_based and loan_ok and _months(now, p.expiry) > 9:
         return 0.75 * cost
     return cost
 
@@ -124,10 +164,21 @@ def _units(positions: Sequence[OptionPosition]):
         n = int(round(abs(p.qty)))
         if not np.isclose(n, abs(p.qty)):
             raise ValueError("option quantities must be integral contracts")
+        ek = _settle_key(p)
         for _ in range(n):
-            out.append(dict(i=i, K=float(p.strike), c=p.is_call, exp=pd.Timestamp(p.expiry),
+            out.append(dict(i=i, K=float(p.strike), c=p.is_call, exp=pd.Timestamp(p.expiry), ek=ek,
                             long=p.qty > 0, px=float(p.price), m=float(p.multiplier), pos=p))
     return out
+
+
+def _settle_key(p: "OptionPosition") -> pd.Timestamp:
+    """Settlement instant (expiry date AND settlement type): an SPXW Thursday PM
+    long settles before an SPX AM monthly short with the same expiry date."""
+    from atlasbt.pricing.time import settlement_instant
+    try:
+        return settlement_instant(pd.Timestamp(p.expiry), p.settlement)
+    except Exception:
+        return pd.Timestamp(p.expiry).tz_localize("UTC") + pd.Timedelta(hours=21)
 
 
 def _group_max_loss(units: list[dict]) -> float:
@@ -143,26 +194,56 @@ def _group_max_loss(units: list[dict]) -> float:
     return float(max(0.0, -pay.min()))
 
 
+def _pairwise_loss(units: list[dict]) -> float:
+    """Pre-1999 treatment: only two-leg verticals are recognized; each short is paired
+    with one long of the same right (least adverse strike first) and charged
+    max(0, adverse strike difference); losses are summed (no butterfly/condor netting)."""
+    total = 0.0
+    for is_c in (True, False):
+        sh = sorted([u for u in units if u["c"] == is_c and not u["long"]], key=lambda u: (u["K"] if is_c else -u["K"]))
+        lg = [u for u in units if u["c"] == is_c and u["long"]]
+        for u in sh:
+            if not lg:
+                break
+            best = min(lg, key=lambda v: (max(0.0, v["K"] - u["K"]) if is_c else max(0.0, u["K"] - v["K"])))
+            lg.remove(best)
+            total += (max(0.0, best["K"] - u["K"]) if is_c else max(0.0, u["K"] - best["K"])) * u["m"]
+    return total
+
+
 def strategy_margin(positions: Sequence[OptionPosition], underlying_price: float, stock_shares: float = 0.0,
                     underlying_class: str = "equity", leverage: float = 1.0, account: str = "margin",
-                    now=None, apply_proceeds_in_cash_account: bool = False) -> MarginResult:
+                    now=None, apply_proceeds_in_cash_account: bool = False, as_of=None) -> MarginResult:
     """Strategy-based requirement for all option positions on ONE underlying.
 
+    ``as_of`` (default ``now``): rules in force on that date (``rule_version``):
+    current >= 2012-08-29 (max-loss over whole same-expiry groups); 1999-08-23..2012-08-28
+    call and put sides grouped separately and summed (butterflies/boxes recognized, no
+    cross-side netting -- conservative assumption); 1988-06-06..1999-08-22 two-leg verticals
+    only; puts' 10% minimum on the underlying before 1997-06-02; 75% loan value on
+    longs > 9 months only from 1999-08-23.  None -> current rules.
     ``underlying_class``: 'equity' | 'narrow_index' | 'broad_index' |
     'broad_etf' | 'volatility_index'.  ``stock_shares`` signed shares held (used
     for covering).  ``account``: 'margin' | 'cash'.  ``now`` (for the 9-month
     long-option rule).
     """
     S = float(underlying_price)
+    as_of = as_of if as_of is not None else now
+    regime = rule_version(as_of)
     units = _units(positions)
     comps: list = []
-    notes: list = []
+    notes: list = [f"rule version: {regime}"]
+    if regime == "pre1988":
+        notes.append("pre-1988-06-06 margin rules not modeled: 1988 percentages applied")
+
+    def naked_req(c, K, px, m):
+        return naked_requirement("C" if c else "P", K, px, S, underlying_class, leverage, m, as_of=as_of)
     short_mv = sum(u["px"] * u["m"] for u in units if not u["long"])
     long_mv = sum(u["px"] * u["m"] for u in units if u["long"])
 
-    # ---- 1. excess shorts per expiry
-    exps = sorted({u["exp"] for u in units})
-    groups: dict = {e: [u for u in units if u["exp"] == e] for e in exps}
+    # ---- 1. excess shorts per expiry SERIES (keyed by settlement instant)
+    exps = sorted({u["ek"] for u in units})
+    groups: dict = {e: [u for u in units if u["ek"] == e] for e in exps}
     excess: list = []
     surplus: dict = {}
     for e in exps:
@@ -184,10 +265,10 @@ def strategy_margin(positions: Sequence[OptionPosition], underlying_price: float
                 surplus.setdefault((e, is_c), []).extend(lg_sorted[:(-n_ex)])
     # ---- 2. calendars / diagonals with later-expiring surplus longs
     still: list = []
-    for u in sorted(excess, key=lambda u: (u["exp"], u["K"] if u["c"] else -u["K"])):
+    for u in sorted(excess, key=lambda u: (u["ek"], u["K"] if u["c"] else -u["K"])):
         best, best_loss, best_key = None, None, None
         for (e, is_c), lst in surplus.items():
-            if is_c != u["c"] or e < u["exp"] or not lst:
+            if is_c != u["c"] or e < u["ek"] or not lst:
                 continue
             for cand in lst:
                 loss = max(0.0, cand["K"] - u["K"]) if u["c"] else max(0.0, u["K"] - cand["K"])
@@ -195,32 +276,54 @@ def strategy_margin(positions: Sequence[OptionPosition], underlying_price: float
                     best, best_loss, best_key = cand, loss, (e, is_c)
         if best is not None:
             surplus[best_key].remove(best)
-            groups[best["exp"]].remove(best)
+            groups[best["ek"]].remove(best)
             loss_usd = best_loss * u["m"]
-            comps.append((f"time spread short {u['exp']:%Y-%m-%d} {u['K']:g}{'C' if u['c'] else 'P'} vs long "
-                          f"{best['exp']:%Y-%m-%d} {best['K']:g}: max loss", loss_usd))
-            comps.append(("time spread long paid", long_requirement(best["pos"], now, account) / abs(best["pos"].qty)))
+            naked = naked_req(u["c"], u["K"], u["px"], u["m"])
+            lbl = (f"time spread short {u['exp']:%Y-%m-%d} {u['K']:g}{'C' if u['c'] else 'P'} vs long "
+                   f"{best['exp']:%Y-%m-%d} {best['K']:g}")
+            if naked < loss_usd:
+                comps.append((lbl + ": short naked requirement (< max loss)", naked))
+            else:
+                comps.append((lbl + ": max loss", loss_usd))
+            comps.append(("time spread long paid in full", best["px"] * best["m"]))
             if account == "cash":
                 notes.append("cash account: calendar/diagonal spreads not permitted (long treated as paid, short must be covered)")
         else:
             still.append(u)
-    # ---- 3. bounded same-expiry groups
+    # ---- 3. bounded same-expiry groups: lesser of max potential loss and the shorts' naked
+    #         requirement; longs in a spread are paid in full (75% loan value only for
+    #         stand-alone longs > 9 months)
     for e in exps:
         g = groups[e]
         if not g:
             continue
-        loss = _group_max_loss(g)
         longs = [u for u in g if u["long"]]
-        if any(not u["long"] for u in g):
-            comps.append((f"spread group {e:%Y-%m-%d}: max potential loss", loss))
+        shorts = [u for u in g if not u["long"]]
+        d0 = g[0]["exp"]
+        if shorts:
+            if regime == "current":
+                loss = _group_max_loss(g)                                    # whole group, riskier side
+            elif regime == "side_groups":
+                loss = sum(_group_max_loss([u for u in g if u["c"] == side]) for side in (True, False))
+            else:
+                loss = _pairwise_loss(g)                                     # two-leg verticals only
+            naked = sum(naked_req(u["c"], u["K"], u["px"], u["m"]) for u in shorts)
+            if naked < loss:
+                comps.append((f"spread group {d0:%Y-%m-%d}: shorts' naked requirement (< max loss)", naked))
+            else:
+                comps.append((f"spread group {d0:%Y-%m-%d}: max potential loss", loss))
             if account == "cash":
                 eur_cash = all(u["pos"].exercise.upper() == "EUROPEAN" and u["pos"].settlement.upper().startswith("CASH")
                                for u in g)
                 if not eur_cash:
-                    notes.append(f"cash account: spread group {e:%Y-%m-%d} not European cash-settled -> not permitted")
-        for u in longs:
-            comps.append((f"long {e:%Y-%m-%d} {u['K']:g}{'C' if u['c'] else 'P'} paid",
-                          long_requirement(u["pos"], now, account) / abs(u["pos"].qty)))
+                    notes.append(f"cash account: spread group {d0:%Y-%m-%d} not European cash-settled -> not permitted")
+            for u in longs:
+                comps.append((f"long {d0:%Y-%m-%d} {u['K']:g}{'C' if u['c'] else 'P'} paid in full (spread)",
+                              u["px"] * u["m"]))
+        else:
+            for u in longs:
+                comps.append((f"long {d0:%Y-%m-%d} {u['K']:g}{'C' if u['c'] else 'P'} paid",
+                              long_requirement(u["pos"], now, account, as_of=as_of) / abs(u["pos"].qty)))
     # ---- 4. cover by stock
     shares = float(stock_shares)
     naked_c, naked_p = [], []
@@ -250,11 +353,11 @@ def strategy_margin(positions: Sequence[OptionPosition], underlying_price: float
             comps.append((f"cash-secured put {u['K']:g}", u["K"] * u["m"] + extra))
         for u in naked_c:
             comps.append((f"naked call {u['K']:g} (not permitted in cash account)",
-                          naked_requirement("C", u["K"], u["px"], S, underlying_class, leverage, u["m"])))
+                          naked_requirement("C", u["K"], u["px"], S, underlying_class, leverage, u["m"], as_of=as_of)))
     else:
-        rc = sorted([(naked_requirement("C", u["K"], u["px"], S, underlying_class, leverage, u["m"]), u) for u in naked_c],
+        rc = sorted([(naked_requirement("C", u["K"], u["px"], S, underlying_class, leverage, u["m"], as_of=as_of), u) for u in naked_c],
                     key=lambda t: -t[0])
-        rp = sorted([(naked_requirement("P", u["K"], u["px"], S, underlying_class, leverage, u["m"]), u) for u in naked_p],
+        rp = sorted([(naked_requirement("P", u["K"], u["px"], S, underlying_class, leverage, u["m"], as_of=as_of), u) for u in naked_p],
                     key=lambda t: -t[0])
         for (qc, uc), (qp, up) in zip(rc, rp):
             if qc >= qp:
@@ -273,7 +376,7 @@ def strategy_margin(positions: Sequence[OptionPosition], underlying_price: float
     return MarginResult(requirement=req, short_market_value=float(short_mv), long_market_value=float(long_mv),
                         net_requirement=req - float(short_mv), components=comps,
                         cash_account_ok=(cash_ok and not any("not permitted" in n for n in notes)) if account == "cash" else None,
-                        notes=notes)
+                        notes=notes, rule_version=regime)
 
 
 def package_margin(pkg, units: float, underlying_price: float, stock_shares: float = 0.0,

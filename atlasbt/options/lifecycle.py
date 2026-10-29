@@ -81,8 +81,23 @@ class LifecycleEvent:
         return fills
 
 
+def effective_underlying(instr: Instrument, S: float) -> float:
+    """Underlying value per unit of the option's price quote: deliverable*S/multiplier
+    (== S for standard 100-share contracts; 150*S/100 after a 3:2 split, 10*S/100 after
+    a 1:10 reverse split)."""
+    return float(S) * instr.deliverable_shares / instr.multiplier
+
+
 def intrinsic(instr: Instrument, S: float) -> float:
-    return max(S - instr.strike, 0.0) if instr.right.value == "C" else max(instr.strike - S, 0.0)
+    """Intrinsic value per price unit (x multiplier = per contract):
+    per contract = deliverable*S - K*multiplier (calls), reverse for puts."""
+    se = effective_underlying(instr, S)
+    return max(se - instr.strike, 0.0) if instr.right.value == "C" else max(instr.strike - se, 0.0)
+
+
+def delivery_price(instr: Instrument) -> float:
+    """Price per delivered share: aggregate exercise price K*multiplier spread over the deliverable."""
+    return instr.strike * instr.multiplier / instr.deliverable_shares
 
 
 def settlement_due(instr: Instrument, session) -> bool:
@@ -111,7 +126,7 @@ def expiration_events(positions: Mapping[Instrument, float], session, ref_price:
         fid = Fidelity.T2_PROXY if st == SettlementType.CASH_AM else Fidelity.T1_BAR
         itm = intrinsic(instr, S)
         exercised = itm >= policy.threshold - 1e-12
-        pin = abs(S - instr.strike) <= policy.pin_band
+        pin = abs(effective_underlying(instr, S) - instr.strike) <= policy.pin_band
         if st != SettlementType.PHYSICAL:
             cash = itm * instr.multiplier * qty if exercised else 0.0
             out.append(LifecycleEvent("CASH_SETTLEMENT" if exercised else "EXPIRE_WORTHLESS", instr, -qty, None, 0.0, 0.0,
@@ -120,7 +135,7 @@ def expiration_events(positions: Mapping[Instrument, float], session, ref_price:
             continue
         if qty < 0 and policy.pin_policy == "adverse" and pin and not exercised:
             exercised = True
-            why = f"pin-risk adverse assignment |S-K|={abs(S - instr.strike):.4f}<= {policy.pin_band}"
+            why = f"pin-risk adverse assignment |S_eff-K|={abs(effective_underlying(instr, S) - instr.strike):.4f}<= {policy.pin_band}"
         else:
             why = f"close={S:.4f} intrinsic={itm:.4f}" + (" PIN" if pin and policy.pin_band > 0 else "")
         if not exercised:
@@ -134,7 +149,8 @@ def expiration_events(positions: Mapping[Instrument, float], session, ref_price:
         else:         # short assigned: call delivers shares, put receives shares
             sq = -shares if is_call else shares
             kind = "ASSIGNMENT"
-        out.append(LifecycleEvent(kind, instr, -qty, instr.underlying, sq, instr.strike, -sq * instr.strike, S,
+        px = delivery_price(instr)
+        out.append(LifecycleEvent(kind, instr, -qty, instr.underlying, sq, px, -sq * px, S,
                                   session, ts, fid, why))
     return out
 
@@ -142,9 +158,41 @@ def expiration_events(positions: Mapping[Instrument, float], session, ref_price:
 # --------------------------------------------------------------------------
 # Early exercise / assignment (American)
 # --------------------------------------------------------------------------
-def early_exercise_rational(instr: Instrument, S: float, option_mid: float, session, r: float,
+@dataclass(frozen=True)
+class OptionMark:
+    """A mark supplied by the engine for the early-assignment test."""
+    mid: float
+    ts: Optional[pd.Timestamp] = None        # when the mark was observed (UTC)
+    fidelity: Optional[Fidelity] = None
+    model_value: float = float("nan")         # optional PIT model value (fallback)
+
+
+def _same_session_value(option_mid, session) -> tuple[float, str]:
+    """Value usable as the option price at ``session``: a finite mid observed in the
+    SAME session (or a bare float, which the caller asserts is same-session), else
+    the PIT model value if supplied, else NaN (-> no assignment)."""
+    from atlasbt.core import clock
+    if isinstance(option_mid, OptionMark):
+        mid, ts = option_mid.mid, option_mid.ts
+        same = ts is None or clock.session_date_of(clock.to_utc(ts)) == session
+        if np.isfinite(mid) and same:
+            return float(mid), "same-session mark"
+        if np.isfinite(option_mid.model_value):
+            return float(option_mid.model_value), "PIT model value (no same-session mark)"
+        return float("nan"), "no same-session mark"
+    v = float(option_mid) if option_mid is not None else float("nan")
+    return (v, "mark") if np.isfinite(v) else (float("nan"), "no mark")
+
+
+def early_exercise_rational(instr: Instrument, S: float, option_mid, session, r: float,
                             dividends: Optional[list] = None) -> tuple[bool, str]:
-    """Holder's early-exercise decision (deterministic rule of thumb):
+    """Holder's early-exercise decision (deterministic rule of thumb).
+
+    ``option_mid``: an ``OptionMark`` (mid + observation ts [+ PIT model value]) or a
+    float the caller guarantees is a same-session mark.  Without a valid same-session
+    mark (or model fallback) NO assignment is generated — a missing price is never
+    treated as zero extrinsic value.""" + """
+
 
     * call: tomorrow is the ex-date of a cash dividend D, the call is ITM and
       its extrinsic value (mid - intrinsic) < D (exercise captures D).
@@ -157,32 +205,37 @@ def early_exercise_rational(instr: Instrument, S: float, option_mid: float, sess
     itm = intrinsic(instr, S)
     if itm <= 0:
         return False, "otm"
-    extrinsic = max(option_mid - itm, 0.0) if np.isfinite(option_mid) else 0.0
     session = pd.Timestamp(session).normalize()
+    value, src = _same_session_value(option_mid, session)
+    if not np.isfinite(value):
+        return False, f"{src}: early-assignment test skipped"
+    extrinsic = max(value - itm, 0.0)
     from atlasbt.core import clock
     nxt = clock.nyse().next_session(session)
     divs = dividends or []
     if instr.right.value == "C":
         for ex, amt in divs:
             if pd.Timestamp(ex).normalize() == nxt and pd.Timestamp(ex) <= instr.expiry + pd.Timedelta(days=1):
-                if extrinsic < amt:
-                    return True, f"call ex-div tomorrow: extrinsic {extrinsic:.4f} < dividend {amt:.4f}"
+                amt_u = amt * instr.deliverable_shares / instr.multiplier   # dividend per price unit
+                if extrinsic < amt_u:
+                    return True, f"call ex-div tomorrow: extrinsic {extrinsic:.4f} < dividend {amt_u:.4f} ({src})"
         return False, "call: no dividend capture"
     T = max((pd.Timestamp(instr.expiry) - session).days, 0) / 365.0
-    pv_d = sum(a * np.exp(-r * max((pd.Timestamp(e) - session).days, 0) / 365.0)
+    pv_d = instr.deliverable_shares / instr.multiplier * sum(a * np.exp(-r * max((pd.Timestamp(e) - session).days, 0) / 365.0)
                for e, a in divs if session < pd.Timestamp(e) <= pd.Timestamp(instr.expiry))
     carry = instr.strike * (1 - np.exp(-r * T)) - pv_d
     if carry > 0 and extrinsic < carry:
-        return True, f"deep ITM put: extrinsic {extrinsic:.4f} < carry {carry:.4f}"
+        return True, f"deep ITM put: extrinsic {extrinsic:.4f} < carry {carry:.4f} ({src})"
     return False, "put: extrinsic >= carry"
 
 
 def early_assignment_events(positions: Mapping[Instrument, float], session, spot: Mapping[str, float] | Callable,
-                            option_mid: Mapping[str, float] | Callable, r: float,
+                            option_mid: Mapping | Callable, r: float,
                             dividends: Mapping[str, list] | None = None) -> list[LifecycleEvent]:
     """Short American options assigned at the end of ``session`` when the
     holder rule in ``early_exercise_rational`` says exercise (whole position,
-    conservative).  Expiring-today options are left to ``expiration_events``."""
+    conservative).  Expiring-today options are left to ``expiration_events``.
+    ``option_mid`` maps symbol -> OptionMark (preferred) or same-session float mid."""
     session = pd.Timestamp(session).normalize()
     ts = _close_ts(session)
     out = []
@@ -198,7 +251,8 @@ def early_assignment_events(positions: Mapping[Instrument, float], session, spot
             continue
         shares = instr.deliverable_shares * abs(qty)
         sq = -shares if instr.right.value == "C" else shares
-        out.append(LifecycleEvent("EARLY_ASSIGNMENT", instr, -qty, instr.underlying, sq, instr.strike, -sq * instr.strike,
+        px = delivery_price(instr)
+        out.append(LifecycleEvent("EARLY_ASSIGNMENT", instr, -qty, instr.underlying, sq, px, -sq * px,
                                   S, session, ts, Fidelity.T2_PROXY, why))
     return out
 

@@ -193,7 +193,7 @@ def bs1993_call(S, X, T, r, b, v):
 
 def bs2002_price(S, K, T, r, q, sigma, is_call):
     """Bjerksund-Stensland (2002) American approximation; continuous yield q
-    (cost of carry b = r - q)."""
+    (cost of carry b = r - q).  Elements with r < 0 are priced by CRR (400 steps)."""
     cp = as_is_call(is_call)
     S, K, T, r, q, sigma, cpb = np.broadcast_arrays(*[np.asarray(a, float) for a in (S, K, T, r, q, sigma)], cp)
     cpb = cpb.astype(bool)
@@ -207,6 +207,13 @@ def bs2002_price(S, K, T, r, q, sigma, is_call):
         out[c] = _bs2002_call(S[c], K[c], T[c], r[c], b[c], sigma[c])
     if np.any(p):
         out[p] = _bs2002_call(K[p], S[p], T[p], r[p] - b[p], -b[p], sigma[p])
+    # BS-2002 assumes r >= 0 (with r < 0 the "b >= r -> European" shortcut is wrong for calls
+    # and the boundary formulas break): price those elements with the CRR tree instead.
+    neg = (r < 0) & ~expired
+    if np.any(neg):
+        for j in np.argwhere(neg):
+            j = tuple(j)
+            out[j] = crr_price(S[j], K[j], T[j], r[j], sigma[j], bool(cpb[j]), steps=400, q=q[j])
     out[expired] = intr[expired]
     if np.any(sigma <= 0) and np.any(T > 0):  # deterministic limit: max(intrinsic, discounted forward intrinsic)
         det = (sigma <= 0) & (T > 0)

@@ -25,6 +25,14 @@ from atlasbt.core.types import (ExerciseStyle, Instrument, Leg, Order, OrderType
 from .chain import SelectionError, get_row, nearest_atm, select_by_delta, wing_by_points
 
 
+def _num(v, default: float) -> float:
+    try:
+        f = float(v)
+        return f if np.isfinite(f) and f > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(frozen=True)
 class OptLeg:
     underlying: str
@@ -45,6 +53,8 @@ class OptLeg:
     settlement: str = "PHYSICAL"
     root: Optional[str] = None
     symbol: Optional[str] = None
+    deliverable_shares: float = 100.0  # OCC-adjusted deliverable (non-standard after splits)
+    tick_size: float = 0.01
 
     @staticmethod
     def from_row(row: pd.Series, ratio: int) -> "OptLeg":
@@ -60,16 +70,25 @@ class OptLeg:
                       multiplier=float(g("multiplier", 100.0) or 100.0), exercise=str(g("exercise", "AMERICAN") or "AMERICAN"),
                       settlement=str(g("settlement", "PHYSICAL") or "PHYSICAL"),
                       root=(str(g("root")) if g("root") is not None and str(g("root")) != "nan" else None),
+                      deliverable_shares=_num(g("deliverable_shares", None), 100.0),
+                      tick_size=_num(g("tick_size", None), 0.01),
                       symbol=(str(g("symbol")) if g("symbol") is not None and str(g("symbol")) != "nan" else None))
 
     def instrument(self) -> Instrument:
-        return Instrument.option(self.underlying, self.expiry, self.strike, Right(self.right),
-                                 exercise=ExerciseStyle(self.exercise.upper()),
-                                 settlement=SettlementType(self.settlement.upper()),
-                                 multiplier=self.multiplier, root=self.root)
+        """core Instrument with the chain row's multiplier, deliverable, tick, root,
+        settlement and exercise (non-standard contracts keep their terms)."""
+        from dataclasses import replace
+        ins = Instrument.option(self.underlying, self.expiry, self.strike, Right(self.right),
+                                exercise=ExerciseStyle(self.exercise.upper()),
+                                settlement=SettlementType(self.settlement.upper()),
+                                multiplier=self.multiplier, root=self.root, tick_size=self.tick_size)
+        if self.deliverable_shares != ins.deliverable_shares:
+            ins = replace(ins, deliverable_shares=float(self.deliverable_shares))
+        return ins
 
     def intrinsic(self, S):
-        S = np.asarray(S, float)
+        """Per price unit; uses the effective underlying deliverable*S/multiplier."""
+        S = np.asarray(S, float) * self.deliverable_shares / self.multiplier
         return np.maximum(S - self.strike, 0.0) if self.right == "C" else np.maximum(self.strike - S, 0.0)
 
 
@@ -99,7 +118,10 @@ class Package:
 
     @property
     def same_expiry(self) -> bool:
-        return len({l.expiry for l in self.legs}) <= 1
+        """All legs settle at the same instant (expiry date AND settlement type:
+        an SPXW Thursday PM leg and an SPX AM monthly leg are different)."""
+        from atlasbt.pricing.time import settlement_instant
+        return len({settlement_instant(l.expiry, l.settlement) for l in self.legs}) <= 1
 
     @property
     def expiry(self) -> pd.Timestamp:
