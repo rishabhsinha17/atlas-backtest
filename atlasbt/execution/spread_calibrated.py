@@ -187,6 +187,7 @@ class CalibratedSpreadConfig:
     era_monotone: bool = True          # era(t, relative ADV$) non-increasing in t (backward cumulative max)
     relative_liquidity: bool = True    # deflate ADV$ by market dollar volume (calibration 'market_volume')
     stress_sigma_mult: float = 3.0     # 'stress regime' qualifier when sigma >= mult x reference sigma
+    pessimistic_floor_2010_2025: bool = True   # 2010-2025 (no NBBO evidence): max(relative, nominal-ADV 2026) estimate
     etf_monotone: bool = True          # ETF branch: running minimum over ADV$
     tod: bool = True
     extended_hours_mult: float = 3.0
@@ -385,7 +386,8 @@ class CalibratedSpreadModel:
         """Vectorised model. Returns (half_spread_frac, reason_code): 0 ok, 1 ADV$ below the
         calibration range (CS-capped when available), 2 default (no inputs), 3 CS/AR fallback (no
         volume), +8 when sigma came (partly) from the price-bucket prior, +16 when the tick regime was
-        assumed (exchange unknown before 2001-04-09), +32 stress regime (sigma >= stress_sigma_mult x ref). ``dates`` naive ET session dates; all inputs PIT.
+        assumed (exchange unknown before 2001-04-09), +32 stress regime (sigma >= stress_sigma_mult x ref),
+        +64 when the 2010-2025 pessimistic floor (nominal-ADV 2026 estimate) binds. ``dates`` naive ET session dates; all inputs PIT.
         ``n_sigma`` (optional) = number of returns behind ``daily_vol`` (shrinkage to the prior)."""
         price = np.asarray(price, float).reshape(-1)
         n = len(price)
@@ -422,6 +424,14 @@ class CalibratedSpreadModel:
         code[self.stress(sig, price, etf)] |= 32
         ok = np.isfinite(adv) & (adv > 0) & np.isfinite(price) & (price > 0)
         L = self._latent_frac(np.where(ok, adv, 1e7), sig, np.where(ok, price, 50.0), etf, dates)
+        if self.cfg.pessimistic_floor_2010_2025 and self._mv is not None:
+            gap = (dates >= np.datetime64("2010-01-01")) & (dates < np.datetime64("2026-01-01"))
+            if gap.any():
+                gi = np.nonzero(gap)[0]
+                Ln = self._latent_frac(np.where(ok, adv, 1e7)[gi], sig[gi], np.where(ok, price, 50.0)[gi], etf[gi], None)
+                bind = Ln > L[gi]
+                L[gi] = np.maximum(L[gi], Ln)
+                code[gi[bind & ok[gi]]] |= 64
         p = np.where(ok, price, 50.0)
         r = L * p / k + self._cd
         S = k * (1.0 + r ** self._q) ** (1.0 / self._q)
@@ -490,6 +500,8 @@ class CalibratedSpreadModel:
             parts.append(f"listing assumed {self.cfg.listing}")
         if code & 32:
             parts.append("stress regime: spread uncertainty high")
+        if code & 64 and base != 3:
+            parts.append("no NBBO evidence for era: pessimistic floor")
         if ac_unknown:
             parts.append("asset class inferred STK")
         return ", ".join(parts)
@@ -591,6 +603,8 @@ class CalibratedSpreadModel:
                 parts.append("listing assumed")
             if code[i] & 32:
                 parts.append("stress regime: spread uncertainty high")
+            if code[i] & 64 and b != 3:
+                parts.append("no NBBO evidence for era: pessimistic floor")
             if asset_class is None:
                 parts.append("asset class inferred")
             src[i] = ", ".join(parts)

@@ -128,8 +128,12 @@ modelled (pass `tick=`).
 **Relative liquidity.** ADV$ enters the model (and the era term) relative to the market: la_rel = ln(ADV$ · MV(fit date) / MV(t)), where MV is
 the median daily US listed $ volume (2000 $67B, 2003 $57B, 2007 $180B, 2010 $209B, 2015 $232B, 2020 $455B, 2026 $1073B; `calibration/market_dollar_volume.csv`, 2000–2010 qlib/Yahoo all symbols,
 survivor-biased (low), 2011–2026 DoltHub; log-linear in time, held flat before 2000 and after 2026). Nominal ADV$ is not
-comparable across eras (MV grew ~19× 2003→2026). For 2010–2025 this makes a given nominal ADV$ cheaper than in 2026
-(e.g. $10M ADV, $20, σ 2.5%: 2010 6.2 bp, 2015 6.7 bp, 2026 17.6 bp half spread).
+comparable across eras (MV grew ~19× 2003→2026). For 2010–2025 the deflated model alone would make a given nominal ADV$ cheaper than in 2026
+($10M ADV, $20, σ 2.5%: 2010 6.2 bp, 2015 6.7 bp, 2020 10.1 bp, 2025 16.0 bp, 2026 17.6 bp half spread). There is no
+NBBO evidence for those years, so by default (`pessimistic_floor_2010_2025=True`) the output for dates 2010-01-01..2025-12-31
+is max(relative, nominal-ADV 2026-calibrated) estimate: the same stock is 17.6 bp in every year 2010–2025, and the reason
+gets ", no NBBO evidence for era: pessimistic floor" (code +64) when the floor binds. Set the flag False for the pure
+relative model.
 
 **Era multiplier** `era(t, la_rel)` (latent spread relative to the 2026 fit) = upper envelope (pessimistic) of two literature
 surfaces, each linear in time between anchors, then the backward cumulative maximum over later dates (`era_monotone`; non-increasing
@@ -181,7 +185,7 @@ m.tod_multiplier(mso, mtc, adv_dollars=None, asset_class=None); m.era_multiplier
 ```
 
 `code` bits: 0 ok, 1 ADV below range, 2 default, 3 CS/AR fallback; add 8 for the sigma prior, 16 when the listing was
-assumed and 32 in the stress regime. `m.log_deflator(dates)` gives ln MV(fit)/MV(t); `m.era_multiplier(dates, adv_dollars=None,
+assumed, 32 in the stress regime and 64 when the 2010–2025 pessimistic floor binds. `m.log_deflator(dates)` gives ln MV(fit)/MV(t); `m.era_multiplier(dates, adv_dollars=None,
 relative_adv=None)`.
 
 Reasons start with "calibrated spread model (T2)" and may add ", era-extrapolated" (before 2010), ", ADV below calibration
@@ -352,4 +356,5 @@ v2 features needs only new keyword arguments; no signature breaks:
 | 11 docs | 07-02 all-symbol row relabelled "time stability"; true OOS = hold-out symbols × 07-02 | true OOS MAE 18.68 bp, SD log ratio 0.62 |
 | schema | loader accepts v1, v2 and v3 (`normalize_calibration`); clear error otherwise | none |
 | v3: relative liquidity | ADV$ deflated by market $ volume in the model and the era; monotone constraint at fixed relative ADV$; HJM + Hasbrouck surfaces, upper envelope | HJM Q1–Q5 (v2) 5.2, 8.7, 13.5, 20.5, 33.1 → 4.7, 7.5, 9.7, 12.9, 65.2 bp (obs 5.19, 6.82, 9.17, 11.68, 19.89); Hasbrouck median 0.35–0.70× → 0.51–1.08×; Furfine post-decimal 8.0¢ → 7.0¢ (fitted) |
+| v3: 2010–2025 floor | default `pessimistic_floor_2010_2025=True`: max(relative, nominal 2026) for 2010–2025, qualifier "no NBBO evidence for era: pessimistic floor" | $20 / $10M / σ 2.5%: 2010 6.2 → 17.6 bp, 2015 6.7 → 17.6, 2020 10.1 → 17.6, 2025 16.0 → 17.6 (2026 17.6) |
 | v3: stress | reason qualifier "stress regime: spread uncertainty high" when σ ≥ 3 × reference σ | SPY 2020-03-18 and 2008-10-15 flagged; normal days not |

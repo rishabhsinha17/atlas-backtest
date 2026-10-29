@@ -169,7 +169,7 @@ def test_vectorised_equals_scalar():
     for i in (25, 50, 79):        # full 20-return windows (shorter windows shrink sigma to the prior)
         hs, why = M.half_spread("E", d[i], c[i - 1], adv[i], sig[i], "ETF")
         assert s.est[i] == pytest.approx(2 * hs, rel=1e-12)
-        assert s.at(i)[1] == "calibrated"
+        assert s.at(i)[1] in ("calibrated", "calibrated, no NBBO evidence for era: pessimistic floor")
     assert "sigma prior" in s.at(15)[1]
     assert np.isnan(s.est[0]) and s.src[0] == "default"
 
@@ -276,3 +276,15 @@ def test_relative_liquidity_and_stress_flag():
     assert why.endswith("stress regime: spread uncertainty high")
     assert "stress" not in M.half_spread("SPY", "2020-01-15", 330.0, 2.5e10, 0.006, "ETF")[1]
     assert "stress" not in M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, "STK")[1]
+
+
+def test_pessimistic_floor_2010_2025():
+    off = CalibratedSpreadModel(CalibratedSpreadConfig(pessimistic_floor_2010_2025=False))
+    h26 = M.half_spread(None, "2026-07-01", 20.0, 1e7, 0.025, "STK")[0]
+    for d in ("2010-01-04", "2015-06-01", "2020-06-01"):
+        h, why = M.half_spread(None, d, 20.0, 1e7, 0.025, "STK")
+        hr = off.half_spread(None, d, 20.0, 1e7, 0.025, "STK")[0]
+        assert h >= hr and h == pytest.approx(h26, rel=1e-6)          # max(relative, nominal 2026)
+        assert why.endswith("no NBBO evidence for era: pessimistic floor")
+    assert "pessimistic floor" not in M.half_spread(None, "2026-07-01", 20.0, 1e7, 0.025, "STK")[1]
+    assert "pessimistic floor" not in M.half_spread(None, "2005-06-01", 20.0, 1e7, 0.025, "STK")[1]
