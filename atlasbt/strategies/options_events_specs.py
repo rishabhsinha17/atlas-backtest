@@ -1,0 +1,55 @@
+"""Verbatim sheet text (docs/strategies.json) for S158-S172: Entry rule || Exit / risk rule."""
+
+SPECS = {
+    'S158': 'At 15:30 ET day before an after-close earnings release buy ATM straddle nearest post-release expiry at 3-10DTE; for before-open release buy at 15:30 prior calendar session. || Exit both legs first next RTH 09:45 via quotes after actual release; no theoretical fills at earnings gap.',
+    'S159': 'Before scheduled earnings choose same nearest post-release expiry: short put -0.20, short call +0.20, buy wings -.05/+.05, only if credit>0 and protected wings. || Exit next day 09:45 or at expiry; simulate assignment after extreme gap.',
+    'S160': 'At first next trading-day 10:00 after earnings release, if current 30DTE ATM IV percentile >70, sell 30DTE 0.20delta put vertical ONLY when stock closes above opening range. || Exit at 50% credit, 7DTE, or underlying below 5d low.',
+    'S161': 'At 10:00 ET on confirmed PM-settled SPX 0DTE expiry, sell 0.20delta call/put, buy 0.05delta protective call/put at same expiry; enter complex order with executable quotes. || Close both verticals before 15:30 ET, or at 50% credit captured / 2x credit debit stop; account PM settlement if held.',
+    'S162': 'At 10:00 ET if SPX above VWAP and open>prior close, sell 0.20delta put and buy 0.05delta put same PM-settled 0DTE expiry. || Close at 50% original credit, 2x credit to close or 15:30, whichever first.',
+    'S163': 'At 10:00-12:00 ET SPX 5m close above first 30m high; buy call delta .55 and sell call delta .25 same 0DTE PM-settled expiry. || Exit when underlying below 5m VWAP, option debit loss 50%, or 15:30.',
+    'S164': '5 minutes BEFORE timestamped FOMC statement (not press conference), buy nearest ATM call and put expiring same PM-settled day at recorded NBBO. || Exit exactly 30 minutes after statement using first available nonlocked NBBO; no hindsight of direction.',
+    'S165': 'If current 30DTE interpolated ATM IV at 90th percentile of its own trailing 252 trading days, open defined-risk 30DTE iron condor (20/5 deltas); only if spread filters pass. || Exit when IV pct <=50, or 50% credit captured or 7DTE.',
+    'S166': 'Define skew=IV30DTE(put delta -.25)-IV30DTE(call +.25); if skew zscore previous 252d <-2, buy 30DTE 0.25delta put and sell lower 0.10delta put for debit. || Close if skew z>=0 or at 7DTE; directional delta not neutral; report separately.',
+    'S167': 'If put-minus-call 25delta IV skew zscore>+2, sell 25delta put, buy 25delta call same expiry and hedge net option delta with shares. || Close when skew zscore<0.5 or DTE<=7; fund naked leg margin.',
+    'S168': 'If 30DTE ATM IV exceeds 60DTE ATM IV by >=5 vol points, sell near 30DTE ATM call, buy 60DTE same-strike call. || Exit when term spread <=0 or near DTE<=7.',
+    'S169': 'If model (specified ex ante) predicts next 30d realized sigma < quoted 30DTE ATM IV -5 vol pts, sell -0.25delta/ buy -.1 put, 30DTE. || Exit 50% credit, 7DTE or forecast edge<1vol pt.',
+    'S170': 'Sell 30DTE ATM SPY straddle and buy dollar-vega matched ATM straddles across fixed 5 highest-weight sector ETFs, net initial delta hedged. || Rehedge delta daily and close at DTE<=7; model each ETF option quotes and cross-correlation.',
+    'S171': 'For same strike/expiry quote synchronized bid/ask, compute executable conversion/reversal inequalities using discounted strike, dividends, borrow, American exercise; ENTER only if arbitrage after all costs. || Hold until parity converges or expiration; enforce stock/option locates and early assignment.',
+    'S172': 'Construct fully cash-settled European SPX four-leg box using same expiry and strikes K1<K2: buy call K1/sell call K2 + buy put K2/sell put K1; use simultaneous executable quote. || Hold to correct cash settlement; compare discounted guaranteed terminal width*100 against net debit, funding rate, fees and margin.',
+}
+
+NAMES = {
+    'S158': 'Earnings long straddle pre-release',
+    'S159': 'Earnings short iron condor pre-release',
+    'S160': 'Post-event volatility crush short spread',
+    'S161': 'SPX 0DTE 20delta iron condor',
+    'S162': 'SPX 0DTE put credit spread',
+    'S163': 'SPX 0DTE call debit breakout',
+    'S164': 'SPX 0DTE long straddle at macro release',
+    'S165': 'Options IV percentile mean reversion',
+    'S166': 'Skew steepening put spread',
+    'S167': 'Call-put IV skew risk reversal spread',
+    'S168': 'IV term-structure call calendar',
+    'S169': 'Volatility forecast vs implied short put spread',
+    'S170': 'Dispersion proxy sector options',
+    'S171': 'Put-call parity violation screen',
+    'S172': 'Box spread financing carry',
+}
+
+GRIDS_TEXT = {
+    'S158': 'DTE 3/7/10; entry 15:00/15:30; exit 09:35/09:45',
+    'S159': 'short .15/.2/.25; wing .05/.1; DTE 3-10',
+    'S160': 'IV pct 60/70/80; delta .2/.3',
+    'S161': 'Entry 09:45/10:00/11:00; delta .1/.2/.25; TP 25/50%',
+    'S162': 'Entry 10/11am; short delta .1/.2/.3; wing .05/.1',
+    'S163': 'OR15/30m; Deltas .5/.55 and .2/.25',
+    'S164': 'entry -5/-10m; exit +15/+30/+60m',
+    'S165': 'IV pct 80/90/95; exit 40/50/60',
+    'S166': 'skew z -1.5/-2/-2.5; DTE 30/45',
+    'S167': 'skew z 1.5/2/2.5; hedge daily/weekly',
+    'S168': 'term spread 2/5/8vol pts; legs 30/60 vs 21/45',
+    'S169': 'Edge 3/5/7 vol pts; forecast HAR-RV/20d realized',
+    'S170': 'Vega ratio .75/1/1.25; 5/11 sectors',
+    'S171': 'Min edge 10/25/50bp of underlying notional; borrow 0/5/20%',
+    'S172': 'DTE 30/90/180; width 25/50/100points',
+}
