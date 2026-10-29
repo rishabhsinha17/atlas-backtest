@@ -82,7 +82,7 @@ class DailyStats:
 
     def __init__(self, symbol: str, bars: BarArrays, sessions_naive: np.ndarray,
                  split_ratio_on: dict[int, float], spread_model: SpreadModel, window: int = 20,
-                 asset_class: str = "STK"):
+                 asset_class: Optional[str] = "STK", exchange: Optional[str] = None):
         self.symbol = symbol
         self.bars = bars
         self.session_ns = sessions_naive        # naive ET date ns per row
@@ -114,9 +114,10 @@ class DailyStats:
         self.adv_dollar = _shifted_rolling_mean(dv, window)
         self.sigma = _shifted_rolling_std(ret, window)
         if getattr(spread_model, "method", None) == "calibrated":
+            # the model computes its own PIT ADV$/sigma (1 session, sigma prior: IPO fix)
             self.spread: SpreadSeries = spread_model.series(
                 bars.h * cum, bars.l * cum, ac, raw_close=c, volume=bars.v, dates=sessions_naive,
-                asset_class=asset_class, adv_dollar=self.adv_dollar, sigma=self.sigma)
+                asset_class=asset_class, prior_close=self.prior_close, exchange=exchange, symbol=symbol)
         else:
             self.spread = spread_model.series(bars.h * cum, bars.l * cum, ac)
 
@@ -194,14 +195,18 @@ class MarketData:
             self._splits[symbol] = sp
         return sp
 
-    def _asset_class(self, symbol: str) -> str:
-        """'ETF' or 'STK' from the instrument master (ETFs have their own spread curve)."""
+    def _instrument_info(self, symbol: str) -> tuple[Optional[str], Optional[str]]:
+        """(asset class 'ETF'|'STK' or None if the instrument master has no record, listing
+        exchange) - ETFs have their own spread curve; the exchange selects pre-2001 tick regimes."""
         try:
             inst = self.portal.instrument(symbol)
         except Exception:
             inst = None
+        if inst is None:
+            return None, None
         ac = getattr(inst, "asset_class", None)
-        return "ETF" if ac is not None and getattr(ac, "value", ac) == "ETF" else "STK"
+        ac = "ETF" if ac is not None and getattr(ac, "value", ac) == "ETF" else "STK"
+        return ac, getattr(inst, "exchange", None)
 
     def daily(self, symbol: str) -> Optional[DailyStats]:
         if symbol in self._daily:
@@ -217,8 +222,9 @@ class MarketData:
             return None
         sess = (pd.DatetimeIndex(b.start, tz="UTC").tz_convert("America/New_York").tz_localize(None)
                 .normalize().as_unit("ns").asi8.astype(np.int64))
+        ac, exch = self._instrument_info(symbol)
         st = DailyStats(symbol, b, sess, self.splits(symbol), self.spread_model, self.stats_window,
-                        asset_class=self._asset_class(symbol))
+                        asset_class=ac, exchange=exch)
         self._daily[symbol] = st
         return st
 

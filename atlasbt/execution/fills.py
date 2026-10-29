@@ -194,7 +194,7 @@ class BarFillModel:
         tick = valid_tick(price, mkt.instrument)
         if getattr(self.spread, "method", None) == "calibrated":
             full = self.spread.full_spread(mkt.spread_estimate, price, tick, bar.mso, bar.mtc,
-                                           adv_dollars=mkt.adv_dollar)
+                                           adv_dollars=mkt.adv_dollar, asset_class=mkt.instrument.asset_class)
         else:
             full = self.spread.full_spread(mkt.spread_estimate, price, tick, bar.mso, bar.mtc)
         if bar.mso is None:
@@ -413,10 +413,15 @@ class BarFillModel:
                 if mkt.spread_source == "default" and tr.liquidity == "TAKER":
                     reasons.append("spread default (no estimate)")
                     fid = Fidelity.T2_PROXY
-                elif tr.liquidity == "TAKER" and str(mkt.spread_source).startswith("calibrated"):
+                elif tr.liquidity == "TAKER" and str(mkt.spread_source).startswith(
+                        ("calibrated", "Corwin-Schultz fallback")):
                     reasons.append("spread modelled (calibrated)")
-                    if mkt.spread_source != "calibrated":
-                        reasons.append(f"spread {mkt.spread_source[len('calibrated, '):]}")
+                    head, *quals = [q.strip() for q in str(mkt.spread_source).split(",")]
+                    if head != "calibrated":
+                        reasons.append(f"spread: {head}")
+                    # model qualifiers: era-extrapolated, listing assumed, stress regime,
+                    # asset class inferred, ADV below calibration range, sigma prior, ...
+                    reasons.extend(f"spread: {q}" for q in quals if q)
                     fid = max(fid, Fidelity.T2_PROXY)
                 elif tr.liquidity == "TAKER":
                     reasons.append(f"spread estimated ({mkt.spread_source})")
