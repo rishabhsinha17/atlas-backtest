@@ -402,10 +402,11 @@ class S138(SinglePackage):
     STANDARD_ONLY = True
     ROOT = "SPX"
     DTE_OFFSETS = (-7, 14)
-    activity_note = ("SPX options exist only as the synthetic T3 chain; the data portal's option_quotes serves real "
-                     "snapshots only, so SPX combos cannot fill until synthetic quotes are fillable (engine/data item)")
     deviations = COMMON_DEVIATIONS + [
         CREDIT_DEV,
+        "SPX trades fill on SYNTHETIC quotes (Portal.option_quotes falls back to the T3 synthetic chain): every SPX "
+        "fill, mark and settlement is T3_MODELED; the synthetic model's structural parameters (spread model, smile) are "
+        "fitted on 2019-2026 data (params_fit_post_as_of caveat, docs/OPTIONS.md §7.4) -- treat results as modeled.",
         "SPX options exist only as the SYNTHETIC T3 chain (no free SPX quotes, docs/OPTIONS.md §13); every fill/mark "
         "is T3. underlying='SPY' is the declared T2 deviation (real DoltHub chains 2020+).",
         "'same monthly SPX expiration' = standard AM-settled SPX monthly (root SPX, kind MONTHLY/QUARTERLY) nearest to "

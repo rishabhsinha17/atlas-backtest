@@ -144,9 +144,10 @@ class S129(_StockBase):
               "close_dte": 1, "roll_window": 4}
     grid = {"strike_rule": ["atm", "delta"]}
     spec = SPECS["S129"]
-    activity_note = ("SPX options exist only as the synthetic T3 chain; the data portal's option_quotes serves real "
-                     "snapshots only, so SPX combos cannot fill until synthetic quotes are fillable (engine/data item)")
     deviations = COMMON_DEVIATIONS + [
+        "SPX trades fill on SYNTHETIC quotes (Portal.option_quotes falls back to the T3 synthetic chain): every SPX "
+        "fill, mark and settlement is T3_MODELED; the synthetic model's structural parameters (spread model, smile) are "
+        "fitted on 2019-2026 data (params_fit_post_as_of caveat, docs/OPTIONS.md §7.4) -- treat results as modeled.",
         "SPX options exist only as the SYNTHETIC T3 chain (no free SPX quotes; replication of the Cboe PUT index: TE "
         "2.6%/yr, ~1.5%/yr rich, docs/OPTIONS.md §7.4). Every fill/mark/settlement is T3/T2.",
         "Roll date = the settlement session of the standard AM monthly (3rd Friday, holiday -> prior session). The new "
