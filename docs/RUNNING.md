@@ -30,6 +30,13 @@ python -m atlasbt.run launch [--commit HEAD] run --ids ... --daily-budget 30 --l
 python -m atlasbt.run launch replicate
 ```
 
+`launch --no-overlay` uses the committed runner exactly. This is the rule for final runs: pin an
+explicit hash (`--commit 4ea9ad1`) so that no uncommitted edits by other agents can leak in. `python -m
+atlasbt.run launch --commit <hash> --no-overlay final ...` runs the whole atlas in one pinned process:
+plans (primary >= 95%, extended >= 60%); primary runs with per-group grid budgets (`--etf-budget` -1 =
+full, `--options-budget 45`, `--stock-budget 0`); all replications; audit; atlas; the
+EXTENDED_SURVIVORSHIP_BIASED stock runs; then atlas again.
+
 `launch` (`worktree.py`) creates `results/_worktrees/<commit12>` with `git worktree add --detach`, with no
 commits or branches. It overlays the runner package `atlasbt/run` when the commit lacks it, and records
 the overlay's sha. It REFUSES to start if anything else in the worktree is dirty. It then starts the
@@ -152,7 +159,7 @@ in the offender's row: combos submitted but never filled, and option selection f
 
 ## 5. `atlas`
 
-* Leaderboard via `reporting.build_leaderboard`. DSR uses N = max(sum of registry grids, parsed sheet
+* Leaderboard via `reporting.build_leaderboard`. DSR uses N = max(registry n_trials() = 1443, parsed sheet
   count). V[SR] is the variance of every grid configuration's per-period Sharpe across the atlas, floored
   by each strategy's own estimation noise. p = 1 - PSR(0); BH q at 0.10. Sort order: DSR, then PBO, then
   q, then PSR. Extra columns: holdout Sharpe and params, grid run/full, window, activity.
@@ -210,6 +217,12 @@ identical (tested). The memo belongs in the data layer (request filed). Remainin
 strategy-side pandas work per bar, e.g. swing_common `BarCache.get` + SMA recomputation (about 6 ms per
 symbol-day). Measured costs: S105 (2 ETFs, monthly) ~12 s/yr; S050 (19 ETFs) ~32 s/yr; S129 with
 synthetic chains ~2 min/yr. Memory: ~0.4-1.3 GB per task.
+
+`FastPortal` also memoizes `universe('SP500', as_of)` per session date, a pure function of the session
+date. At f9702e1, `Portal.borrow()` rebuilt the ~500 security keys on every call (~4 s), and the engine
+calls `borrow()` for every short position at every session end. A 1-symbol coin flip took 503 s per
+simulated year, against 5.5 s with the memo. Bit-for-bit verified: equity and fills are identical
+(`test_fastportal_universe_memo_identical_to_portal`, commit 4ea9ad1).
 
 ## 8. Known cross-layer issues the runner works around or reports
 

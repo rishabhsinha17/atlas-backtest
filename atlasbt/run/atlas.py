@@ -239,8 +239,15 @@ def _write_report(res_dir: Path, out, tested, other, fdist, plan, rows, ext=None
          "| Status | Strategies |", "|---|---:|"]
     for k, v in sorted(out["status_counts"].items()):
         L.append(f"| {k} | {v} |")
+    try:
+        from atlasbt.strategies import registry as _R
+
+        n_reg = _R.n_trials()
+    except Exception:  # pragma: no cover
+        n_reg = None
     L += ["", f"Total configurations deflated against (DSR): **N = {out['n_trials_total']}** "
-              f"(max of summed registry grids and the parsed sheet count). V[SR] across trials from "
+              f"(conservative: max of the registry's n_trials() = {n_reg} and the sheet's parsed count 1450; the "
+              f"same N is used in every per-strategy report and in this leaderboard). V[SR] across trials from "
               f"{out['n_trial_sharpes']} grid-configuration Sharpe ratios (floored by each strategy's own "
               f"estimation noise). Benjamini-Hochberg (q = 0.10) on p = 1 - PSR(0): "
               f"**{out['fdr_pass']}** strategies pass.", "",
