@@ -30,7 +30,8 @@ atlasbt/data/
   qa.py          data QA (bad ticks, OHLC, gaps, zero volume, split cross-check, stale, adj-close check)
   fetch.py       CLI: python -m atlasbt.data.fetch --set core|daily|bulk|quick  /  --only <task>
   providers/     yahoo, cboe, fred, french, dolthub (SQL API), dolthub_bulk (CSV mirrors), sec, fomc,
-                 sp500, ziplime, hod, iex, dukascopy, nasdaqtrader, borrow,
+                 sp500, ziplime, hod, iex, dukascopy, nasdaqtrader, borrow, iborrowdesk (keyed),
+                 dividends_decl (EDGAR full-text search), buybacks (EDGAR full-text search + filing text),
                  key-gated: alpaca, polygon, tiingo, databento, alphavantage (+ _keyed helpers)
 ```
 
@@ -112,7 +113,8 @@ summaries: `cache/logs/`. QA reports: `cache/qa/qa_<freq>_<date>.csv`.
 | Yahoo daily / intraday bars, DoltHub daily bars, Cboe indices | T1_BAR | real bars |
 | Dukascopy 1m bars & ticks (CFD quotes) | T2_PROXY | dealer CFD quotes, not exchange prints/NBBO; opt-in only |
 | IEX TOPS quotes | T2_PROXY | single venue BBO, not NBBO |
-| Alpaca SIP quotes (if key) | T0_QUOTE | consolidated quotes (UNVERIFIED) |
+| Alpaca SIP 1m/5m bars | T1_BAR | consolidated trades, 2016-> (§4.15) |
+| Alpaca SIP NBBO quotes (decision windows) | T0_QUOTE | consolidated NBBO, cleaned (§4.15) |
 | Corporate actions (Yahoo) | T2_PROXY | known_at approximated |
 | DoltHub dividends for symbols Yahoo lacks | T2 (2014+) / T3 (pre-2014) | split-adjusted amounts un-adjusted with a split table that starts 2014 |
 | Option chains (DoltHub, historicaloptiondata sample) | T2_PROXY | real quotes, capture minute unknown, sparse strikes |
@@ -120,7 +122,10 @@ summaries: `cache/logs/`. QA reports: `cache/qa/qa_<freq>_<date>.csv`.
 | EARNINGS from DoltHub calendar only | T2 | clock time approximated (BMO 08:00, AMC 16:30 ET) |
 | INDEX_ADD/DEL | T2 | announcement time-of-day approximate (17:15 ET) or fallback |
 | FOMC | T1 if time printed on page, else T2 | |
-| Borrow | T2 | default model (no free borrow data reachable) |
+| Borrow, IBorrowDesk rows (keyed API) | T1 | IB stock-loan fee/availability, daily close reading, known 16:00 ET |
+| Borrow, default model | T2 | no rows for the symbol/date (no key, before 2015-07-13, stale > 7 days) |
+| DIVIDEND_DECL (EDGAR 8-K full-text match) | T2 | exact SEC acceptance time; hit -> dividend association inferred |
+| BUYBACK (EDGAR 8-K text) | T2 | amount / intent parsed from free text (precision 27/30) |
 | French / AQR factors | T2 | revised, not PIT -- validation only |
 
 ## 4. Sources
@@ -222,6 +227,13 @@ User-Agent: `atlasbt-research/0.1` (override `ATLASBT_USER_AGENT`); **no persona
   filing) pairs kept; `fundamentals()` returns the latest period known at as_of and, for it, the
   latest filed value. Q4 quarterly values are not filed separately (only FY) -- not derived.
   XBRL facts exist from ~2009 (large filers) / 2011 (all).
+* **Full-text search** (`fts_search`, `efts.sec.gov/LATEST/search-index`, 2001+): answers the plain
+  UA (verified 200 on 2026-10-30); 100 hits per page, offsets <= 10,000; hits carry accession, form,
+  items, exhibit type and filing date but NO text. `acceptance_map(cik)` attaches the acceptance
+  time from the submissions JSON (`filing_known_at`: fallback filed date 17:30 ET, never early).
+  `fetch_document` (filing text on `www.sec.gov/Archives`) refuses without `SEC_USER_AGENT`
+  (`SecContactRequired`; the plain UA gets HTTP 403). The contact string is read from the
+  environment only (never written to code, docs, cache metadata or logs).
 * License: public domain.
 
 ### 4.5 S&P 500 PIT membership (`providers/sp500.py`)
@@ -293,8 +305,7 @@ User-Agent: `atlasbt-research/0.1` (override `ATLASBT_USER_AGENT`); **no persona
   either all real or all synthetic. `synthetic=False` = real only.
 * `has(sym|'*', 'options', freq)` / `fidelity_of`: freq `None`/`'1d'` = EOD chains (kind
   `option_chain`); intraday freqs (`'1m'` ...) = kinds `option_bars_<freq>` / `option_quotes`
-  (e.g. Databento OPRA when a key is configured -- none is stored today, so they return False /
-  NA). `fidelity_of` is the best tier among the sources actually present
+  (Databento OPRA samples, §4.15c; absent underlyings return False / NA). `fidelity_of` is the best tier among the sources actually present
   (`portal.OPTION_SOURCE_FIDELITY`): exchange-timestamped quotes (databento / polygon / alpaca) T0,
   EOD captured at a documented time (cboe_eod) T1, EOD with approximate capture time (dolthub,
   hod) T2; with no real source, EOD falls back to the synthetic chain -> T3 when the underlying has
@@ -303,7 +314,7 @@ User-Agent: `atlasbt-research/0.1` (override `ATLASBT_USER_AGENT`); **no persona
   look wider than the NBBO (AAPL near-ATM median relative spread 4.2% in 2019, 2.5-4.8% by year)
   and the 2019 Saturday snapshots may reflect after-hours quotes -> fills at DoltHub bid/ask are
   conservative for single names.
-* No free intraday option quotes exist (Lean fixtures only). QQQ/IWM/SPX chains are therefore
+* Intraday option quotes: Databento OPRA (keyed, §4.15c) for the fetched plans only. Otherwise QQQ/IWM/SPX chains are
   synthetic (T3) except on the single historicaloptiondata day.
 
 ### 4.7 Cboe indices (`providers/cboe.py`)
@@ -367,20 +378,316 @@ nasdaqlisted.txt + otherlisted.txt: 13,249 non-test symbols, 5,772 ETFs (2026-10
 Current-only; snapshots accumulate per run (`reference/nasdaqtrader/directory`). Used for ETF flags
 and as the "still listed" set in delisting detection.
 
-### 4.14 Borrow (`providers/borrow.py`)
-iborrowdesk.com probed once (2026-10-28): connection dropped by the remote (no data). FINRA short
-data is excluded by its terms. Default model (T2_PROXY, env-overridable): ETFs & S&P 500 members
-0.30% p.a., other stocks 1.0%, leveraged/inverse ETFs 2.0%; always shortable.
+### 4.14 Borrow (`providers/borrow.py`, `providers/iborrowdesk.py`)
+* **IBorrowDesk** (re-checked 2026-10-30, UA `atlasbt-research/0.1`): the bare host only redirects to
+  `www.iborrowdesk.com`; the site's `/api/ticker/{T}` endpoints are the web app's internal interface
+  and (per its `/llms.txt`) block scripted user agents -- the earlier probe's dropped connection was
+  that block, and we no longer call them. Programmatic access is the **keyed v2 API** (paid: $29/month
+  incl. 5,000 units; unit packs extra): `GET /api/v2/daily/borrow?symbols=..&start=..` = daily
+  open/high/low/close of fee (% p.a.), rebate and shares available, **2015-07-13 ->**, one unit per
+  symbol per 365 days returned, <= 150 units and <= 100 symbols per request, 60 req/min.
+  `GET /api/v2/coverage` is free (read 2026-10-30: daily_earliest_available 2015-07-13).
+  `iborrowdesk.fetch_daily` (env `IBORROWDESK_API_KEY`) batches by worst-case units, waits >= 1.1 s
+  between requests, backs off on 429/5xx, stops on 400/401/402/403, sends the key only as a header
+  (never in params, cache metadata or logs), keeps US lines, and drops a response whose name shares
+  no word with the SEC registrant name. Stored PIT: `borrow/iborrowdesk/<TICKER>` with
+  `time` (= known_at) = 16:00 ET of the date (the daily close is IB's last in-session reading),
+  fee, rebate, available (+ open/high/low), figi, name. The API resolves a ticker to the security
+  trading under it TODAY (with its history across renames), so only current tickers are requested
+  and the files are ticker-keyed CURRENT stores (`Portal.resolve_symbol` serves a security key only
+  when its CIK is the ticker's current registrant).
+* **Fetch target** (`iborrowdesk.short_universe`): PIT S&P 500 members whose membership overlaps
+  2015-07-13.. (base tickers) + CORE_ETFS + LEVERAGED_ETFS = 812 symbols; all-time history <= 12
+  units/symbol -> worst case 9,744 units in 68 requests (from 2017: 8,120); billed units are lower
+  for names that stopped trading (billing counts the span actually returned) -- the $29 plan's
+  5,000 units plus unit packs. **Not fetched: NEEDS USER
+  (`IBORROWDESK_API_KEY`).** Coverage today: 0 symbols x 0 years.
+* IBKR's own public short-stock files (`ftp3.interactivebrokers.com`, user `shortstock`) are a current
+  snapshot only (no history); FTP does not resolve from this environment anyway. FINRA short data
+  is excluded by its terms.
+* `Portal.borrow(symbol, as_of)`: the last stored row with `time <= as_of` -> (available > 0,
+  fee / 100, T1_BAR); before the first row or when that row is older than
+  `Portal.MAX_BORROW_STALE_DAYS` (7) -> the default model. Without rows the code path is unchanged
+  (same memoised S&P-membership shortcut, bit-for-bit identical results; perf/fastportal tests).
+* **Default model** (T2_PROXY, env-overridable): ETFs & S&P 500 members 0.30% p.a., other stocks
+  1.0%, leveraged/inverse ETFs 2.0%; always shortable. The engine flags T2 on short sales only when
+  the borrow it used is the default.
 
-### 4.15 Key-gated providers -- UNVERIFIED (written from official docs, never run with a key)
+### 4.17 Dividend declarations (`providers/dividends_decl.py`, events `DIVIDEND_DECL`)
+Sources checked 2026-10-30: Nasdaq's dividend-history API answers the honest UA but covers only
+Nasdaq-listed symbols (SPY / DIA / IWM / JNJ "not available", QQQ declaration "N/A") and
+`api.nasdaq.com/robots.txt` is `Disallow: /` -> not used (one probe of AAPL served as an
+independent check below, nothing stored); the cached DoltHub `dividend` table has ex-date and
+amount only; ETFs (SPY, QQQ, IWM, DIA) file no 8-Ks -> no free PIT declaration source for them.
+**Method**: per issuer CIK (the 1,053 SEC-mapped S&P 500 PIT-union tickers), EDGAR full-text search
+for declaration phrases (`DECL_QUERY`: "declared a quarterly" OR "declared a cash dividend" OR
+...) in 8-K filings and exhibits, kept only for announcement documents (8-K body or EX-99.x under
+Items 2.02 / 7.01 / 8.01; contracts, indentures, charters excluded). Each regular CASH_DIVIDEND the
+portal serves (ex-date E, amount) is matched to the LATEST such document accepted in
+(E - 75 days, open of E) with no earlier ex-date in between; known_at = that filing's SEC
+acceptance time (an upper bound on the press-release time). Unmatched dividends get no event.
+Payload: ex_date, amount (from the corporate action), accn, items, file_type, filename, lead_days,
+cik. Fidelity **T2_PROXY** (timestamp exact, association inferred from timing: the search index has
+no text). Events whose CIK is not the issuer the ticker denoted on the declaration date are dropped
+(`identity_filter`, reused tickers). `dividends_decl.rematch()` re-derives the events offline from the stored hits
+(`reference/sec_fts/DIVIDEND_DECL_HITS`, 14,446) and dividends (`.../DIVIDEND_DECL_DIVS`, 41,513).
+* **Table** (2026-10-30): 8,059 events, 466 issuers, known_at 2004-09-21 .. 2026-10-13.
+  Recall vs the portal's regular cash dividends of the 647 dividend-paying issuers: 2002-09 9.2%,
+  2010-17 19.4%, **2018-26 24.9%** (4,569 of 18,354). Structural: many issuers announce
+  dividends by press release only (no 8-K): MSFT, JPM, JNJ, XOM, PEP, WMT, MA, HD, UNH, NVDA have
+  none; AAPL, PG, ORCL, V, COST, AVGO are complete 2018+.
+* **Validation**: AAPL 54 of 54 declaration dates (2012-2026) equal Nasdaq's independently recorded
+  declaration dates (and Apple's earnings-release dates). Lead (acceptance -> ex-date open): median
+  20.7 days; 1.4% under 2 days (late mentions; conservative direction). An earlier 30-event sample
+  showed an M&A agreement exhibit (LMT 2020-12) mis-associated -> the document-type filter. Text
+  check of a random 30 (filings read with `SEC_USER_AGENT`, 2026-10-30): 29 of 30 documents declare
+  the matched dividend (28 state the exact amount; 2 use number formats the check missed); 1 is a
+  mis-association in the leak direction (UDR 2022-10-26 earnings release restating the Q3 dividend,
+  matched to the Q4 ex-date 2023-01-06: known_at ~2 months early, same amount) -> **precision ~97%**.
+* Consumer: S042 (declared dividends T2; dividends without a declaration record are skipped).
+
+### 4.19 Analyst consensus, next-12-months EPS (`providers/estimates.py`; S041)
+DoltHub `earnings.eps_estimate` weekly snapshots (mostly Sundays), periods 'Current Year' /
+'Next Year' with consensus and `count` (number of estimates). Loaded 2026-10-30 from the HF CSV mirror
+(`siddharthmb/stocks-earnings-eps_estimate`, 2017-10-26 .. 2026-01-25; deleted after loading) and
+extended by the DoltHub SQL API (39 snapshot dates to 2026-10-25): 667,532 raw rows, S&P 500 PIT-union
+tickers only (`reference/estimates/fy_consensus_raw`). **PIT**: capture time and DoltHub publication
+lag are undocumented -> a snapshot dated d is known at the close of the first NYSE session after d
+(Sunday -> Monday 16:00 ET). **Identity**: each snapshot's ticker is mapped to the issuer it denoted on
+that date (identity layer); unknown identity -> dropped (5,890 snapshots). Served through
+`Portal.fundamentals` as `eps_consensus_ntm` = w * FY1 + (1 - w) * FY2 (w = remaining share of FY1),
+`eps_num_analysts_ntm` = min(FY1, FY2 counts), plus `eps_consensus_fy1/fy2`
+(`fundamentals/estimates/<TICKER>`, 869 tickers, 1.30 M rows); latest snapshot known at as_of, none if
+older than 21 days; a security key collects its issuer's snapshots across renamed tickers (FB -> META).
+Fidelity **T2_PROXY** (blended NTM, not I/B/E/S; weekly granularity). Coverage: of the S&P 500 PIT
+members, 497 / 506 have an NTM value at 2018-06-29 (442 with >= 5 analysts), 496 / 505 at 2021-12-31
+(412), 500 / 503 at 2025-06-30 (468), 502 / 503 at 2026-10-23 (456). Checks against known revisions: NVDA FY1 4.52 -> 4.77 (2023-05-28 snapshot, after the 05-24
+guidance) -> 7.46 (06-04); META (FB) FY1 13.91 -> 13.33 -> 12.93 after the 2022-02-02 report; AAPL
+FY1 13.65 -> 12.16 over Mar-Apr 2020 (COVID).
+
+### 4.18 Buyback authorizations (`providers/buybacks.py`, events `BUYBACK`)
+S045 needs known_at, authorized amount as % of market cap and an earnings-bundling flag.
+Candidates: EDGAR full-text search per issuer CIK for authorization phrases
+(`AUTH_QUERY`) in 8-K filings/exhibits, known_at = acceptance, `with_earnings` = Item 2.02 in the
+8-K -> `reference/sec_fts/BUYBACK_CANDIDATES` (2026-10-30: 11,307 documents in 8,999 filings of 838 issuers, accepted 2001-01-17 .. 2026-10-29; 5,787 filings carry Item 2.02, 3,212 do not). A phrase hit is not an
+authorization (earnings releases routinely mention existing programs) and has no amount, so
+candidates are never served as events. **Text stage** (`SEC_USER_AGENT`, www.sec.gov at <= 4 req/s;
+2026-10-30): the 4,331 documents of the 3,212 candidate filings WITHOUT Item 2.02 were read (S045
+excludes earnings-bundled releases, so those are not read; 7 pre-2002 `.txt` documents 404'd; raw
+cache 232 MB). `parse_authorization` takes the largest NEW / increased authorization in dollars
+(share counts x the prior close), skipping sentences that date the program > 60 days before the
+filing, use past wording ("previously", "remaining", "had approved", "years ago") or are slide/table
+text (> 350 chars); for "increase the existing $200M program to $350M" the amount is the stated
+total. pct_mcap = amount / (shares outstanding filed before known_at x last close before known_at),
+rows above 100% dropped, issuer identity checked as in §4.17. `with_earnings` is also set when the
+issuer filed an 8-K Item 2.02 within +-24 h (63 events). Fidelity **T2_PROXY**.
+* **Table** `events/sec_fts/BUYBACK`: 695 events, 294 issuers, known_at 2009-08-28 .. 2026-09-15
+  (no events before 2009: XBRL shares outstanding start then); pct_mcap median 5.8% (5th-95th
+  1.3%-18.6%); S045-eligible (>= 5%, not with earnings): 373 events / 214 issuers, 190 since 2018.
+* **Precision** (random 30, judged by reading each sentence): 27/30 = 90% are a new or increased
+  authorization announced in that filing; misses: an existing authorization restated (MMC 2009), a
+  10b5-1 plan under an existing program (PDCO 2012), an accelerated repurchase executing an
+  existing program (INTC 2020). The previous parser version (before the stale / past-wording /
+  identity filters) scored 22/30. Recall is not measured (no reference list).
+
+### 4.15 Alpaca SIP intraday (`providers/alpaca.py`) -- LIVE-VERIFIED 2026-10-30
+Free paper-account key (env `ALPACA_API_KEY` / `ALPACA_API_SECRET`, sourced from `~/.atlasbt/secrets.env`;
+read from the environment only -- never logged, cached, stored in metadata or committed). Raw responses are
+**not** written to the HTTP cache (multi-GB JSON); the parquet store is the cache. Endpoints: multi-symbol
+`GET data.alpaca.markets/v2/stocks/{bars,quotes}?symbols=..` with `feed=sip`, `adjustment=raw`, `asof=-`,
+`limit=10000` (page limit across ALL symbols), `page_token` pagination.
+
+**Verified against the live API** (probes 2026-10-30; recorded pages in `tests/data/fixtures/alpaca_*.json`):
+* History starts **2016-01-04** (nothing earlier); the free plan serves up to 15 min ago.
+* `t` = bar **START** (UTC): SPY's 14:30Z bar of 2016-01-04 opens at 200.49 = the official open; the 1Day
+  bar is stamped at ET midnight. Minute bars include extended hours 04:00-20:00 ET (no session filter);
+  `frames.intraday_bars` tags PRE/RTH/POST from the NYSE schedule (early closes: POST from 13:00).
+* The **closing auction prints in the 16:00 (POST) minute** (AAPL 2016-01-04: 8.5 M shares at 105.35 in the
+  21:00Z bar), so the last RTH 1m close is the last continuous trade, not the official close, and RTH 1m
+  volume sums to ~90 % of the consolidated daily volume. Daily official prices stay the daily bars'.
+* `asof`: by default Alpaca maps renamed tickers to today's entity (`META` for 2016 returns FB's tape). We
+  always send `asof=-` (tape as traded) and decide which tape belongs to which security ourselves (below).
+* **Quotes are the consolidated NBBO stream**, not per-exchange BBOs: bid and ask exchanges differ on 72-81 %
+  of updates (a venue BBO always has one exchange). No NBBO rebuild is needed; the stream is cleaned
+  (`clean_nbbo`): drop one-sided / non-positive sides; drop updates whose conditions are not a subset of
+  {R regular, ? not reported (2016-~2021 data), O opening} (non-firm, closed, halted, slow/manual); drop
+  **crossed** (ask < bid) and **locked** (ask = bid) updates (0.1-4 % of updates, mostly premarket and fast
+  markets); keep the last update per timestamp; drop consecutive duplicates of (bid, ask, sizes) -- lossless
+  for the NBBO state. ~70 % of raw updates survive.
+* **Quote sizes**: round lots (x100 shares) for sessions **before 2025-11-03**, **shares from 2025-11-03**
+  (SIP round-lot reform: SPY 2025-10-31 sizes 1, 2, 6..; 2025-11-03 multiples of the new 40-share lot; KO /
+  INTC / JPM switch the same day on every tape; the 2025-10-31 POST session is still in lots). Stored sizes
+  are always shares. NBBO update counts drop sharply on the new regime (KO: 1,388 -> 19 updates in the last
+  10 s of the session) -- consistent with odd-lot-sized quotes no longer moving the round-lot NBBO.
+* Rate limit header `X-RateLimit-Limit: 200`/min; we use a rolling-minute token bucket capped at **180/min
+  per account** (split between concurrent fetch processes with `ATLASBT_ALPACA_RPM`), pause until
+  `X-RateLimit-Reset` on 429, exponential backoff on 5xx / network errors, never retry 4xx.
+
+**Identity routing** (reused tickers never splice). Universe symbols are tickers or security keys
+`TICKER~CIK##########` (`Portal.universe`). For every wanted (symbol, session) the identity-verified RAW daily
+close / volume that `bars(symbol, '1d')` serves is compared with Alpaca's 1Day bar of each candidate tape
+ticker (the symbol's own ticker first, then the CIK's evidenced lineage and SEC tickers); a tape is accepted
+for the session only if |ln close ratio| <= 0.5 % and |ln volume ratio| <= ln 2.5. Sessions without an accepted
+tape get no intraday bars (fail closed). Intraday rows are stored under the universe symbol
+(`bars_1m/alpaca/<SYMBOL or TICKER_CIK..>`), so FB (2016-2022) and META (2022-) each carry the right tape,
+`DIS~CIK0001001039` and `DIS~CIK0001744489` each get only their own sessions, BRK-B maps to `BRK.B`.
+Routes and per-symbol match rates are stored in `reference/alpaca/tape_routes_<set>` /
+`route_summary_<set>`. Intraday bars are RAW; `bars(..., adjusted=True)` applies the same actions of the
+same identity frame as the daily bars (SPY 2016-06-01: adjusted 1m close = adjusted daily close).
+
+**What is fetched** (`python -m atlasbt.data.fetch --set intraday`; resumable: per (symbol, month) / (window,
+month) ledgers in `cache/logs/alpaca_progress_*.jsonl`, an incomplete month is always refetched):
+
+| task | symbols | frequency / sessions | dates |
+|---|---|---|---|
+| `alpaca_universe` | PIT S&P 500 members and top-60 by 20-day $ volume (the `SP500_TOP50_DV` definition) per session -> `reference/alpaca/universe_pit` | | 2016-01-04 -> |
+| `alpaca_bars_etf` | SPY QQQ IWM DIA, 11 sector SPDRs, TLT GLD EFA EEM (S001-S030, S116, S031-S037) | 1m PRE+RTH | 2016-01-04 -> |
+| `alpaca_bars_top` | every stock ever in the PIT top-60 (S001-S022, S027, S030 + 10-name margin) | 1m PRE+RTH | its top-60 sessions -30/+5 sessions |
+| `alpaca_quotes` | windows below | cleaned NBBO | 2016-01-04 -> |
+| `alpaca_bars_sp500_5m` | every PIT S&P 500 member (S039/S040) | 5m RTH | member sessions -30/+5 from 2017-11 (S&P coverage start 2018-02) |
+
+POST bars are not stored (no strategy reads them; ~20 % of rows); 5m for 1m symbols is resampled by the Portal.
+
+**Quote windows** (`alpaca.QUOTE_WINDOWS`, relative to the actual open/close, so early closes shift):
+`pre_0920` [open-10m, open] top-50 members of the day (S005/S006 09:29 premarket midpoint); `close_m36`
+[close-36m, close-35m] ETF_CORE (S015 15:25 midpoint); `close_m30` (S015 15:30 entry), `close_m5` (15:55
+flat-by exits) ETF_CORE; `close_m10` (S031-S037 15:50 entries) and `open_p5` (09:35 exits) for the 19 ETFs.
+Each recorded window is a closed interval [w0, w1] in `reference/alpaca/quote_windows`. **The Portal serves
+Alpaca quotes only for requests inside a recorded window** (an engine 1m fill window (T, T+1m] is), for
+premarket last-quote lookups ending at the open whose last minute is recorded, and for availability scans
+longer than 7 days; any other request (5m / daily fill windows, other minutes) gets an empty frame, so the
+engine falls back to bar fills instead of simulating a resting order on a partial quote path.
+
+Coverage actually fetched: see §5.
+
+**Planner changes needed for intraday** (`atlasbt/run/plan.py`, owned by the runner; verified by running the shipped
+and a patched planner side by side, scratch script `plan_patched.py`):
+1. `PlanContext.bar_range`: intraday ranges start at `now - 800 days` (the Yahoo era) -> must start at
+   2016-01-01, otherwise every Alpaca-backed intraday window is cut to 2024-08-21..
+2. `_plan_instance`, `kind == "quotes"`: the branch always returns NOT_TESTABLE ("required quotes exist on only N
+   common session(s)") even for N in the thousands -> when N >= the minimum, append the first/last quote session to
+   `starts`/`ends` and continue; for a PIT `universe_name` use the UNION of the members' quote sessions (Alpaca
+   pre-open windows exist only on the sessions a stock is in the top-60, exactly when S005/S006 need them).
+3. `quote_range` reads the whole quotes parquet of every member; it should read `reference/alpaca/quote_windows`
+   (one row per recorded window) for Alpaca.
+4. PIT intraday universes (`SP500_TOP50_DV`): members are resolved at the LAST date and the window starts when 80 %
+   of TODAY's members have their first intraday bar. Alpaca bars exist for each stock on its top-60 sessions
+   +-30/+5 (not its whole history), so this rule dates the window by today's members' first top-60 entry; the
+   right test is per-session coverage of THAT session's members (as `sp500_full_coverage_start` does for daily).
+5. Plan caches (`results/plan_cache.json`) memoise `bars|SYM|1m` / `quotes|SYM` as None from before the fetch:
+   delete those keys (or plan into a fresh results dir).
+
+### 4.15b Other key-gated providers -- UNVERIFIED (written from official docs, never run with a key)
 | Provider | Env | What | Notes |
 |---|---|---|---|
-| `alpaca.py` | ALPACA_API_KEY, ALPACA_API_SECRET | SIP 1m bars (`/v2/stocks/{s}/bars`, adjustment=raw, feed=sip), quotes (`/quotes`) since 2016 | quote sizes x100 (round lots) |
 | `polygon.py` | POLYGON_API_KEY | aggregates `/v2/aggs/ticker/...` | **api.polygon.io is blocked (403) by this environment's egress proxy** |
 | `tiingo.py` | TIINGO_API_KEY | EOD raw + divCash/splitFactor (incl. delisted tickers), IEX intraday | IEX intraday = single venue (T2) |
-| `databento.py` | DATABENTO_API_KEY | `timeseries.get_range` csv (ohlcv-1m, bbo-1m), cost check first, refuses > DATABENTO_MAX_COST (default $1) | XNAS.ITCH = Nasdaq venue only |
+| `databento.py` (equity helpers only) | DATABENTO_API_KEY | `fetch()` ohlcv-1m / bbo-1m csv, budget-guarded like OPRA (§4.15c), per-request cap DATABENTO_MAX_COST (default $1) | XNAS.ITCH = Nasdaq venue only; the OPRA part is LIVE-VERIFIED (§4.15c) |
 | `alphavantage.py` | ALPHAVANTAGE_API_KEY | TIME_SERIES_INTRADAY month=YYYY-MM, extended hours, adjusted=false | 25 req/day free |
 Without keys `available()` is False and fetch functions return `{'skipped': ...}` (tested).
+
+### 4.15c Databento OPRA option quotes (`providers/databento.py`) -- LIVE-VERIFIED 2026-10-30
+Key `DATABENTO_API_KEY` (environment only, sourced from `~/.atlasbt/secrets.env`; never logged/stored). The
+account runs on free credits, so **every data request is priced first** (`metadata.get_cost`), written to the
+ledger `cache/raw/databento_ledger.csv` (timestamp, dataset, schema, symbols, window, cost, status) and refused
+if the cumulative spend would exceed `DATABENTO_BUDGET_USD` (default **$90**). Listings come from the free
+`symbology.resolve` (parent `<ROOT>.OPT` -> every OSI symbol listed that day). Small raw responses are cached
+(`cache/raw/hist.databento.com/`); large ones are not (disk) -- the parquet store plus the progress ledger
+`cache/logs/databento_progress.jsonl` make `python -m atlasbt.data.fetch --only databento_options` resumable
+without paying twice (env `ATLASBT_DATABENTO_PLANS`, `_START`, `_END`, `_DRY_RUN=1` prices only).
+
+**Verified semantics** (pilot 2024-01-02, SPXW 0DTE, $0.0013): dataset `OPRA.PILLAR` starts 2023-03-28;
+`cbbo-1m` = OPRA consolidated best bid/offer (all exchanges) **sampled on the minute grid**: `ts_recv` is the
+sample instant (exact minute), the quote is the book state at that instant, a record is emitted every minute
+for every requested contract (404/404 minutes), after the close the last quote is repeated unchanged;
+`ts_event` tracks the last trade, NOT the last quote change, so `age_s = ts - ts_event` is "time since last
+trade". Zero bids are real ("no bid") quotes. Price: ~$1.5e-7 per contract-minute with a floor of ~$3e-6 per
+contract per request (1-10 minutes cost the same); a full session of one contract $6e-5; the whole SPXW chain
+for one minute $0.019. `cbbo-1s` exists only from 2025-02-20; `cmbp-1` (tick NBBO) is ~25x cbbo-1m.
+**The sample stamped exactly at the closing bell is unreliable** for non-expiring SPX/SPXW series (30-DTE ATM
+SPXW call 69.9/75.9 at 16:00:00 vs 75.2/75.8 at 15:59 and 71.2/71.6 at 16:01 on 2024-01-31), so "closing"
+samples are taken at close - 1 minute (15:59 ET).
+
+**Storage / serving.** Kind `option_quotes`, source `databento`, one file per (underlying, ET session):
+`store/option_quotes/databento/<UND>/<YYYY-MM-DD>.parquet` with `ts, symbol (internal OCC: expiry = last
+trading day; SPX AM monthlies listed by OPRA under the settlement Friday are moved to the Thursday by
+option_meta, SPX vs SPXW keep their roots/settlement), bid, ask, bid_size, ask_size, age_s, chain`.
+`known_at = ts`. The Portal serves them as **T0_QUOTE** (`OPTION_SOURCE_FIDELITY['databento']`):
+* `option_chain(u, as_of)`: the latest sample instant <= as_of whose rows are flagged `chain` (fetched as a
+  decision snapshot, see plans) if it is <= 15 min old and strictly newer than the EOD (DoltHub/hod) snapshot;
+  otherwise the EOD / synthetic path is unchanged. Valuation-only rows (`chain=False`, e.g. daily SPX box
+  marks, 0DTE samples in the last 20 minutes) are never served as a chain, so end-of-day consumers are not
+  handed a truncated chain. `underlying_price`: index underlyings (SPX) = put-call parity of the same snapshot;
+  equities/ETFs = close of the last 1m (else 5m) bar known at ts.
+* `option_quote` / `option_quotes`: every sample (chain or not); at equal ts OPRA wins. A contract that has
+  OPRA samples on a session never receives a synthetic substitute for a window without samples.
+* `has(u, 'options', '1m')` / `fidelity_of` -> T0 when the underlying has OPRA files; for EOD (`'1d'`) OPRA
+  counts only when no DoltHub chain exists for the underlying (SPX, QQQ, IWM).
+* **SPX minute levels** (no index feed in OPRA): `bars_1m/opra_parity/SPX`, **T2_PROXY**: at every 1-minute sample
+  the level is the median of K + C_mid - P_mid over the 5 SPXW 0DTE strikes with the smallest |C - P| (carry over
+  the remaining hours < 3e-5, ignored); bar [t-1m, t) has close = level(t), open = level(t-1m), high/low = max/min
+  of the two samples (no intra-minute path), volume 0. Check vs the Cboe official close on the pilot week
+  (2024-01-29..02-02): -0.10, +0.31, -0.17, -0.37, +0.69 index points (<= 0.014%).
+
+**Plans** (`databento.PLANS`; fetch selection uses data known later, e.g. the day's high/low, only to choose WHAT
+to download -- strategies never see it):
+
+| plan | strategies | contracts | samples |
+|---|---|---|---|
+| `spx0dte` | S161-S164 | SPXW expiring that session, strike in [low(1-m), high(1+m)], m = max(3%, 3.5 VIX_prev/sqrt(252)) | every minute open..close (chain until close-20m) |
+| `spxeod` | S172 | month-end session + next: SPX & SPXW, DTE 1-60 within +-15%, 61-300 within +-6% (chain); other sessions: the series S172 would pick at each of the last month-ends (DTE 30/90/180) +-75 pts (marks) | 15:59 |
+| `earnings` | S158/S159 | every PIT S&P 500 member with a scheduled BMO/AMC release: expiries [max(next session, E+2d), E+11d], strikes +-25% | entry session E 15:00-15:31, next session 09:30-09:46 |
+| `s160` | S160 | decision session R (first 10:00 after the actual release): 10:00-10:01 puts 0.8-1.05 S / calls 0.95-1.2 S DTE 14-60; 10:00-close the puts (0.7-1.02 S) of the 30-DTE expiry S160 selects (choose_expiry replicated); 15:59 marks of those puts until 6 days before expiry | see left |
+| `s171` | S171 | SPY/QQQ/IWM/DIA DTE 0-60, +-10% | 15:24-15:27 (inside the Alpaca NBBO window close_m36) -- not fetched yet: no 2023+ Alpaca NBBO for ETF_CORE in the store |
+| `validation` | OPTIONS.md §7.4b | SPY/QQQ/IWM DTE 5-70 +-12%, one session every 2nd month | 15:59, stored apart (`reference/databento_validation`), never served |
+
+Coverage fetched: see §5 (Databento OPRA).
+
+### 4.19 Survivorship patch: delisted S&P 500 members (`providers/alpaca_eod.py`, `providers/tiingo.py`; 2026-10-30)
+Measured first: the full DoltHub `stocks.ohlcv` mirror (18,893 symbols, re-downloaded 2026-10-30) has
+**no symbol whose last bar is before 2018-01-01** -- DoltHub cannot patch anything delisted before
+2018 (the bulk re-ingest added nothing; the store already held every relevant DoltHub row).
+* **Alpaca SIP daily bars** (`alpaca_eod`, 2016-01-04 ->, key-gated, read-only reuse of
+  `alpaca.fetch_bars_raw`, `asof=-` = as traded under the symbol, own 60 req/min bucket):
+  bars_1d/alpaca_eod/<T> for the 106 tickers of members (and their CIK lineage) without verified
+  bars 2016-2018. Zero-volume filler bars (Alpaca repeats the last print on no-trade sessions: DD
+  2017-09 .. 2019-05) are dropped. **Validation** (47 survivors, 94 comparisons vs Yahoo raw and
+  DoltHub, `reference/alpaca_eod/validation`): 100 % pass, median |log close ratio| 1e-8 (identical
+  closes), median volume difference 7.8 %, 26/26 Yahoo splits reproduced by Alpaca raw gaps;
+  per symbol, a ticker whose overlap with DoltHub disagrees is not stored. Identity: rows are
+  labelled by CIK evidence exactly like DoltHub rows (rank between DoltHub and unlabelled rows);
+  DoltHub rows of a ticker on >= 5 consecutive sessions with no trade on the SIP tape lose their
+  identity (DowDuPont 2017-09 filed under 'DD' while old DuPont no longer traded); an unexplained x3
+  move inside an Alpaca/Tiingo chunk is an identity break (AmSurg -> 'EVHC' 2016-12-02, Valaris new
+  equity 2021-05-03): the rest of the chunk is dropped.
+* **Tiingo EOD** (`tiingo`, user's free key, header auth only -- the key never reaches the raw cache;
+  free tier 50 symbols/h, 1,000 req/day, 500 symbols/month -> we stay at <= 40/h, 400/day, 400/month
+  with a persistent ledger `cache/logs/tiingo_requests.jsonl`, resumable). A Tiingo line is keyed by
+  the ticker the security LAST traded under and carries its whole history; its supported-ticker list
+  (`reference/tiingo/lines`) shows one row per line. Findings: many delisted names exist only from
+  2016-01-04 (HAR, LLTC, CVC, HOT, BRCM), names delisted before ~2015 are mostly absent (BMC, CEPH,
+  MOLX, TLAB, NOVL), and a reused ticker serves its CURRENT holder (CA, MON, APC, DOW, DD) -> only
+  tickers whose latest line starts before 2016 are requested (`needed_symbols`). Identity rule: rows
+  are used for CIK c only if the line's owner (issuer the ticker denoted at the line's end) is c,
+  inside c's evidence span; renamed history and every row of a multi-line ticker need price
+  agreement with a verified segment. Tiingo is a BACKFILL: where a trusted source (Yahoo, Alpaca,
+  DoltHub) covers the same issuer later, the symbol is gated on the first 250 overlapping sessions
+  and only rows up to that junction are stored. Actions from Tiingo divCash / splitFactor.
+  **Validation** (`reference/tiingo/validation`): see §8.2 for the numbers of the final run.
+* **Identity fixes** (`identity.py`, `sp500.py`): share-class lines without own evidence take the
+  evidenced sibling class's date labels (VIAB -> VIA = Viacom 2006-2019, DISCK -> DISCA, CMCSK ->
+  CMCSA; letters B/C/K only); fja's closed intervals listed under a ticker adopted only after leaving
+  the index are rebased to the PIT ticker by SEC CIK evidence (`pit_rebase`, `fja_base` keeps the
+  original: AABA -> YHOO 1999-2017, VIAV -> JDSU 2000-2013, ATGE -> DV 2009-2012, FNMA -> FNM,
+  ABKFQ -> ABK, IAC -> IACI, KATE -> LIZ); splits that the prices contradict (no gap) or that
+  re-encode a same-day spin-off already carried as SPINOFF are dropped (GE 2024-04-02 1.253, SSP
+  2025-12-08 1.33).
+* Not usable / not used: Stooq (connection reset by the egress proxy), Nasdaq Data Link WIKI (free
+  key required; not requested), qlib_us_1d (Yahoo split-adjusted snapshot of 2020, no split list,
+  starts 2012-06-18 for most dead names -- kept for cross-checks only), Hugging Face re-uploads of
+  the paywalled paperswithbacktest Stocks-Daily-Price (terms).
+* Fetch: `fetch --only alpaca_eod`, `--only tiingo_eod` (keys from the environment), then
+  `--only identity`.
 
 ### 4.16 Other on-disk scout data not integrated (available for cross-checks)
 qlib_us_1d (8,994 symbols 1999-2020, total-adjusted, Yahoo-derived, only 178 dead names),
@@ -408,6 +715,11 @@ kept outside the cache (scratch) and can be deleted after loading.
 | quotes / dukascopy | 1 | 76 k | 1 MB | SPY CFD ticks 2026-10-27 (sample) |
 | events / ziplime | 12,657 symbols | 430,908 | 18 MB | EARNINGS 2003-04-25 .. 2026-10-23 |
 | events / sec | 1,018 | 71,757 | 11 MB | EARNINGS_RELEASE (8-K 2.02) per symbol |
+| fundamentals / estimates | 869 | 1.30 M | | weekly NTM / FY1 / FY2 consensus + analyst counts 2017-10-26 .. 2026-10-25 (§4.19) |
+| events / sec_fts BUYBACK | 294 | 695 | <1 MB | repurchase authorizations 2009-08 .. 2026-09 (§4.18) |
+| events / sec_fts DIVIDEND_DECL | 466 | 8,059 | <1 MB | dividend declarations, known_at 2004-09-21 .. 2026-10-13 (§4.17; built 2026-10-30) |
+| reference / sec_fts BUYBACK_CANDIDATES | 838 | 11,307 | <1 MB | phrase hits (search index only), not events (§4.18) |
+| borrow / iborrowdesk | 0 | 0 | | keyed API not fetched (NEEDS USER: IBORROWDESK_API_KEY) |
 | events / sp500, fomc | | 1,544 / 246 | | INDEX_ADD/DEL 1996-2026; FOMC 1994-02-04 .. 2026-09-16 |
 | fundamentals / sec | 979 | 3.51 M | 35 MB | XBRL facts 2009+, 1,053 of 1,199 S&P union tickers mapped to a CIK |
 | reference / sec security_master | 1,053 | | | SIC for 1,048 |
@@ -420,8 +732,10 @@ kept outside the cache (scratch) and can be deleted after loading.
 
 * `bars(symbol, freq, start, end, as_of, adjusted=False, sessions=('RTH',), source=None)`:
   freq `1d`, `1m`, `5m`, `60m` native; other minute multiples resampled causally from 1m. Source
-  priority: daily yahoo > dolthub > tiingo > cboe; intraday yahoo > alpaca > polygon > databento >
-  alphavantage > tiingo (dukascopy only if opted in). `attrs`: source, fidelity, adjusted.
+  priority: daily yahoo > dolthub > tiingo > cboe; intraday **alpaca** > yahoo > polygon > databento >
+  alphavantage > tiingo (dukascopy only if opted in); a coarser native store of a lower-priority source
+  (Yahoo 5m) is not used when a higher-priority 1m store exists (Alpaca 1m is resampled instead).
+  Identity-keyed intraday stores (`TICKER~CIK..`) are read under the key itself. `attrs`: source, fidelity, adjusted.
   **Daily requests for stocks go through the security-identity layer (§8.1). Identity is a
   property of the BAR DATE, never of `as_of`**: each requested session is attributed to the issuer
   (CIK) the ticker denoted on that date (`ticker_timeline`); `as_of` only filters knowledge
@@ -436,7 +750,7 @@ kept outside the cache (scratch) and can be deleted after loading.
   Intraday: `sessions=('PRE','RTH','POST')` selects session parts (Yahoo has pre/post). Missing
   native frequencies are resampled causally from 1m: RTH buckets aligned to the 09:30 ET open,
   `known_at` = bucket end, capped at the actual close on half days (tested on 2023-11-24).
-* `quotes()` (alpaca > databento > iex > dukascopy).
+* `quotes()` (alpaca > databento > iex > dukascopy); Alpaca only inside recorded decision windows (§4.15).
 * `instrument(symbol).exchange` = primary listing venue (NYSE / NASDAQ / AMEX / ARCA / BATS) from
   the Nasdaq Trader directory (current); `exchange_at(symbol, as_of)` -> (venue, source, inferred):
   a PIT mover table (ORCL Nasdaq -> NYSE 2013-07-15, TXN NYSE -> Nasdaq 2012-12-12, PEP NYSE ->
@@ -445,8 +759,10 @@ kept outside the cache (scratch) and can be deleted after loading.
   marked `inferred=True` for dates before its snapshot. `security_master()` carries
   `exchange_pit`, `exchange_source`, `exchange_inferred`.
 * `has(symbol, kind, freq=None, sessions=None)`: symbol `'*'` = any data of that kind;
-  `has('*', 'events', 'EARNINGS'|'INDEX_ADD'|'INDEX_DEL'|'FOMC'|'EARNINGS_RELEASE'|'EARNINGS_SCHEDULE')`
-  True when the source is loaded (BUYBACK, HALT: False -- no source integrated);
+  `has('*', 'events', 'EARNINGS'|'INDEX_ADD'|'INDEX_DEL'|'FOMC'|'EARNINGS_RELEASE'|'EARNINGS_SCHEDULE'|'DIVIDEND_DECL')`
+  True when the source is loaded (BUYBACK: from events/sec_fts/BUYBACK, §4.18; HALT: False -- no source integrated). DIVIDEND_DECL / BUYBACK are served
+  from one stored table each (`Portal.STORED_EVENT_KINDS`, symbol + cik columns: security keys get
+  only their issuer's events);
   `has('*', 'fundamentals', field)`; `has(sym, 'bars', '1m', sessions=('PRE',))` checks session
   availability. **Bars availability for a date**: `has(sym, 'bars', freq, start=, end=, as_of=)`
   is True iff `bars(sym, freq, start, end, as_of)` serves >= 1 bar -- it is computed by calling
@@ -537,6 +853,14 @@ computed with the earlier 10x / 25 % detector):
 * Intraday 1m (51 symbols x 20 sessions): RTH completeness 99.7-100% (mean 99.97%), 0 OHLC
   violations, 0-6 zero-volume RTH bars per symbol, PRE 148-6,354 and POST 160-3,464 bars per symbol
   (pre/post bars exist only for minutes with trades).
+
+**Corporate-action cross-check** (`ca_crosscheck.py`, ENGINE agent; method and full numbers in docs/ENGINE.md
+§3): classified Yahoo actions vs DoltHub splits/dividends and DoltHub's as-traded overnight gaps, identity-guarded,
+flag-only (severity `error` / `warn`, `flags()` for fail-closed consumers). `python -m atlasbt.data.ca_crosscheck`
+-> `cache/qa/ca_crosscheck_<date>.csv`. 2026-10-30, 657 symbols: splits 43 of 171 comparable events disagree
+(25.1 %, mostly Yahoo splits that DoltHub omits, confirmed by DoltHub's own prices), dividends 1,439 of 29,300 (4.9 %). Errors in the
+served actions: GE 2024-04-02 (GE Vernova spin-off served both as SPINOFF and as a 1.253 SPLIT -- needs a fix in
+`actions_classify`) and SSP 2025-12-08 (1.33 "split" without any price gap).
 
 ## 8. Survivorship & known gaps (blunt)
 
@@ -683,6 +1007,8 @@ over the trailing 20 sessions equals the point coverage within 0.3 pp.)
 * Options: sparse EOD chains, ~3 snapshots/week 2020-2024, DTE 11-66 only (no 0-10 DTE, no LEAPS),
   no QQQ/IWM/SPX (synthetic T3 fallback), no volume/OI, capture minute unknown, 2019 weekly only.
 * Corporate actions: no declaration/record/pay dates (known_at = previous close, pay_date None);
+  declaration timestamps exist separately as DIVIDEND_DECL events for ~25% of S&P cash dividends
+  2018+ (§4.17; none for ETFs);
   spin-offs, mergers' stock components and symbol changes are not modelled as actions (Yahoo does not
   provide them); DoltHub dividends for delisted names are split-adjusted amounts (T3 pre-2014).
 * Fundamentals: XBRL only (2009+); no pre-2009 PIT fundamentals; Q4 quarter values not derived;
@@ -692,7 +1018,11 @@ over the trailing 20 sessions equals the point coverage within 0.3 pp.)
   assumed known 7 days ahead (no history of when calendars were published).
 * Index changes: announcement date known for 623 of 1,544 events; the rest use a conservative
   previous-session fallback.
-* Borrow: no historical borrow fees/availability (default model, T2); FINRA data excluded by terms.
+* Borrow: no historical borrow fees/availability in the store (default model, T2) until an
+  IBorrowDesk API key is supplied (§4.14; keyed provider ready); FINRA data excluded by terms.
+* Buybacks: 2009+ only, S&P union issuers, precision ~90%, earnings-bundled 8-Ks not parsed (§4.18).
+* Analyst revisions (S041): consensus only from 2017-10-26 (weekly; NTM blended, T2; §4.19). iNAV
+  (S110): no free PIT source.
 * Sector: SIC-based mapping and current GICS only -- no PIT GICS history (2018 Communication
   Services reshuffle and 2023 GICS changes are not reflected historically).
 * FRED now refuses the plain UA (local fallback works; updates need the scout's route or a FRED

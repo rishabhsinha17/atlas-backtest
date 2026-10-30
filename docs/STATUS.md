@@ -55,12 +55,12 @@ and the red-team tests stay in `tests/redteam/` as regressions.
 
 | Cause | Strategies | What unlocks them |
 |---|---|---|
-| No multi-year 1-minute or 5-minute bars for stocks | S001–S014, S016–S022, S027, S030, S039, S040 | Alpaca key (free SIP minute bars since 2016) |
-| Intraday decision times (15:45/15:50) need 1-minute bars across the ETF universe | S031–S037 | Alpaca key; or the opt-in daily proxy (T2), run as proxy variants (below) |
-| Quotes required (09:29 / 15:25 midpoints) | S015 | Alpaca key; or the T2 mid proxy, run as a proxy variant (below) |
-| Intraday option quotes required | S158–S160, S164, S171 | Databento OPRA |
-| SPX minute bars / SPX quotes required | S161–S163, S172 | Databento / Cboe data |
-| No free point-in-time source | S041 (analyst revisions), S045 (buyback announcements), S110 (iNAV) | paid data |
+| No multi-year 1-minute or 5-minute bars for stocks | S001–S014, S016–S022, S027, S030, S039, S040 | **Alpaca SIP fetch (2026-10-30, DATA.md §4.15)**: 1m PRE+RTH for every PIT top-60 stock 2016-> and 5m RTH for every PIT S&P 500 member 2017-11-> (resumable `fetch --set intraday`); the planner still needs the intraday changes listed in DATA.md §4.15 (intraday bar range capped at 800 days; PIT-universe intraday coverage) |
+| Intraday decision times (15:45/15:50) need 1-minute bars across the ETF universe | S031–S037 | **Alpaca SIP 1m 2016-01-04 -> for the 19 ETFs fetched** (testable 2016->, see DATA.md §4.15); the daily proxy variants remain |
+| Quotes required (09:29 / 15:25 midpoints) | S015 (and S005/S006 premarket) | **Alpaca SIP NBBO decision windows fetched** (15:24-15:25 ETF_CORE every session 2016->; 09:20-09:30 for the day's top-60); the planner's `quotes` branch still returns NOT_TESTABLE unconditionally (fix in DATA.md §4.15) |
+| Intraday option quotes required | S158–S160, S164, S171 | Databento OPRA quotes now fetched (DATA.md §4.15c): S164 data-complete 2023-05+; S158–S160 also need 2023+ 5m bars for the S&P 500 universe (Alpaca, in progress); S171 needs 2023+ Alpaca ETF NBBO windows |
+| SPX minute bars / SPX quotes required | S161–S163, S172 | Databento OPRA fetched 2023-03-28+ (T0 quotes; SPX minute levels from put-call parity, T2); planner must read `databento.coverage()` (OPTIONS.md §13) |
+| No free point-in-time source | S110 (iNAV) | paid data |
 | Missing ETF history in cache | S108 (Vanguard sector ETFs) | add them to the fetch set |
 
 **Proxy variants.** Some NOT_TESTABLE strategies ship an opt-in proxy that the strategy documents and
@@ -89,9 +89,23 @@ excluded candidates are in `atlasbt/run/variants.py` and RUNNING.md §2b. The co
 * **Options.** Free real chains (DoltHub) start in 2020, are sparse (about 3 expiries per day) and lack
   SPX/QQQ/IWM. Earlier or missing contracts are priced from a synthetic surface (T3), which runs about
   1.5%/yr rich against the Cboe PUT index.
-* **Spreads.** The model is fitted to 2026 consolidated quotes. Earlier eras are anchored to published studies
+* **Spreads.** The model is fitted to 2026 consolidated quotes; v4 (2026-10-30) checks 2016-2025 against Alpaca SIP NBBO samples and replaces the pessimistic floor there for S&P-sized names (SPREADS.md §10: stock MAE 4.4 -> 2.4 bp out of fold). Earlier eras are anchored to published studies
   (Hasbrouck 2009, Hendershott-Jones-Menkveld, Furfine), with a deliberately pessimistic floor for 2010–2025.
 * **Sectors and industries.** These are today's classification applied historically (flagged T2).
-* **Borrow fees.** No history; a default schedule is used (flagged T2).
-* **Key-gated providers** (Alpaca, Polygon, Tiingo, Databento, Alpha Vantage) were written from official docs
-  but not live-tested.
+* **Borrow fees.** No history in the store; a default schedule is used (flagged T2). A keyed
+  IBorrowDesk provider (IBKR stock-loan fee/availability, daily since 2015-07-13; 812 short-able
+  symbols, <= 9,744 API units) is wired into `Portal.borrow` (real rows -> T1, no T2 flag) but needs
+  `IBORROWDESK_API_KEY` (paid API; the site's free endpoints block scripted clients).
+* **Dividend declarations (S042).** DIVIDEND_DECL events from EDGAR 8-K full-text matches (T2):
+  8,059 declarations, ~25% of S&P 500 cash dividends 2018+, text-checked precision 29/30, none for
+  ETFs (DATA.md §4.17). S042
+  trades declared stock dividends (flagged T2) and skips undeclared ones; its runs remain limited by
+  1-minute stock-bar coverage of SP500_TOP50_DV.
+* **Analyst revisions (S041, now testable at T2, 2017-11 ->).** Weekly DoltHub consensus snapshots,
+  FY1/FY2 blended to next-12-months EPS, known one session after each snapshot (DATA.md §4.19).
+* **Buyback announcements (S045, now testable at T2).** 695 repurchase authorizations 2009-2026 parsed
+  from EDGAR 8-K press releases (precision 27/30 on a read sample; earnings-bundled releases not
+  parsed since S045 excludes them; DATA.md §4.18).
+* **Key-gated providers** (Polygon, Tiingo, Alpha Vantage) were written from official docs but not
+  live-tested. Alpaca and Databento OPRA are live-verified. Databento runs on free credits under a
+  hard $90 budget with a per-request ledger (DATA.md §4.15c).

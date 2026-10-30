@@ -183,6 +183,11 @@ def build_membership(store: Optional[ParquetStore] = None, ttl_hours: float = 24
     mem = mem[mem["base"].notna()].reset_index(drop=True)
     mem["yahoo"] = [RENAMES.get(b, b).replace(".", "-") if (not h or b in RENAMES) else None
                     for b, h in zip(mem["base"].astype(str), mem["historical_identity"])]
+    try:
+        from ..identity import IdentityIndex
+        mem = pit_rebase(mem, IdentityIndex(store))
+    except Exception as e:                      # identity evidence not built yet: keep fja tickers
+        log.warning("sp500 PIT rebase skipped: %s", e)
     events = build_events(mem, wiki)
     store.write("reference", SOURCE, "membership", mem, key=["ticker", "start"], replace=True,
                 fidelity=int(Fidelity.T1_BAR), extra={"fja_last_change": str(last.date()),
@@ -196,6 +201,88 @@ def build_membership(store: Optional[ParquetStore] = None, ttl_hours: float = 24
     return {"intervals": len(mem), "tickers": mem["ticker"].nunique(), "events": len(events),
             "events_with_parsed_announcement": n_ann, "wiki_rows": len(wiki), "current": cur,
             "historical_identity_intervals": int(mem["historical_identity"].sum())}
+
+
+REBASE_MIN_SHARE = 0.90
+REBASE_FROM = pd.Timestamp("2006-01-03")       # ZipLime as-of ticker evidence starts in 2006
+
+
+def pit_rebase(mem: pd.DataFrame, idx) -> pd.DataFrame:
+    """Point-in-time member tickers for CLOSED membership intervals that fja's "Updated" file lists
+    under a ticker the issuer adopted only AFTER leaving the index (VIAV for JDS Uniphase 2000-2013,
+    ATGE for DeVry 2009-2012, AABA for Yahoo 1999-2017): the bar-date identity layer cannot attribute
+    a ticker that did not exist yet, so the member counted as missing. SEC CIK evidence (ZipLime
+    8-K as-of tickers) decides; an interval [start, end) with base T is rebased to T' when
+      * T has NO as-of evidence on any interval session since 2006 (T was not trading as T),
+      * T's first evidence (as-of, else carried) lies AFTER the interval end and names CIK c,
+      * c's as-of evidence under one other ticker T' labels >= 90 % of the interval sessions
+        (2006+) as c, and T' is not the base of another overlapping interval.
+    Open intervals (current members, identified by Wikipedia's CIK) and every interval on which T
+    itself is evidenced (renames inside the index: FISV/FI, BLL/BALL, handled by the Portal) are
+    never touched. The original ticker is kept in `fja_base`; `rebase_reason` documents the CIK."""
+    from ..identity import norm
+    mem = mem.copy()
+    if "fja_base" not in mem.columns:
+        mem["fja_base"] = mem["base"]
+    mem["rebase_reason"] = mem.get("rebase_reason", pd.Series([None] * len(mem), index=mem.index))
+    sch = frames.schedule().index
+    bases = [norm(b) for b in mem["fja_base"].astype(str)]
+    for i, (pos, r) in enumerate(mem.iterrows()):
+        if pd.isna(r["end"]):
+            continue
+        t = bases[i]
+        lo, hi = max(pd.Timestamp(r["start"]), REBASE_FROM), pd.Timestamp(r["end"])
+        ss = sch[(sch >= lo) & (sch < hi)]
+        if not len(ss) or (idx.label_dates(t, ss) != 0).any():
+            continue
+        e = idx.by_ticker.get(t)
+        if e is None or not len(e):
+            continue
+        after = e[e["date"] >= hi]
+        ea = after[after["conf"] == 0]
+        first = ea if len(ea) else after
+        if not len(first) or len(e[(e["conf"] == 0) & (e["date"] < hi)]):
+            continue                              # T traded (as-of evidence) before the interval ended
+        c = int(first.sort_values("date")["cik"].iloc[0])
+        best, share = None, 0.0
+        for t2 in idx.zl_tickers_of(c):
+            if t2 == t:
+                continue
+            sh = float((idx.label_dates(t2, ss) == c).mean())
+            if sh > share:
+                best, share = t2, sh
+        if best is None or share < REBASE_MIN_SHARE:
+            continue
+        clash = [(b, s0, e0) for b, s0, e0 in zip(bases, mem["start"], mem["end"])
+                 if b == best and s0 < hi and (pd.isna(e0) or e0 > pd.Timestamp(r["start"]))]
+        if clash:
+            continue
+        mem.at[pos, "base"] = best
+        mem.at[pos, "rebase_reason"] = (f"fja lists {t} (adopted after the interval); SEC CIK {c} traded as "
+                                        f"{best} on {share:.0%} of the interval sessions (as-of 8-K evidence)")
+        log.info("sp500 PIT rebase %s [%s, %s) -> %s (CIK %d, %.0f%%)", t, r["start"].date(), hi.date(), best, c,
+                 100 * share)
+    return mem
+
+
+def rebase_stored_membership(store: Optional[ParquetStore] = None) -> dict:
+    """Apply `pit_rebase` to the stored membership (from its fja tickers) and rebuild the INDEX
+    events, without any network access."""
+    from ..identity import IdentityIndex
+    store = store or default_store()
+    mem = store.read("reference", SOURCE, "membership")
+    meta = store.meta("reference", SOURCE, "membership") or {}
+    if "fja_base" in mem.columns:
+        mem["base"] = mem["fja_base"]
+    mem = pit_rebase(mem, IdentityIndex(store))
+    wiki = store.read("reference", SOURCE, "wiki_changes")
+    events = build_events(mem, wiki)
+    store.write("reference", SOURCE, "membership", mem, key=["ticker", "start"], replace=True,
+                fidelity=int(Fidelity.T1_BAR), extra={k: meta.get(k) for k in ("fja_last_change", "wiki_rows")})
+    store.write("events", SOURCE, "INDEX", events, key=["kind", "fja_ticker", "effective_date"], replace=True,
+                fidelity=int(Fidelity.T2_PROXY))
+    reb = mem[mem["base"] != mem["fja_base"]]
+    return {"rebased": reb[["fja_base", "base", "start", "end"]].astype(str).values.tolist()}
 
 
 def fetch_current_constituents(store: ParquetStore, ttl_hours: float = 24) -> int:

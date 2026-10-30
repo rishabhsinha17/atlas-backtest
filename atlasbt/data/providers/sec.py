@@ -268,3 +268,96 @@ def fetch_company(symbol: str, store: Optional[ParquetStore] = None, facts: bool
                 out["fundamental_rows"] = len(fund)
                 out["fields"] = fund["field"].nunique()
     return out
+
+
+# ---------------------------------------------------------------------------
+# EDGAR full-text search (efts.sec.gov, 2001+) and filing documents (www.sec.gov/Archives)
+#
+# efts.sec.gov answers the plain UA `atlasbt-research/0.1` (verified 2026-10-30: HTTP 200).
+# www.sec.gov/Archives refuses it (HTTP 403 "undeclared automated tool") -> reading filing TEXT
+# needs SEC_USER_AGENT (a contact string supplied by the user); without it `fetch_document`
+# raises SecContactRequired and callers keep only what the search index itself says
+# (accession, form, items, exhibit type, filing date). Search hits carry no text snippets.
+FTS_URL = "https://efts.sec.gov/LATEST/search-index"
+ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{adsh_nodash}/{filename}"
+FTS_PAGE = 100            # hits per page (EFTS default)
+FTS_MAX = 10_000          # EFTS refuses offsets beyond 10,000
+
+
+class SecContactRequired(RuntimeError):
+    """www.sec.gov needs a User-Agent with a contact (env SEC_USER_AGENT) -- NEEDS USER."""
+
+
+def fts_search(q: str, *, ciks=None, forms: str = "8-K", start: str = "2001-01-01",
+               end: Optional[str] = None, max_hits: int = FTS_MAX, ttl: Optional[float] = None) -> pd.DataFrame:
+    """All EDGAR full-text-search hits for query `q` (EFTS syntax: "phrase", OR, AND), one row per
+    matching DOCUMENT: adsh, cik (first filer), ciks, file_date, form, root_form, file_type,
+    file_description, items, filename, display_name. Paged 100 at a time (polite: the shared
+    HTTP client throttles per host and backs off on 429/5xx; responses are disk-cached)."""
+    end = end or pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")
+    params = {"q": q, "forms": forms, "dateRange": "custom", "startdt": start, "enddt": end}
+    if ciks:
+        params["ciks"] = ",".join(f"{int(c):010d}" for c in ([ciks] if isinstance(ciks, (int, str)) else ciks))
+    if ttl is None:   # a window that ended > 30 days ago is final; recent windows are re-read daily
+        ttl = None if pd.Timestamp(end) < pd.Timestamp.now() - pd.Timedelta(days=30) else 86400.0
+    rows, frm, total = [], 0, None
+    while True:
+        p = dict(params, **({"from": frm} if frm else {}))
+        d = json.loads(client().get(FTS_URL, params=p, ttl=ttl))
+        hits = d.get("hits", {})
+        total = int(hits.get("total", {}).get("value", 0)) if total is None else total
+        page = hits.get("hits", [])
+        for h in page:
+            s = h.get("_source", {})
+            _id = str(h.get("_id", ""))
+            rows.append({"adsh": s.get("adsh") or _id.split(":")[0],
+                         "cik": int(s["ciks"][0]) if s.get("ciks") else None,
+                         "ciks": ",".join(str(int(c)) for c in s.get("ciks") or []),
+                         "file_date": s.get("file_date"), "form": s.get("form"),
+                         "root_form": ",".join(s.get("root_forms") or []),
+                         "file_type": s.get("file_type"), "file_description": s.get("file_description"),
+                         "items": ",".join(s.get("items") or []),
+                         "filename": _id.split(":", 1)[1] if ":" in _id else None,
+                         "display_name": (s.get("display_names") or [None])[0]})
+        frm += len(page)
+        if not page or frm >= min(total, max_hits, FTS_MAX):
+            break
+    df = pd.DataFrame(rows, columns=["adsh", "cik", "ciks", "file_date", "form", "root_form", "file_type",
+                                     "file_description", "items", "filename", "display_name"])
+    if len(df):
+        df["file_date"] = pd.to_datetime(df["file_date"], errors="coerce")
+    df.attrs["total"] = total or 0
+    return df
+
+
+def acceptance_map(cik: int) -> dict:
+    """accession number -> acceptance datetime (UTC) from the cached / fetched submissions JSON
+    (data.sec.gov accepts the plain UA). Empty dict when unavailable."""
+    try:
+        _, filings = _submissions(int(cik))
+    except (FetchError, ValueError, KeyError) as e:
+        log.warning("submissions for CIK %s unavailable: %s", cik, e)
+        return {}
+    f = parse_filings(filings)
+    return dict(zip(f["accessionNumber"], f["acceptance"]))
+
+
+def filing_known_at(adsh: str, file_date, accept: dict) -> tuple[pd.Timestamp, str]:
+    """(known_at UTC, method): the acceptance time when known, else file date 17:30 ET -- never
+    early (EDGAR dates filings accepted after 17:30 ET as the next business day)."""
+    a = accept.get(adsh)
+    if a is not None and pd.notna(a):
+        return pd.Timestamp(a), "acceptance"
+    return et(pd.Timestamp(file_date).normalize(), "17:30"), "filed_1730ET"
+
+
+def fetch_document(cik: int, adsh: str, filename: str) -> bytes:
+    """Raw bytes of one filing document from www.sec.gov/Archives (cached forever). Requires
+    SEC_USER_AGENT (www.sec.gov refuses the plain UA with 403): raises SecContactRequired
+    without it -- NEEDS USER: "SEC_USER_AGENT contact string"."""
+    from .. import config
+    if not config.SEC_USER_AGENT:
+        raise SecContactRequired("www.sec.gov/Archives refuses requests without a contact in the User-Agent; "
+                                 "set SEC_USER_AGENT (NEEDS USER)")
+    url = ARCHIVES_URL.format(cik=int(cik), adsh_nodash=adsh.replace("-", ""), filename=filename)
+    return client().get(url)

@@ -264,6 +264,26 @@ Synthetic smiles are deterministic in (VIX family, SKEW-clipped), so **synthetic
 used as a source of skew/term-structure SIGNALS** (S166/S167/S168 z-scores would be degenerate).
 
 
+### 7.4b Synthetic surface vs real OPRA quotes, 2023-2026 (`options/validate_real.py`)
+
+Real chain = Databento OPRA consolidated BBO sampled at 15:59 ET (DATA.md §4.15c), SPY / QQQ / IWM, DTE 5-70,
+|K/S-1| <= 12%, 22 sessions (one mid-month session every second month, 2023-04-17 .. 2026-10-15). Synthetic =
+`Portal.synthetic_chain` at 16:20 ET of the same session (same-day vol-index closes). Both through
+`chain_metrics` (IV from OTM mids on the parity forward). Medians over the 22 sessions:
+
+| underlying | ATM 30D IV, synthetic - real | 25-delta skew, synthetic / real | 30-DTE ATM put premium, synthetic / real | near-the-money spread (20-40 DTE, abs delta 0.3-0.7), synthetic / real |
+|---|---|---|---|---|
+| SPY | -0.06 vol pts (mean +0.15) | 0.93 | 0.99 | 2.6x |
+| QQQ | -0.54 vol pts | 1.12 | 0.95 | 1.7x |
+| IWM | -1.15 vol pts | 1.54 | 0.94 | 1.9x |
+
+Reading: in 2023-2026 the synthetic ETF chains price the ATM 30-day level well (SPY within 0.1 vol point,
+QQQ/IWM 0.5-1.2 points cheap). Their quoted spreads are 1.7-2.6x the real NBBO, so synthetic fills are
+conservative on cost. The 25-delta skew is close for SPY (93%) and too steep for IWM (154%: VIX-shaped
+skew applied to RVX). The +1.5%/yr richness against the Cboe PUT index (above) is an SPX/AM-monthly,
+2008-2026 result. It does not appear as an SPY premium bias at the 15:59 close in this window (premium
+ratio 0.99). Detail: `cache/store/reference/databento_validation/{detail,summary}.csv`.
+
 ### 7.5 Fallback quote stream (`marking.synthetic_option_quotes`)
 
 `synthetic_option_quotes(instrument, start, end, as_of, portal, real_first=True, include_open=False,
@@ -360,7 +380,10 @@ covered by `tests/options/test_plugins.py`.
 
 ## 12. Real option data available
 
-Besides DoltHub (below): `data_raw/historicaloptiondata_free_samples` has ONE full-market EOD day
+**Databento OPRA (keyed, DATA.md §4.15c, T0)**: consolidated BBO sampled every minute, from 2023-03-28, for the
+fetched plans only. They cover SPXW 0DTE all session, SPX/SPXW month-end closing chains and box marks, S&P 500
+pre/post-earnings windows, and S160 post-earnings puts. A synthetic quote is never substituted for a contract
+with OPRA samples that day. Besides DoltHub (below): `data_raw/historicaloptiondata_free_samples` has ONE full-market EOD day
 (2019-08-15, all US options incl. SPX/SPXW/QQQ/IWM, with underlying price) — used for calibration,
 not enough for any backtest; `data_raw/gh_quantconnect_lean_data` has minute quotes for a handful of
 SPX contracts (2021-01-04, 2021-01-14) and SPY options (2023-08-03) — test fixtures only;
@@ -407,21 +430,22 @@ NT = recommend `RunStatus.NOT_TESTABLE`. Pre-2020 everything option-priced is T3
 | S150 | diagonal with 180–365 DTE LEAP | T3 (no LEAP quotes) | |
 | S151–S154 | backspreads, risk reversals 30–60 DTE | T2 / T3 at 7 DTE | |
 | S156, S157 | jade lizard, covered strangle | T2 | |
-| S158, S159 | earnings 3–10 DTE, 15:30 → 09:45 | **NT** | no intraday quotes, no 3–10 DTE expiries; synthetic cannot model event IV crush |
-| S160 | post-earnings 10:00 entry, 30 DTE | T2 with close-for-10:00 timing proxy | declare deviation |
-| S161–S163 | SPX 0DTE intraday | **NT** (T3 only illustrative) | no SPX, no intraday option quotes; VIX1D daily close cannot capture intraday vol |
-| S164 | FOMC 0DTE straddle at recorded NBBO | **NT** | needs timestamped NBBO |
+| S158, S159 | earnings 3–10 DTE, 15:30 → 09:45 | **T0 option quotes 2023-03-28+ (OPRA)** | quotes T0 for every PIT S&P 500 scheduled BMO/AMC release; the runs still need 5m stock bars for the universe (Alpaca `alpaca_bars_sp500_5m`, being fetched) and the release time is calendar-approximated (T2) |
+| S160 | post-earnings 10:00 entry, 30 DTE | **T0 decision quotes 2023-03-28+ (OPRA)**; IV history T2 (DoltHub EOD) | first signals need 252 daily IV values; also needs 5m stock bars (as S158) |
+| S161–S163 | SPX 0DTE intraday | **T0 option quotes 2023-03-28+ (OPRA)**, SPX minute levels T2 (parity) | S162/S163 VWAP on SPY (T2, declared) |
+| S164 | FOMC 0DTE straddle at recorded NBBO | **T0 at 1-minute resolution, 2023-05-03+** (28 statements) | fill = first 1-minute NBBO sample after the decision |
 | S165–S167, S169 | IV percentile / skew z / forecast vs implied | T2 (signals from real 30D surfaces, 2020+) | z-scores need 252d history → from 2021 |
 | S170 | SPY vs sector-ETF straddles (dispersion) | T2 (all in DoltHub) | vega matching + EOD delta hedges |
-| S171 | 1-minute synchronized parity screen | **NT** | EOD snapshots are neither synchronized nor executable intraday |
-| S172 | SPX European box financing | **NT** | no SPX quotes; a synthetic box prices at the model rate by construction (circular) |
+| S171 | 1-minute synchronized parity screen | **NT** (plan `s171` ready, not fetched) | needs synchronized stock NBBO: Alpaca ETF_CORE NBBO windows exist only to 2021-07 in the store |
+| S172 | SPX European box financing | **T0 2023-03-31+ (OPRA 15:59 samples)** | month-end chain + next-session fill + daily marks |
 
 ## 14. Limitations / open items
 
 * Spread model residual sd is large and recent spreads are under-predicted (§7.4): treat synthetic
   transaction costs as uncertain by ×1.6 and run cost stress ×1.5–2.
 * Synthetic SPX put-write is ≈ 1.5%/yr rich vs the Cboe PUT index; synthetic 25Δ skew ≈ 75–80% of
-  real SPX on the 2019-08-15 check day.
+  real SPX on the 2019-08-15 check day. Against real OPRA closes 2023-2026 (§7.4b) the SPY ATM level is within
+  0.1 vol pt and spreads are 1.7-2.6x too wide; IWM skew is too steep (1.5x).
 * Synthetic chains have no event (earnings) variance, no per-name skew dynamics beyond (a, b), no
   intraday vol dynamics; vol-index mapping for unmapped names relies on the caller's `rv_ratio`.
 * Early-assignment model is a deterministic rule of thumb (no probabilistic assignment).

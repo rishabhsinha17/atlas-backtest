@@ -531,11 +531,70 @@
   "ref_log_usd": 27.700189138579248,
   "source": "calibration/market_dollar_volume.csv (2000-2010 qlib/Yahoo, survivor-biased; 2011-2026 DoltHub)"
  },
- "version": 3,
- "description": "Calibrated half-spread model, see docs/SPREADS.md",
+ "version": 4,
+ "description": "Calibrated half-spread model, see docs/SPREADS.md | v4 (2026-10-30): 2016-2025 inside the evidence ADV$ band uses the relative model x per-year SIP NBBO evidence multipliers (Alpaca sample) instead of the nominal-2026 pessimistic floor; floor kept for 2010-2015 and below the band.",
  "fit_day": "20260701",
  "target": "RTH time-weighted mean NBBO quoted half-spread (fraction of mid)",
  "fit_weight": "log10(ADV$) - 5 clipped to [0.5, 5]",
  "residual_sd_log": 0.637794750820859,
- "n_symbols": 10956
+ "n_symbols": 10956,
+ "nbbo_evidence": {
+  "start": "2016-01-04",
+  "end": "2025-12-31",
+  "adv_band": [
+   36192043.0875,
+   76714246.87158585
+  ],
+  "multipliers": {
+   "2016": {
+    "stock": 1.143788695992742,
+    "etf": 1.0
+   },
+   "2017": {
+    "stock": 1.2998661945234153,
+    "etf": 1.0
+   },
+   "2018": {
+    "stock": 1.0794625319330224,
+    "etf": 1.0
+   },
+   "2019": {
+    "stock": 1.0,
+    "etf": 1.0
+   },
+   "2020": {
+    "stock": 1.0,
+    "etf": 1.0
+   },
+   "2021": {
+    "stock": 1.0,
+    "etf": 1.0
+   },
+   "2022": {
+    "stock": 1.0,
+    "etf": 1.0
+   },
+   "2023": {
+    "stock": 1.0,
+    "etf": 1.0
+   },
+   "2024": {
+    "stock": 1.0531112364868898,
+    "etf": 1.0
+   },
+   "2025": {
+    "stock": 1.4855924775327995,
+    "etf": 1.0304511315345435
+   }
+  },
+  "quantile": 0.4,
+  "source": "Alpaca SIP NBBO sample (calibration/alpaca_nbbo_2016_2026.csv.gz): 2nd Wednesday of each month, 7 one-minute windows, 19 ETFs + 50 PIT S&P 500 members spread over ADV$ ranks",
+  "n_symbol_days": 2746,
+  "n_rows": 19066,
+  "sample_days": 40,
+  "sample_range": [
+   "2016-01-13",
+   "2025-10-08"
+  ]
+ }
 }

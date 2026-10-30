@@ -1,6 +1,6 @@
 # Calibrated bid-ask spreads (`atlasbt/execution/spread_calibrated.py`)
 
-Owner: SPREAD CALIBRATION agent. Calibration schema **v3** (2026-10-29: red-team fixes, then relative liquidity and stress flag; section 9). The engine
+Owner: SPREAD CALIBRATION agent. Calibration schema **v4** (2026-10-30: v3 + SIP NBBO evidence 2016-2025 from Alpaca, section 10; v3 = 2026-10-29: red-team fixes, then relative liquidity and stress flag; section 9). The engine
 default is `BacktestConfig.spread_model='calibrated'`. Fidelity of every fill priced with it: **T2, "spread modelled
 (calibrated)"**.
 
@@ -299,7 +299,8 @@ COVID spike: SPY IEX median 4.7 bp, while the model with that day's PIT σ (5.2%
 ## 7. Limitations
 
 * There is one consolidated-NBBO fit day. 2026-07-02 checks time stability and, with the hold-out symbols, out-of-sample
-  error. NYSE's sample folders hold no free consolidated-NBBO day from another year.
+  error. NYSE's sample folders hold no free consolidated-NBBO day from another year. Since v4, 2016-2025 is checked
+  against SIP NBBO samples from Alpaca (section 10) -- S&P 500 members and the 19 intraday ETFs only.
 * Before 2010 the model rests on published aggregates (HJM 2003 NYSE quintiles, Furfine 2001, Hasbrouck 2009 text values) and
   on the monotone-in-time assumption, not on quotes we hold. 2003–2010 is interpolated under the monotone floor. The
   residual misfit against HJM Q5 and Hasbrouck is quantified in section 5. Market $ volume 2000–2010 is survivor-biased (low).
@@ -358,3 +359,85 @@ v2 features needs only new keyword arguments; no signature breaks:
 | v3: relative liquidity | ADV$ deflated by market $ volume in the model and the era; monotone constraint at fixed relative ADV$; HJM + Hasbrouck surfaces, upper envelope | HJM Q1–Q5 (v2) 5.2, 8.7, 13.5, 20.5, 33.1 → 4.7, 7.5, 9.7, 12.9, 65.2 bp (obs 5.19, 6.82, 9.17, 11.68, 19.89); Hasbrouck median 0.35–0.70× → 0.51–1.08×; Furfine post-decimal 8.0¢ → 7.0¢ (fitted) |
 | v3: 2010–2025 floor | default `pessimistic_floor_2010_2025=True`: max(relative, nominal 2026) for 2010–2025, qualifier "no NBBO evidence for era: pessimistic floor" | $20 / $10M / σ 2.5%: 2010 6.2 → 17.6 bp, 2015 6.7 → 17.6, 2020 10.1 → 17.6, 2025 16.0 → 17.6 (2026 17.6) |
 | v3: stress | reason qualifier "stress regime: spread uncertainty high" when σ ≥ 3 × reference σ | SPY 2020-03-18 and 2008-10-15 flagged; normal days not |
+
+## 10. Validation against real SIP NBBO 2016-2025 (Alpaca) and the v4 refit
+
+**Data.** Alpaca's historical SIP quotes are the consolidated NBBO stream (docs/DATA.md §4.15), cleaned the same
+way as the TAQ statistics (crossed / locked / non-firm updates dropped). Sample
+(`calibration/tools/alpaca_nbbo_sample.py` -> `calibration/alpaca_nbbo_2016_2026.csv.gz`, derived statistics
+only): the 2nd Wednesday of a month (quarterly months first; the fit used the 40 quarterly days 2016-01-13 ..
+2025-10-08), seven 1-minute windows at the middle of the model's 5-minute time-of-day buckets (09:32, 09:47,
+10:32, 12:32, 14:32, 15:32, 15:52 ET), the 19 intraday ETFs plus 50 PIT S&P 500 members spread evenly over that
+day's ADV$ ranks (632 symbols in all), each identity-routed to its tape ticker. Statistic: time-weighted mean
+relative half spread in the minute. Features exactly as in the calibration (prior raw close, 20-day ADV$,
+20-day sigma, sessions strictly before the day). Prediction = what the engine charges: max(model half spread x
+time-of-day multiplier, half a tick) (`calibration/alpaca_validate.py`). 19,066 symbol-windows, 2,746
+symbol-days.
+
+**Finding.** ETFs: the model is unbiased in every year (median ln(pred/obs) -0.00 .. +0.04; within 2x 91-100 %).
+S&P 500 stocks: v3 overstated the half spread by **~1.9x (median ln ratio +0.63)** in 2016-2024 -- the 2010-2025
+pessimistic floor (nominal-ADV 2026 estimate, used because there was no NBBO evidence) binds for most large
+caps, while the relative-liquidity model without the floor is close to unbiased (2016-2018 median ln ratio
+-0.00 .. +0.01, 2019-2023 +0.11 .. +0.31). 2025 is the exception: the floor was right (-0.03), the relative model
+alone is too low there.
+
+**v4 refit** (`spread_calibration.json` version 4; v3 kept as `spread_calibration_v3.json`; the loader accepts
+v1-v4, `CalibratedSpreadConfig(nbbo_evidence=False)` reproduces v3). New block `nbbo_evidence`: for sessions
+2016-01-04 .. 2025-12-31 the nominal floor is replaced by the relative model x a per-year multiplier m(y, kind)
+= exp(max(0, -q40)), q40 = 40th percentile of ln(relative model / observed) over that year's symbol-days, so the
+model is at or above the observed spread on >= 60 % of symbol-days (pessimistic) and is never below the
+relative model. Multipliers (stock / ETF): 2016 1.14 / 1.00, 2017 1.30 / 1.00, 2018 1.08 / 1.00, 2019-2023
+1.00 / 1.00, 2024 1.05 / 1.00, 2025 1.49 / 1.03. The evidence covers S&P 500-sized liquidity only, so it applies
+fully above ADV$ $76.7M (10th percentile of the sample stocks), not at all below $36.2M (2nd percentile; the
+v3 floor stays), log-linear in between (monotone in ADV$, tested). 2010-2015 and smaller names keep the floor
+("no NBBO evidence for era: pessimistic floor"); evidence rows carry "era checked against SIP NBBO 2016-2025"
+(code +128).
+
+**Errors before (v3) / after (v4)**, bp of half spread; v4 numbers are **out of fold** (multipliers fitted on the
+Jan/Jul days, evaluated on Apr/Oct, and vice versa):
+
+| set | n | obs median bp | MAE bp v3 / v4 | median ln(pred/obs) | SD ln | within x2 | pred < obs |
+|---|---|---|---|---|---|---|---|
+| all (symbol x window) | 19066 | 1.65 | 3.27 / 1.76 | +0.41 / +0.07 | 0.57 / 0.47 | 65% / 84% | 18% / 33% |
+| symbol-day level | 2746 | 2.60 | 3.09 / 1.44 | +0.46 / +0.15 | 0.44 / 0.35 | 69% / 93% | 11% / 27% |
+| S&P 500 stocks | 13820 | 2.47 | 4.44 / 2.37 | +0.63 / +0.18 | 0.58 / 0.52 | 53% / 78% | 13% / 32% |
+| ETFs | 5246 | 0.63 | 0.18 / 0.17 | +0.01 / +0.00 | 0.28 / 0.27 | 97% / 98% | 31% / 37% |
+| stocks 2016 | 1387 | 1.90 | 4.04 / 1.93 | +0.79 / +0.12 | 0.62 / 0.60 | 44% / 72% | 8% / 33% |
+| stocks 2018 | 1387 | 2.17 | 3.33 / 1.49 | +0.61 / +0.01 | 0.57 / 0.54 | 54% / 80% | 11% / 45% |
+| stocks 2020 | 1394 | 3.11 | 7.94 / 3.46 | +0.87 / +0.34 | 0.52 / 0.49 | 38% / 74% | 5% / 21% |
+| stocks 2022 | 1397 | 2.65 | 5.37 / 2.63 | +0.71 / +0.29 | 0.45 / 0.45 | 47% / 78% | 4% / 21% |
+| stocks 2024 | 1377 | 2.67 | 2.98 / 2.08 | +0.41 / +0.11 | 0.48 / 0.48 | 70% / 82% | 20% / 39% |
+| stocks 2025 | 1342 | 4.61 | 3.43 / 3.81 | -0.03 / +0.07 | 0.49 / 0.53 | 83% / 79% | 55% / 43% |
+| stocks ADV < $100M | 2616 | 2.99 | 5.07 / 3.46 | +0.74 / +0.31 | 0.63 / 0.62 | 44% / 66% | 11% / 28% |
+| stocks $100M-500M | 8710 | 2.53 | 4.66 / 2.24 | +0.64 / +0.17 | 0.55 / 0.47 | 53% / 81% | 12% / 31% |
+| stocks $500M-2B | 2053 | 1.87 | 3.28 / 1.81 | +0.47 / +0.10 | 0.59 / 0.50 | 61% / 81% | 20% / 37% |
+| stocks $2B-10B | 266 | 1.04 | 1.95 / 1.12 | +0.51 / +0.12 | 0.60 / 0.56 | 62% / 74% | 19% / 37% |
+| stocks >= $10B | 175 | 1.26 | 1.34 / 0.81 | +0.15 / -0.17 | 0.64 / 0.57 | 75% / 79% | 37% / 60% |
+| window 09:32 | 2713 | 6.08 | 9.53 / 5.57 | +0.65 / +0.40 | 0.59 / 0.59 | 58% / 75% | 13% / 28% |
+| window 10:32 | 2726 | 1.98 | 2.40 / 1.18 | +0.35 / +0.03 | 0.51 / 0.40 | 69% / 90% | 18% / 37% |
+| window 12:32 | 2705 | 1.56 | 1.70 / 0.83 | +0.29 / +0.01 | 0.52 / 0.40 | 71% / 89% | 22% / 39% |
+| window 15:32 | 2740 | 1.23 | 1.61 / 0.82 | +0.33 / +0.01 | 0.58 / 0.43 | 65% / 85% | 20% / 33% |
+| window 15:52 | 2744 | 1.10 | 1.60 / 0.82 | +0.35 / +0.02 | 0.63 / 0.47 | 62% / 81% | 19% / 30% |
+
+The 2025 multiplier makes v4 slightly worse there out of fold (MAE 3.43 -> 3.81 bp) -- the price of the
+pessimistic quantile. Residual: the largest stocks (ADV >= $10B, n = 175) are now understated by ~16 % in the
+median (no liquidity term in the evidence multiplier).
+
+**Time of day** (window / symbol-day mean, median over symbol-days): stocks observed 2.70 (09:32), 1.20, 0.84,
+0.62, 0.59, 0.45, 0.39 (15:52) vs the model's liquid-stock profile 3.06, 1.37, 0.78, 0.53, 0.47, 0.41, 0.38 --
+close; the open is ~13 % too wide in the model. Large ETFs are flat in reality (0.99-1.03 at every window: they
+quote at one tick all day) while the liquid-ETF profile gives 1.68x at 09:32 and 0.85x midday; for tick-bound
+ETFs the engine's one-tick floor dominates (SPY ~0.2 bp), so the error is < 0.1 bp. The profiles are unchanged
+in v4.
+
+**2026 cross-check** (4 quarterly days 2026-01..10, model unchanged by v4): S&P stocks median ln(pred/obs) +0.06
+(MAE 2.98 bp on a 3.73 bp median, within 2x 86 %), ETFs +0.02 (within 2x 93 %) -- the TAQ 2026-07-01 fit and
+Alpaca's NBBO agree, which also validates the Alpaca data path. The shipped sample has 44 days / 20,957 rows.
+
+**Dense ETF check** (every session): the decision-window quotes stored for the strategies (15:24 ET, ETF_CORE,
+2016-2021 first pass) give model vs observed median ln ratio -0.04 (pred 0.302 vs obs 0.308 bp, MAE 0.065 bp,
+within 2x 97.6 %; 2020: +0.09, 2021: +0.16); `alpaca_validate.window_sample_from_store()` recomputes it.
+
+Rebuild: `python atlasbt/execution/calibration/tools/alpaca_nbbo_sample.py` (key-gated, resumable), then
+`--assemble`, then `alpaca_validate.fit_evidence` + `write_v4` (see the module); validation report:
+`python -m atlasbt.execution.calibration.alpaca_validate --json ...`.
