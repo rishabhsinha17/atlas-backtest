@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+cache/
+data_raw/**/*.parquet
+data_raw/**/*.zip
+.pytest_cache/
+data_raw/*
+!data_raw/SOURCES.md
+!data_raw/inventory.json
+
+# atlas runner outputs (keep only the README)
+results/*
+!results/README.md

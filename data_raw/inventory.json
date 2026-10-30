@@ -1,0 +1,1055 @@
+{
+ "cboe_indices": {
+  "path": "cboe_indices/",
+  "kind": "vol_index",
+  "symbols": {
+   "BFLY": "1986-06-20..2026-10-27 (10161 rows)",
+   "BXMD": "1986-06-20..2026-10-27 (10161 rows)",
+   "BXMW": "2012-06-29..2026-10-27 (3599 rows)",
+   "BXM": "2002-03-22..2026-10-27 (6187 rows)",
+   "BXY": "1988-06-01..2026-10-27 (9669 rows)",
+   "CLL": "2008-08-26..2026-10-27 (4530 rows)",
+   "CMBO": "1986-06-30..2026-10-27 (10155 rows)",
+   "CNDR": "1986-06-20..2026-10-27 (10161 rows)",
+   "COR1M": "2006-01-03..2026-10-27 (5237 rows)",
+   "COR3M": "2006-01-03..2026-10-27 (5222 rows)",
+   "DJX": "1997-09-29..2026-10-27 (7315 rows)",
+   "DSPX": "2014-06-19..2026-10-27 (3108 rows)",
+   "GVZ": "2009-09-18..2026-10-27 (4301 rows)",
+   "OEX": "1983-03-11..2026-10-27 (10987 rows)",
+   "OVX": "2009-09-18..2026-10-27 (4301 rows)",
+   "PPUT": "1986-06-30..2026-10-27 (10155 rows)",
+   "PUTY": "1986-06-30..2026-10-27 (10157 rows)",
+   "PUT": "1991-03-04..2026-10-27 (4993 rows)",
+   "RUT": "2020-11-27..2026-10-27 (1485 rows)",
+   "RVX": "2009-09-16..2026-10-27 (4300 rows)",
+   "RXM": "1986-06-20..2026-10-27 (10161 rows)",
+   "SKEW": "1990-01-02..2026-10-27 (9257 rows)",
+   "SPX": "1975-01-02..2026-10-27 (13064 rows)",
+   "VIX1D": "2022-05-13..2026-10-27 (1118 rows)",
+   "VIX1Y": "2007-01-03..2026-10-27 (4980 rows)",
+   "VIX3M": "2009-09-18..2026-10-27 (4303 rows)",
+   "VIX6M": "2008-01-02..2026-10-27 (4735 rows)",
+   "VIX9D": "2011-01-04..2026-10-27 (3977 rows)",
+   "VIX": "1990-01-02..2026-10-27 (9303 rows)",
+   "VVIX": "2006-03-06..2026-10-27 (5134 rows)",
+   "VXAPL": "2011-01-07..2026-10-27 (3970 rows)",
+   "VXAZN": "2011-01-07..2026-10-27 (3970 rows)",
+   "VXD": "2009-09-18..2026-10-27 (4303 rows)",
+   "VXEEM": "2011-03-16..2026-10-27 (3924 rows)",
+   "VXEFA": "2008-01-02..2026-10-27 (4731 rows)",
+   "VXGDX": "2011-03-16..2026-10-27 (3025 rows)",
+   "VXGOG": "2011-01-07..2026-10-27 (3970 rows)",
+   "VXGS": "2011-01-07..2026-10-27 (3970 rows)",
+   "VXIBM": "2011-01-07..2026-10-27 (3970 rows)",
+   "VXN": "2009-09-14..2026-10-27 (4309 rows)",
+   "VXSLV": "2011-03-16..2026-10-27 (3109 rows)",
+   "VXTH": "2006-03-31..2026-10-27 (5173 rows)",
+   "VXTLT": "2004-01-02..2026-10-27 (5729 rows)",
+   "XEO": "2009-09-18..2026-10-27 (4300 rows)"
+  },
+  "start": "1975-01-02",
+  "end": "2026-10-27",
+  "fields": [
+   "DATE",
+   "OPEN",
+   "HIGH",
+   "LOW",
+   "CLOSE (or single value column for some indices)"
+  ],
+  "adjusted": "n/a",
+  "notes": "https://cdn.cboe.com/api/global/us_indices/daily_prices/{SYM}_History.csv. VIX/VIX9D/VIX3M/VIX6M/VIX1Y/VIX1D/SKEW/VVIX/VXN/RVX/VXD/OVX/GVZ/VXEEM/VXTLT/VXEFA/single-stock VIX + strategy indices PUT/BXM/BXMD/BXY/CNDR/BFLY/CLL/PPUT/PUTY/BXMW/CMBO/RXM, COR1M/COR3M, DSPX, VXTH, SPX/OEX/XEO/DJX/RUT. Early rows of some files have O=H=L=C (close only). SKEW/VVIX/PUT etc. have single value column. Dates MM/DD/YYYY. VXST, VXV, COR9D, SPXEW, NDX returned 403."
+ },
+ "fred": {
+  "path": "fred/",
+  "kind": "rates",
+  "symbols": {
+   "BAMLC0A0CM": "2023-10-30..2026-10-26 792 rows, 9 blank values",
+   "BAMLH0A0HYM2": "2023-10-30..2026-10-26 792 rows, 8 blank values",
+   "CPIAUCSL": "1947-01-01..2026-09-01 957 rows, 1 blank values",
+   "DFF": "1954-07-01..2026-10-26 26416 rows, 0 blank values",
+   "DFII10": "2003-01-02..2026-10-26 6213 rows, 255 blank values",
+   "DGS1": "1962-01-02..2026-10-26 16910 rows, 721 blank values",
+   "DGS10": "1962-01-02..2026-10-26 16910 rows, 721 blank values",
+   "DGS1MO": "2001-07-31..2026-10-26 6585 rows, 274 blank values",
+   "DGS2": "1976-06-01..2026-10-26 13150 rows, 553 blank values",
+   "DGS30": "1977-02-15..2026-10-26 12965 rows, 546 blank values",
+   "DGS3MO": "1981-09-01..2026-10-26 11780 rows, 493 blank values",
+   "DGS5": "1962-01-02..2026-10-26 16910 rows, 721 blank values",
+   "DGS6MO": "1981-09-01..2026-10-26 11780 rows, 493 blank values",
+   "DPRIME": "1955-08-04..2026-10-26 18583 rows, 428 blank values",
+   "DTB1YR": "1959-07-15..2026-10-26 17554 rows, 2435 blank values",
+   "DTB3": "1954-01-04..2026-10-26 18996 rows, 801 blank values",
+   "DTB4WK": "2001-07-31..2026-10-26 6585 rows, 274 blank values",
+   "DTB6": "1958-12-09..2026-10-26 17710 rows, 755 blank values",
+   "DTWEXBGS": "2006-01-02..2026-10-23 5430 rows, 213 blank values",
+   "EFFR": "2000-07-03..2026-10-26 6866 rows, 259 blank values",
+   "SOFR": "2018-04-03..2026-10-26 2235 rows, 96 blank values",
+   "T10Y2Y": "1976-06-01..2026-10-27 13151 rows, 553 blank values",
+   "T10Y3M": "1982-01-04..2026-10-27 11692 rows, 485 blank values",
+   "T10YIE": "2003-01-02..2026-10-27 6214 rows, 255 blank values",
+   "USREC": "1854-12-01..2026-09-01 2062 rows, 0 blank values",
+   "VIXCLS": "1990-01-02..2026-10-26 9605 rows, 302 blank values",
+   "VXVCLS": "2007-12-04..2026-10-26 4930 rows, 177 blank values"
+  },
+  "start": "1854-12-01",
+  "end": "2026-10-27",
+  "fields": [
+   "observation_date",
+   "<SERIES_ID>"
+  ],
+  "adjusted": "n/a",
+  "notes": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=SERIES. Percent units. Missing values are empty strings (holidays). NOTE: FRED rejected a custom User-Agent (HTTP/2 INTERNAL_ERROR / empty reply) but served the default curl UA. BAML* series only return last 3y (ICE license). FRED data are revised; for PIT use ALFRED vintages."
+ },
+ "ken_french": {
+  "path": "ken_french/ (zips) + ken_french/extracted/",
+  "kind": "factors",
+  "symbols": {
+   "10_Industry_Portfolios_Daily.csv": "daily 19260701..20260930",
+   "10_Portfolios_Prior_12_2.csv": "monthly 192701..202609",
+   "10_Portfolios_Prior_12_2_Daily.csv": "daily 19261103..20260930",
+   "12_Industry_Portfolios.csv": "monthly 192607..202609",
+   "12_Industry_Portfolios_Daily.csv": "daily 19260701..20260930",
+   "25_Portfolios_5x5.csv": "monthly 192607..202609",
+   "25_Portfolios_5x5_Daily.csv": "daily 19260701..20260930",
+   "49_Industry_Portfolios.csv": "monthly 192607..202609",
+   "49_Industry_Portfolios_Daily.csv": "daily 19260701..20260930",
+   "F-F_LT_Reversal_Factor.csv": "monthly 193101..202609",
+   "F-F_LT_Reversal_Factor_Daily.csv": "daily 19300320..20260930",
+   "F-F_Momentum_Factor.csv": "monthly 192701..202609",
+   "F-F_Momentum_Factor_daily.csv": "daily 19261103..20260930",
+   "F-F_Research_Data_5_Factors_2x3.csv": "monthly 196307..202609",
+   "F-F_Research_Data_5_Factors_2x3_daily.csv": "daily 19630701..20260930",
+   "F-F_Research_Data_Factors.csv": "monthly 192607..202609",
+   "F-F_Research_Data_Factors_daily.csv": "daily 19260701..20260930",
+   "F-F_Research_Data_Factors_weekly.csv": "weekly 19260702..20260925",
+   "F-F_ST_Reversal_Factor.csv": "monthly 192602..202609",
+   "F-F_ST_Reversal_Factor_daily.csv": "daily 19260126..20260930",
+   "ME_Breakpoints.csv": "monthly 192512..202609",
+   "Portfolios_Formed_on_ME.csv": "monthly 192607..202609",
+   "Portfolios_Formed_on_ME_daily.csv": "daily 19260701..20260930",
+   "Siccodes12.txt": "text (SIC definitions)",
+   "Siccodes49.txt": "text (SIC definitions)"
+  },
+  "start": "1926-07",
+  "end": "2026-09",
+  "fields": [
+   "Mkt-RF",
+   "SMB",
+   "HML",
+   "RMW",
+   "CMA",
+   "RF",
+   "Mom",
+   "ST_Rev",
+   "LT_Rev",
+   "industry/portfolio returns"
+  ],
+  "adjusted": "n/a",
+  "notes": "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/<name>.zip. Percent returns. Files contain multiple sub-tables (value-weighted, equal-weighted, annual) separated by text lines; -99.99/-999 = missing. RF is 1-month T-bill."
+ },
+ "yfinance_daily": {
+  "path": "yfinance/daily/",
+  "kind": "daily_ohlcv",
+  "symbols": {
+   "AGG": "2003-09-29..2026-10-27 (5807)",
+   "BIL": "2007-05-30..2026-10-27 (4885)",
+   "DIA": "1998-01-20..2026-10-27 (7238)",
+   "EEM": "2003-04-14..2026-10-27 (5923)",
+   "EFA": "2001-08-27..2026-10-27 (6329)",
+   "GLD": "2004-11-18..2026-10-27 (5519)",
+   "HYG": "2007-04-11..2026-10-27 (4919)",
+   "IDX_GSPC": "1927-12-30..2026-10-27 (24823)",
+   "IDX_IRX": "1960-01-04..2026-10-27 (16690)",
+   "IDX_VIX": "1990-01-02..2026-10-27 (9275)",
+   "IDX_VIX3M": "2006-07-17..2026-10-27 (5103)",
+   "IDX_VIX9D": "2011-01-04..2026-10-27 (3977)",
+   "IEF": "2002-07-30..2026-10-27 (6101)",
+   "IWM": "2000-05-26..2026-10-27 (6644)",
+   "LQD": "2002-07-30..2026-10-27 (6101)",
+   "QLD": "2006-06-21..2026-10-27 (5120)",
+   "QQQ": "1999-03-10..2026-10-27 (6952)",
+   "RSP": "2003-05-01..2026-10-27 (5911)",
+   "SDS": "2006-07-13..2026-10-27 (5105)",
+   "SH": "2006-06-21..2026-10-27 (5120)",
+   "SHV": "2007-01-11..2026-10-27 (4980)",
+   "SHY": "2002-07-30..2026-10-27 (6101)",
+   "SPY": "1993-01-29..2026-10-27 (8494)",
+   "SSO": "2006-06-21..2026-10-27 (5120)",
+   "TLT": "2002-07-30..2026-10-27 (6101)",
+   "TQQQ": "2010-02-11..2026-10-27 (4203)",
+   "UPRO": "2009-06-25..2026-10-27 (4362)",
+   "VNQ": "2004-09-29..2026-10-27 (5555)",
+   "XLB": "1998-12-22..2026-10-27 (7004)",
+   "XLC": "2018-06-19..2026-10-27 (2101)",
+   "XLE": "1998-12-22..2026-10-27 (7004)",
+   "XLF": "1998-12-22..2026-10-27 (7004)",
+   "XLI": "1998-12-22..2026-10-27 (7004)",
+   "XLK": "1998-12-22..2026-10-27 (7004)",
+   "XLP": "1998-12-22..2026-10-27 (7004)",
+   "XLRE": "2015-10-08..2026-10-27 (2779)",
+   "XLU": "1998-12-22..2026-10-27 (7004)",
+   "XLV": "1998-12-22..2026-10-27 (7004)",
+   "XLY": "1998-12-22..2026-10-27 (7004)"
+  },
+  "start": "1927-12-30",
+  "end": "2026-10-27",
+  "fields": [
+   "Date(tz)",
+   "Open",
+   "High",
+   "Low",
+   "Close",
+   "Adj Close",
+   "Volume",
+   "Dividends",
+   "Stock Splits",
+   "Capital Gains"
+  ],
+  "adjusted": "split-adjusted OHLC (Yahoo always split-adjusts), NOT dividend-adjusted; Adj Close = split+dividend adjusted",
+  "notes": "yfinance 1.7.0, Ticker.history(period=max, auto_adjust=False, actions=True). Raw unadjusted prices must be reconstructed by multiplying by cumulative split factors. Live ETFs only (no delisted). Yahoo ToS: personal use."
+ },
+ "yfinance_intraday_1m": {
+  "path": "yfinance/intraday_1m/",
+  "kind": "intraday",
+  "symbols": {
+   "AAPL_1m_7d_prepost.csv": "2026-10-19 04:00:00-04:00..2026-10-27 19:59:00-04:00 (5669)",
+   "QQQ_1m_7d_prepost.csv": "2026-10-19 04:00:00-04:00..2026-10-27 19:59:00-04:00 (6409)",
+   "SPY_1m_7d_prepost.csv": "2026-10-19 04:00:00-04:00..2026-10-27 19:59:00-04:00 (6262)"
+  },
+  "start": "2026-10-19",
+  "end": "2026-10-27",
+  "fields": [
+   "Datetime(America/New_York)",
+   "Open",
+   "High",
+   "Low",
+   "Close",
+   "Adj Close",
+   "Volume"
+  ],
+  "adjusted": false,
+  "notes": "1-minute bars incl. pre/post (04:00-20:00 ET), last 7 days only (Yahoo keeps ~30 days of 1m). Extended-hours volume often 0/partial."
+ },
+ "yfinance_options_snapshot": {
+  "path": "yfinance/options_snapshot/",
+  "kind": "options",
+  "symbols": [
+   "SPY_2026-10-28_calls_asof2026-10-28.csv",
+   "SPY_2026-10-28_puts_asof2026-10-28.csv",
+   "SPY_2026-10-29_calls_asof2026-10-28.csv",
+   "SPY_2026-10-29_puts_asof2026-10-28.csv"
+  ],
+  "start": "2026-10-28",
+  "end": "2026-10-28",
+  "fields": [
+   "contractSymbol",
+   "lastTradeDate",
+   "strike",
+   "lastPrice",
+   "bid",
+   "ask",
+   "change",
+   "percentChange",
+   "volume",
+   "openInterest",
+   "impliedVolatility",
+   "inTheMoney",
+   "contractSize",
+   "currency"
+  ],
+  "adjusted": "n/a",
+  "notes": "Current snapshot only (no history from Yahoo). Taken outside market hours so bid/ask may be 0/stale."
+ },
+ "qlib_us_1d": {
+  "path": "qlib_us_1d/qlib_data_us_1d_latest.zip",
+  "kind": "daily_ohlcv",
+  "symbols": 8994,
+  "start": "1999-12-31",
+  "end": "2020-11-10",
+  "fields": [
+   "open",
+   "high",
+   "low",
+   "close",
+   "volume",
+   "factor",
+   "change"
+  ],
+  "adjusted": true,
+  "notes": "Microsoft Qlib community US dataset (GitHub release SunsetWolf/qlib_dataset v2, 450MB). Binary .day.bin: float32 little-endian, first value = start index into calendars/day.txt. Prices are adjusted AND normalized (first close=1); raw price = value/factor. Source Yahoo. Instruments: all.txt (8994 incl. ETFs like SPY/QQQ/TQQQ/XLK), sp500.txt (755 rows w/ membership intervals), nasdaq100.txt. Only 178 symbols end before 2020-11-10 -> largely survivorship-biased. Ends 2020-11-10."
+ },
+ "dolthub_post_no_preference": {
+  "path": "dolthub_post_no_preference/",
+  "kind": "events",
+  "symbols": {
+   "earnings__earnings_calendar.csv": "122113 rows 2020-01-22..2026-12-04 cols=['act_symbol', 'date', 'when']",
+   "earnings__eps_history.csv": "169386 rows 2016-07-31..2026-09-30 cols=['act_symbol', 'period_end_date', 'reported', 'estimate']",
+   "rates__us_treasury.csv": "9198 rows 1990-01-02..2026-10-27 cols=['date', '1_month', '2_month', '3_month', '6_month', '1_year']",
+   "stocks__dividend.csv": "502467 rows 1970-01-19..2026-10-23 cols=['act_symbol', 'ex_date', 'amount']",
+   "stocks__split.csv": "4168 rows 2014-03-28..2026-10-23 cols=['act_symbol', 'ex_date', 'to_factor', 'for_factor']",
+   "option_chain (remote)": "2019-02-09..2026-10-27; ~sparse: SPY 2024-01-03 = 104 rows (3 expiries, ~22 strikes); bid/ask/vol/greeks",
+   "ohlcv (remote)": "2011-01-03..2026-10-27 daily OHLCV, all listed symbols",
+   "volatility_history (remote)": "IV/HV current, week/month ago, 52w hi/lo per symbol per day",
+   "eps_estimate/income_statement/balance_sheet*/cash_flow (remote)": "Zacks-style estimates 2017-10-26.., statements"
+  },
+  "start": "1970-01-19",
+  "end": "2026-12-04",
+  "fields": [
+   "see per-table"
+  ],
+  "adjusted": "unknown (ohlcv appears unadjusted daily; dividends/splits separate)",
+  "notes": "DoltHub SQL API https://www.dolthub.com/api/v1alpha1/post-no-preference/{options|earnings|stocks|rates}/master?q=SQL (max 1000 rows/query, ~20-60s timeout; aggregates on big tables time out -> filter on PK date first). Whole-table CSV: https://www.dolthub.com/csv/post-no-preference/<repo>/master/<table> (works for small tables; stocks.symbol timed out 504). For bulk use `dolt clone post-no-preference/<repo>`. earnings_calendar.when: After market close 50,915 / Before market open 39,487 / NULL 31,711."
+ },
+ "hf_ziplime_earnings_calendar": {
+  "path": "hf_ziplime_earnings_calendar/",
+  "kind": "events",
+  "symbols": 12657,
+  "start": "2003-04-25",
+  "end": "2026-10-23",
+  "fields": [
+   "cik",
+   "accession_number",
+   "form",
+   "ticker",
+   "ticker_confidence",
+   "announced_at",
+   "knowledge_date",
+   "announced_date_et",
+   "session",
+   "first_tradeable_session",
+   "period_end",
+   "quarters",
+   "fiscal_year",
+   "fiscal_period",
+   "eps_basic",
+   "eps_diluted",
+   "revenue",
+   "net_income",
+   "currency",
+   "eps_quality",
+   "eps_diluted_year_ago",
+   "eps_yoy_change",
+   "revenue_year_ago",
+   "revenue_yoy_change",
+   "sue",
+   "sue_periods",
+   "revenue_sue",
+   "statement_accession",
+   "statement_accepted_at",
+   "days_announcement_to_statement",
+   "figures_source",
+   "inserted_at"
+  ],
+  "adjusted": "n/a",
+  "notes": "HF dataset ZipLime/earnings-calendar (Apache-2.0) rev f8d9be6. 8-K Item 2.02 earnings releases with EDGAR acceptance time from SGML header (ET), session pre_market/market_hours/after_close, first_tradeable_session (NYSE calendar), EPS/revenue from XBRL, SUE. events/ = all 8-K items (4.38M rows, 1993-2026). Card warns EDGAR submissions JSON acceptanceDateTime \"Z\" is actually Eastern for a large share of pre-2021 filings."
+ },
+ "sec_edgar": {
+  "path": "sec_edgar/",
+  "kind": "fundamentals",
+  "symbols": [
+   "AAPL",
+   "MSFT (submissions)",
+   "frames EPSDiluted CY2023Q4"
+  ],
+  "start": "1994-01-26",
+  "end": "2026-07-31",
+  "fields": [
+   "submissions: filings.recent{accessionNumber,filingDate,reportDate,acceptanceDateTime,form,items,...}",
+   "companyfacts: facts.{taxonomy}.{tag}.units[{start,end,val,accn,fy,fp,form,filed,frame}]"
+  ],
+  "adjusted": "n/a",
+  "notes": "data.sec.gov works with UA \"atlasbt-research/0.1\" (no email). www.sec.gov (company_tickers.json, Archives full-index) returned 403 without a contact email in UA - SEC policy requires \"Name email\" UA; DATA agent should use a declared UA (confirm email with the user). Rate limit 10 req/s. 8-K Item 2.02 rows carry acceptanceDateTime (see ZipLime caveat on time zone)."
+ },
+ "us_treasury": {
+  "path": "us_treasury/",
+  "kind": "rates",
+  "symbols": {
+   "daily_treasury_bill_rates_2024.csv": "2024-01-02..2024-12-31",
+   "daily_treasury_yield_curve_2026.csv": "2026-01-02..2026-10-27",
+   "daily_treasury_bill_rates_2025.csv": "2025-01-02..2025-12-31",
+   "bill_rates_csv_2002.csv": "2002-01-02..2002-12-31",
+   "daily_treasury_bill_rates_2026.csv": "2026-01-02..2026-10-27",
+   "daily_treasury_yield_curve_2025.csv": "2025-01-02..2025-12-31",
+   "daily_treasury_yield_curve_2024.csv": "2024-01-02..2024-12-31",
+   "yield_curve_xml_1990.xml": "1990 (XML feed)"
+  },
+  "start": "1990-01-02",
+  "end": "2026-10-27",
+  "fields": [
+   "Date",
+   "1 Mo..30 Yr (par CMT yields)",
+   "bill rates: bank discount + coupon equivalent for 4/8/13/17/26/52 wk"
+  ],
+  "adjusted": "n/a",
+  "notes": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{YEAR}/all?type=daily_treasury_yield_curve|daily_treasury_bill_rates&field_tdr_date_value={YEAR}&_format=csv (one year per call; yield curve since 1990, bill rates since 2002). XML: .../pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value=YYYY."
+ },
+ "nyfed_reference_rates": {
+  "path": "nyfed_reference_rates/",
+  "kind": "rates",
+  "symbols": {
+   "effr_search.csv": "2000-07-03..2026-10-26 (6613)",
+   "tgcr_search.csv": "2018-04-02..2026-10-26 (2140)",
+   "sofr_search.csv": "2018-04-02..2026-10-26 (2140)",
+   "bgcr_search.csv": "2018-04-02..2026-10-26 (2140)",
+   "obfr_search.csv": "2016-03-01..2026-10-26 (2677)"
+  },
+  "start": "2000-07-03",
+  "end": "2026-10-26",
+  "fields": [
+   "Effective Date",
+   "Rate Type",
+   "Rate (%)",
+   "percentiles",
+   "Volume ($Billions)",
+   "Target Rate From/To"
+  ],
+  "adjusted": "n/a",
+  "notes": "https://markets.newyorkfed.org/api/rates/{unsecured/effr|unsecured/obfr|secured/sofr|secured/bgcr|secured/tgcr}/search.csv?startDate=..&endDate=.. Newest first."
+ },
+ "global_q_factors": {
+  "path": "global_q_factors/",
+  "kind": "factors",
+  "symbols": [
+   "R_F",
+   "R_MKT",
+   "R_ME",
+   "R_IA",
+   "R_ROE",
+   "R_EG"
+  ],
+  "start": "1967-01-03",
+  "end": "2025-12-31",
+  "fields": [
+   "date",
+   "R_F",
+   "R_MKT",
+   "R_ME",
+   "R_IA",
+   "R_ROE",
+   "R_EG"
+  ],
+  "adjusted": "n/a",
+  "notes": "Hou-Xue-Zhang q5 factors, daily + monthly (2025 vintage), percent. https://global-q.org/uploads/1/2/2/6/122679606/q5_factors_{daily|monthly}_2025.csv"
+ },
+ "aqr_factors": {
+  "path": "aqr_factors/",
+  "kind": "factors",
+  "symbols": {
+   "Betting-Against-Beta-Equity-Factors-Daily.xlsx": [
+    "BAB Factors",
+    "Definition",
+    "Data Sources",
+    "--> Additional Global Factors",
+    "MKT",
+    "SMB",
+    "HML FF",
+    "HML Devil",
+    "UMD",
+    "RF",
+    "Sources and Definitions",
+    "Disclosures"
+   ],
+   "Century-of-Factor-Premia-Monthly.xlsx": [
+    "Century of Factor Premia",
+    "Definition",
+    "Data Sources",
+    "Disclosures"
+   ],
+   "Quality-Minus-Junk-Factors-Daily.xlsx": [
+    "QMJ Factors",
+    "Definition",
+    "Data Sources",
+    "--> Additional Global Factors",
+    "MKT",
+    "SMB",
+    "HML FF",
+    "HML Devil",
+    "UMD",
+    "RF",
+    "Sources and Definitions",
+    "Disclosures"
+   ],
+   "The-Devil-in-HMLs-Details-Factors-Daily.xlsx": [
+    "HML Devil",
+    "Definition",
+    "Data Sources",
+    "--> Additional Global Factors",
+    "MKT",
+    "SMB",
+    "HML FF",
+    "UMD",
+    "RF",
+    "Sources and Definitions",
+    "Disclosures"
+   ],
+   "Time-Series-Momentum-Factors-Monthly.xlsx": [
+    "TSMOM Factors",
+    "Definitions",
+    "Data Sources",
+    "Disclosures"
+   ]
+  },
+  "start": "1926 (country-dependent)",
+  "end": "2026 (see sheets)",
+  "fields": [
+   "per-sheet: DATE + one column per country incl. USA"
+  ],
+  "adjusted": "n/a",
+  "notes": "AQR data sets (https://www.aqr.com/-/media/AQR/Documents/Insights/Data-Sets/<name>.xlsx). Daily BAB/QMJ/HML-Devil files contain MKT, SMB, HML FF, HML Devil, UMD, BAB/QMJ, RF sheets. AQR terms: research use, attribution."
+ },
+ "wikipedia_sp_index_pages": {
+  "path": "wikipedia/",
+  "kind": "constituents",
+  "symbols": [
+   "S&P 500 current (503)",
+   "S&P 500 changes table (Historical_components_of_the_S&P_500)",
+   "S&P 400",
+   "S&P 600",
+   "Nasdaq-100"
+  ],
+  "start": "1976-07-01",
+  "end": "2026-10-06",
+  "fields": [
+   "Effective Date",
+   "Added_Ticker",
+   "Added_Security",
+   "Removed_Ticker",
+   "Removed_Security",
+   "Reason",
+   "Refs"
+  ],
+  "adjusted": "n/a",
+  "notes": "en.wikipedia.org/w/index.php?title=...&action=render|raw (REST /api/rest_v1 returned 429 for our UA). Changes table rows: 412; coverage is sparse before ~2000. CC BY-SA."
+ },
+ "gh_fja05680_sp500": {
+  "path": "gh_fja05680_sp500/",
+  "kind": "constituents",
+  "symbols": "S&P 500 PIT membership (~1,200 distinct tickers)",
+  "start": "1996-01-02",
+  "end": "2026-08-18",
+  "fields": [
+   "date",
+   "tickers (comma-joined list of members on that date)"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/fja05680/sp500 (MIT). 2720 change dates. \"(Updated)\" file uses current tickers; non-Updated file suffixes delisted tickers with -YYYYMM. Also sp500_ticker_start_end.csv, sp500_changes_since_2019.csv, sp500.csv (current w/ GICS)."
+ },
+ "gh_datasets_finance-vix": {
+  "path": "gh_datasets_finance-vix/data/",
+  "kind": "vol_index",
+  "symbols": {
+   "vix-daily.csv": "9278 rows 1990-01-02..2026-09-22",
+   "vix-monthly.csv": "441 rows 1990-01-31..2026-09-22"
+  },
+  "start": "1990-01-02",
+  "end": "2026-09-22",
+  "fields": [
+   "DATE",
+   "OPEN",
+   "HIGH",
+   "LOW",
+   "CLOSE"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/finance-vix (ODC-PDDL). VIX daily OHLC 1990.. (mirror of Cboe)"
+ },
+ "gh_datasets_s-and-p-500": {
+  "path": "gh_datasets_s-and-p-500/data/",
+  "kind": "other",
+  "symbols": {
+   "data.csv": "1869 rows 1871-01-01..2026-09-01"
+  },
+  "start": "1871-01-01",
+  "end": "2026-09-01",
+  "fields": [
+   "Date",
+   "SP500",
+   "Dividend",
+   "Earnings",
+   "Consumer Price Index",
+   "Long Interest Rate",
+   "Real Price",
+   "Real Dividend",
+   "Real Earnings",
+   "PE10"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/s-and-p-500 (ODC-PDDL). Shiller monthly S&P composite, dividends, earnings, CPI, long rate"
+ },
+ "gh_datasets_bond-yields-us-10y": {
+  "path": "gh_datasets_bond-yields-us-10y/data/",
+  "kind": "rates",
+  "symbols": {
+   "monthly.csv": "881 rows 1953-04-01..2026-08-01"
+  },
+  "start": "1953-04-01",
+  "end": "2026-08-01",
+  "fields": [
+   "Date",
+   "Rate"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/bond-yields-us-10y (ODC-PDDL). 10y Treasury monthly"
+ },
+ "gh_datasets_s-and-p-500-companies": {
+  "path": "gh_datasets_s-and-p-500-companies/data/",
+  "kind": "constituents",
+  "symbols": {
+   "constituents.csv": "503 rows",
+   "sector-counts.csv": "11 rows"
+  },
+  "start": "snapshot",
+  "end": "2026-10",
+  "fields": [
+   "Symbol",
+   "Security",
+   "GICS Sector",
+   "GICS Sub-Industry",
+   "Headquarters Location",
+   "Date added",
+   "CIK",
+   "Founded"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/s-and-p-500-companies (ODC-PDDL). current S&P 500 list w/ GICS sector"
+ },
+ "gh_datasets_s-and-p-500-companies-financials": {
+  "path": "gh_datasets_s-and-p-500-companies-financials/data/",
+  "kind": "fundamentals",
+  "symbols": {
+   "constituents-financials.csv": "503 rows",
+   "constituents.csv": "503 rows",
+   "scatter-data.csv": "442 rows"
+  },
+  "start": "snapshot",
+  "end": "2026-10",
+  "fields": [
+   "Symbol",
+   "Name",
+   "Sector",
+   "Price",
+   "Price/Earnings",
+   "Dividend Yield",
+   "Earnings/Share",
+   "52 Week Low",
+   "52 Week High",
+   "Market Cap",
+   "EBITDA",
+   "Price/Sales",
+   "Price/Book",
+   "SEC Filings"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/s-and-p-500-companies-financials (ODC-PDDL). current snapshot of S&P500 financial ratios"
+ },
+ "gh_datasets_nasdaq-listings": {
+  "path": "gh_datasets_nasdaq-listings/data/",
+  "kind": "other",
+  "symbols": {
+   "nasdaq-listed-symbols.csv": "5640 rows",
+   "nasdaq-listed.csv": "5640 rows"
+  },
+  "start": "snapshot",
+  "end": "2026-10",
+  "fields": [
+   "Symbol",
+   "Company Name",
+   "Security Name",
+   "Market Category",
+   "Test Issue",
+   "Financial Status",
+   "Round Lot Size",
+   "ETF",
+   "NextShares"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/nasdaq-listings (ODC-PDDL). current Nasdaq-listed symbols"
+ },
+ "gh_datasets_nyse-other-listings": {
+  "path": "gh_datasets_nyse-other-listings/data/",
+  "kind": "other",
+  "symbols": {
+   "nyse-listed.csv": "2886 rows",
+   "other-listed.csv": "7641 rows"
+  },
+  "start": "snapshot",
+  "end": "2026-10",
+  "fields": [
+   "ACT Symbol",
+   "Company Name"
+  ],
+  "adjusted": "n/a",
+  "notes": "git clone https://github.com/datasets/nyse-other-listings (ODC-PDDL). current NYSE/other-listed symbols"
+ },
+ "gh_quantconnect_lean_data": {
+  "path": "gh_quantconnect_lean_data/Data/",
+  "kind": "intraday",
+  "symbols": {
+   "equity/usa/daily": "aapl aig bac eem fb goog googl ibm iwm qqq spy uso ... 1998-01-02..2021-03-31 (spy)",
+   "equity/usa/minute/spy": "7 days Oct 2013 trade+quote (04:00-20:00 incl. ext hours)",
+   "equity/usa/tick/spy": "tick trades/quotes Oct 2013",
+   "equity/usa/factor_files + map_files": "~30 symbols",
+   "equity/usa/fundamental/coarse": "11 daily whole-market coarse universe snapshots (2014-03)",
+   "option/usa/minute/spy": "2023-08-03 4 contracts quote+trade",
+   "indexoption/usa/minute/spx": "2021-01-04, 2021-01-14 quote/trade/OI",
+   "option/usa/daily/aapl_2014_quote_american.zip": "AAPL options daily 2014",
+   "index/usa/daily": "SPX daily"
+  },
+  "start": "1998-01-02",
+  "end": "2023-08-03",
+  "fields": [
+   "ms-since-midnight or yyyymmdd HH:MM",
+   "open",
+   "high",
+   "low",
+   "close (x10000 deci-cents for equities)",
+   "volume",
+   "quote files: bid OHLC,bidsize, ask OHLC,asksize"
+  ],
+  "adjusted": "raw prices + separate factor_files (price factor, split factor)",
+  "notes": "Apache-2.0 Lean repo Data/ test fixtures (AlgoSeek/QuantConnect-sourced). Prices integer x10000 for equity daily/minute. Only a few days of intraday; daily ends 2021-03-31."
+ },
+ "dukascopy": {
+  "path": "dukascopy/",
+  "kind": "intraday",
+  "symbols": [
+   "QQQUSUSD/2024-01-16/14h_ticks.bi5",
+   "QQQUSUSD/2024-01-16/15h_ticks.bi5",
+   "QQQUSUSD/2024-01-16/16h_ticks.bi5",
+   "QQQUSUSD/2024-01-16/17h_ticks.bi5",
+   "QQQUSUSD/2024-01-16/18h_ticks.bi5",
+   "QQQUSUSD/2024-01-16/ASK_candles_min_1.bi5",
+   "QQQUSUSD/2024-01-16/BID_candles_min_1.bi5",
+   "SPYUSUSD/2024-01-16/15h_ticks.bi5",
+   "SPYUSUSD/2024-01-16/16h_ticks.bi5",
+   "SPYUSUSD/2024-01-16/17h_ticks.bi5",
+   "SPYUSUSD/2024-01-16/18h_ticks.bi5",
+   "SPYUSUSD/2024-01-16/20h_ticks.bi5",
+   "SPYUSUSD/2024-01-16/ASK_candles_min_1.bi5",
+   "SPYUSUSD/2024-01-16/BID_candles_min_1.bi5",
+   "USA500IDXUSD/2024-01-16/14h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/15h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/16h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/17h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/18h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/19h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/20h_ticks.bi5",
+   "USA500IDXUSD/2024-01-16/ASK_candles_min_1.bi5",
+   "USA500IDXUSD/2024-01-16/BID_candles_min_1.bi5",
+   "instrument_metadata_from_dukascopy-node-1.51.0.csv (666 US stock/ETF/index CFDs w/ first tick dates)"
+  ],
+  "start": "2017-01-26 (US stock/ETF CFD ticks; USA500.IDX from 2012-01-16)",
+  "end": "present",
+  "fields": [
+   "tick bi5: uint32 ms-from-hour, uint32 ask, uint32 bid, float32 askvol, float32 bidvol (big-endian, LZMA)",
+   "candle bi5: uint32 sec-from-day, O, C, L, H (uint32), float32 vol"
+  ],
+  "adjusted": "n/a",
+  "notes": "https://datafeed.dukascopy.com/datafeed/{INSTR}/{YYYY}/{MM-1 zero-based}/{DD}/{HH}h_ticks.bi5 and .../{BID|ASK}_candles_min_1.bi5. Prices /1000 for US stock CFDs (SPY 474.513). These are Dukascopy CFD quotes, NOT exchange NBBO; US stock CFDs quote ~RTH only. Server rate-limits (503) and times out frequently: pace >=2s, retry. 4 of 27 hour files failed in sample."
+ },
+ "iex_hist": {
+  "path": "iex_hist/",
+  "kind": "intraday",
+  "symbols": "all IEX-traded symbols (one day sample)",
+  "start": "2019-12-24",
+  "end": "2019-12-24",
+  "fields": [
+   "pcapng of IEX-TP 1.6 TOPS: QuoteUpdate(Q): ts ns, symbol, bid size/px, ask px/size; TradeReport(T); etc."
+  ],
+  "adjusted": false,
+  "notes": "IEX HIST (free, IEX Exchange terms with attribution). Index: https://iextrading.com/api/1.0/hist (2,498 dates 2016-12-12..2026-10-27; TOPS 1.5/1.6, DEEP since 2017-05-15, DPLS since 2024-10-01). Files on GCS bucket \"iex\" (storage.googleapis.com). Typical recent day 10-16 GB per feed; 2019-12-24 half-day TOPS = 160 MB. IEX-only quotes/trades (not consolidated NBBO). Verified SPY quote 2019-12-24 13:34:55 bid 2000@321.55."
+ },
+ "historicaloptiondata_free_samples": {
+  "path": "historicaloptiondata_free_samples/",
+  "kind": "options",
+  "symbols": 4285,
+  "start": "2019-08-15",
+  "end": "2019-08-15",
+  "fields": [
+   "UnderlyingSymbol",
+   "UnderlyingPrice",
+   "Flags",
+   "OptionSymbol",
+   "Type",
+   "Expiration",
+   "DataDate",
+   "Strike",
+   "Last",
+   "Bid",
+   "Ask",
+   "Volume",
+   "OpenInterest",
+   "T1OpenInterest",
+   "IVMean",
+   "IVBid",
+   "IVAsk",
+   "Delta",
+   "Gamma",
+   "Theta",
+   "Vega",
+   "AKA"
+  ],
+  "adjusted": "n/a",
+  "notes": "Delta Neutral / historicaloptiondata.com free sample (Dropbox links on /free-data/): full US option market EOD for one day (928674 contracts) + optionstats (IV30..IV360, OI, vol) + stockquotes; stockhistory_sample.zip (2019 EOD stock, dividends, splits). SPX/SPXW Dec-2023 CSV samples were not downloadable (Dropbox served HTML)."
+ },
+ "hf_samples": {
+  "path": "hf_samples/",
+  "kind": "intraday",
+  "symbols": {
+   "jwigginton_timeseries-1mn-sp500": "503 S&P500 symbols 1-min RTH 2024-02-26 09:30..2024-03-11 16:00 (no license stated)",
+   "fabhaus_equities_5m_options/2024-01.jsonl": "5-min OHLCV/VWAP bars of US equity options (OCC symbols), Jan 2024 full month shard; dataset 2024-01..2026-03, 60 GB, license other",
+   "fabhaus_equities_5m_stockprices/2024-01.jsonl.first4MB": "TRUNCATED first 4MB of 15.6GB Jan-2024 shard; 5-min bars ~13.3k tickers + indicators/fundamentals; dataset 478 GB",
+   "papylove_alpaca-options-data/minute/2025-08-06.parquet": "despite name: 1-min STOCK bars for 10 symbols (AAPL..TSLA) + engineered features",
+   "thillsss_SPX-MES-VIX-data/SPX_full_1min_CT.txt.first2MB": "TRUNCATED; SPX index 1-min from 2008-01-02 (Central Time), no license",
+   "Pinxitu_SP500_5m/market_data.csv.first2MB": "TRUNCATED; actually ES futures 5-min (market=ES) 2014.., unlicense",
+   "gauss314_options-IV-SP500/data_IV_USA.csv.first2MB": "TRUNCATED; daily per-symbol IV buckets (DITM..DOTM), OI, HV, VIX for S&P500 names from 2019-10-14, apache-2.0",
+   "CodyJiang_nvda-option-chains/nvda_2020_2022.csv.first2MB": "TRUNCATED; NVDA EOD chains 2020-2022 in OptionsDX format (likely redistributed vendor data - license unclear)",
+   "vtasca_fomc-statements-minutes/communications.csv": "FOMC statements+minutes text with Date/Release Date/Type, incl. scheduled future meetings to 2027 (CC)"
+  },
+  "start": "2008-01-02",
+  "end": "2027-12-08",
+  "fields": [
+   "varies"
+  ],
+  "adjusted": "varies",
+  "notes": "HuggingFace datasets via https://huggingface.co/datasets/<id>/resolve/main/<file>. Truncated files are byte-range samples (last line may be partial)."
+ },
+ "federalreserve_fomc": {
+  "path": "federalreserve_fomc/",
+  "kind": "events",
+  "symbols": "FOMC meetings 1994-2026+",
+  "start": "1994",
+  "end": "2026",
+  "fields": [
+   "HTML calendars"
+  ],
+  "adjusted": "n/a",
+  "notes": "federalreserve.gov fomccalendars.htm (2021+ incl. statement links monetaryYYYYMMDDa.htm), fomchistorical{1994..2020}.htm, press_monetary.xml RSS; statement pages give release time (\"For release at 2:00 p.m. EST\" since 2013; pre-2013 typically 2:15 p.m.; older boarddocs pages list only Release Date). Needs HTML parsing."
+ },
+ "nasdaqtrader": {
+  "path": "nasdaqtrader/",
+  "kind": "other",
+  "symbols": [
+   "nasdaqlisted.txt",
+   "otherlisted.txt",
+   "trade halts RSS current + by date"
+  ],
+  "start": "2010-01-04 (halts by date; sparse early)",
+  "end": "2026-10-28",
+  "fields": [
+   "Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares",
+   "halts RSS: HaltDate, HaltTime, IssueSymbol, Market, ReasonCode, ResumptionDate/Quote/TradeTime"
+  ],
+  "adjusted": "n/a",
+  "notes": "Current symbol directory (pipe-delimited, footer \"File Creation Time\"). Halts: https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts&haltdate=MMDDYYYY (2020-03-09: 905 halts; 2010-01-04: 1 item). Nasdaq-listed + other halts reported by Nasdaq."
+ },
+ "eodhd_demo": {
+  "path": "eodhd_demo/",
+  "kind": "daily_ohlcv",
+  "symbols": [
+   "AAPL.US"
+  ],
+  "start": "1980-12-12",
+  "end": "2026-10-27",
+  "fields": [
+   "date",
+   "open",
+   "high",
+   "low",
+   "close (raw)",
+   "adjusted_close",
+   "volume"
+  ],
+  "adjusted": "raw OHLC + adjusted_close",
+  "notes": "EODHD public demo key works only for a few tickers (AAPL.US ok; SPY.US 403; options 403). Also splits, dividends (declaration/record/payment dates), 1m intraday, fundamentals JSON, earnings calendar with before_after_market. Demo terms: evaluation only."
+ },
+ "twelvedata_demo": {
+  "path": "twelvedata_demo/",
+  "kind": "intraday",
+  "symbols": [
+   "AAPL"
+  ],
+  "start": "last ~5000 minutes",
+  "end": "2026-10-27",
+  "fields": [
+   "datetime",
+   "open",
+   "high",
+   "low",
+   "close",
+   "volume"
+  ],
+  "adjusted": false,
+  "notes": "demo key: AAPL only (SPY -> 401). Evaluation only."
+ },
+ "nasdaq_api": {
+  "path": "nasdaq_api/",
+  "kind": "events",
+  "symbols": [
+   "earnings calendar 2024-01-25 (117 rows)",
+   "SPY historical 10y"
+  ],
+  "start": "2016-10-27",
+  "end": "2026-10-27",
+  "fields": [
+   "earnings: time(pre-market/after-hours/not-supplied), symbol, eps, surprise, epsForecast, noOfEsts, fiscalQuarterEnding",
+   "historical: date, close, volume, open, high, low"
+  ],
+  "adjusted": "unknown",
+  "notes": "api.nasdaq.com (flaky earlier; worked on retry). Historical capped ~10y (2513 rows). Nasdaq website ToS restrict automated/commercial use - check before bulk use."
+ },
+ "hilpisch_eikon_eod": {
+  "path": "hilpisch_eikon_eod/tr_eikon_eod_data.csv",
+  "kind": "daily_ohlcv",
+  "symbols": [
+   "AAPL.O",
+   "MSFT.O",
+   "INTC.O",
+   "AMZN.O",
+   "GS.N",
+   "SPY",
+   ".SPX",
+   ".VIX",
+   "EUR=",
+   "XAU=",
+   "GDX",
+   "GLD"
+  ],
+  "start": "2010-01-01",
+  "end": "2018-06-29",
+  "fields": [
+   "Date",
+   "close per symbol"
+  ],
+  "adjusted": "unknown",
+  "notes": "Close-only textbook dataset (Hilpisch, Python for Finance). Small cross-check source."
+ },
+ "shiller": {
+  "path": "shiller/ie_data.xls",
+  "kind": "other",
+  "symbols": "S&P composite",
+  "start": "1871-01",
+  "end": "2026",
+  "fields": [
+   "Date",
+   "P",
+   "D",
+   "E",
+   "CPI",
+   "GS10",
+   "CAPE",
+   "..."
+  ],
+  "adjusted": "n/a",
+  "notes": "Robert Shiller online data (shillerdata.com via img1.wsimg.com)."
+ },
+ "damodaran": {
+  "path": "damodaran/histretSP.xls",
+  "kind": "other",
+  "symbols": "S&P500/T-bill/T-bond annual returns",
+  "start": "1928",
+  "end": "2025",
+  "fields": [
+   "annual returns"
+  ],
+  "adjusted": "n/a",
+  "notes": "Damodaran annual historical returns."
+ },
+ "gh_cran_PCRA": {
+  "path": "gh_cran_PCRA/data/",
+  "kind": "vol_index",
+  "symbols": [
+   "CboeOptionStrategies (monthly BXM,PUT,... 1986-06..2021-12)",
+   "FRBinterestRates"
+  ],
+  "start": "1986-06-30",
+  "end": "2021-12-31",
+  "fields": [
+   "Date",
+   "BXM",
+   "BXMD",
+   "BXY",
+   "PUT",
+   "CLL",
+   "BFLY",
+   "CLLZ",
+   "CMBO",
+   "CNDR",
+   "PPUT",
+   "SPTR",
+   "SPX",
+   "VIX",
+   "VXO",
+   "GS3M"
+  ],
+  "adjusted": "n/a",
+  "notes": "CRAN PCRA .rda. CRSP/SPGMI-derived files (stocksCRSPmonthly, factorsSPGMI, crsp.returns8) were deliberately NOT kept: their docs forbid redistribution/derivative use."
+ },
+ "gh_cran_qrmdata": {
+  "path": "gh_cran_qrmdata/data/",
+  "kind": "daily_ohlcv",
+  "symbols": [
+   "SP500_const (505 then-current S&P500 stocks, adjusted close)",
+   "SP500",
+   "VIX",
+   "ZCB_USD (US zero-coupon yields 1-30y)",
+   "DJ_const"
+  ],
+  "start": "~1995 (see package docs)",
+  "end": "2015-12-31",
+  "fields": [
+   "xts objects; pyreadr drops the date index - read with R"
+  ],
+  "adjusted": true,
+  "notes": "CRAN qrmdata (GPL). Survivorship-biased (constituents as of 2016). ZCB_USD = Gurkaynak-Sack-Wright-type zero curve."
+ },
+ "gh_JerBouma_FinanceDatabase": {
+  "path": "gh_JerBouma_FinanceDatabase/database/equities/",
+  "kind": "other",
+  "symbols": "US exchanges NYQ/NMS/NGM/NCM/ASE/PCX/BTS",
+  "start": "snapshot",
+  "end": "2026-10",
+  "fields": [
+   "symbol",
+   "name",
+   "summary",
+   "currency",
+   "sector",
+   "industry_group",
+   "industry",
+   "exchange",
+   "mic",
+   "market",
+   "country",
+   "...",
+   "isin",
+   "cusip",
+   "figi",
+   "composite_figi",
+   "delisted"
+  ],
+  "adjusted": "n/a",
+  "notes": "MIT. Current-snapshot GICS-like sector/industry classification incl. delisted flag; not point-in-time."
+ },
+ "gh_matplotlib_mplfinance_sampledata": {
+  "path": "gh_matplotlib_mplfinance_sampledata/examples/data/",
+  "kind": "intraday",
+  "symbols": [
+   "SP500 index 1-min Nov-2019 (5 days)",
+   "SPY daily 2008-2018"
+  ],
+  "start": "2008-01-02",
+  "end": "2019-11-08",
+  "fields": [
+   "Date",
+   "Open",
+   "Close",
+   "High",
+   "Low",
+   "Volume"
+  ],
+  "adjusted": "unknown",
+  "notes": "BSD; tiny sample files."
+ }
+}

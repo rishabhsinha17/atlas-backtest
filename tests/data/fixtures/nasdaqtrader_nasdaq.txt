@@ -1,0 +1,28 @@
+Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares
+AAAP|Pacer Barings CLO Market Flex ETF|G|N|N|100|Y|N
+AACG|ATA Creativity Global - American Depositary Shares, each representing two common shares|S|N|D|100|N|N
+AACI|Armada Acquisition Corp. III - Class A Ordinary Share|G|N|N|100|N|N
+AACIU|Armada Acquisition Corp. III - Units|G|N|N|100|N|N
+AACIW|Armada Acquisition Corp. III - Warrant|G|N|N|100|N|N
+AACO|Abony Acquisition Corp. I - Class A Ordinary Share|G|N|N|100|N|N
+AACOU|Abony Acquisition Corp. I - Units|G|N|N|100|N|N
+AACOW|Abony Acquisition Corp. I - Warrants|G|N|N|100|N|N
+AACP|Apogee Acquisition Corp - Class A Ordinary Shares|G|N|N|100|N|N
+AACPR|Apogee Acquisition Corp - Rights|G|N|N|100|N|N
+AACPU|Apogee Acquisition Corp - Units|G|N|N|100|N|N
+AACPW|Apogee Acquisition Corp - Warrant|G|N|N|100|N|N
+AADR|AdvisorShares Dorsey Wright ADR ETF|G|N|N|100|Y|N
+AAEQ|Alpha Architect US Equity 2 ETF|G|N|N|100|Y|N
+AAL|American Airlines Group, Inc. - Common Stock|Q|N|N|100|N|N
+AALG|Leverage Shares 2X Long AAL Daily ETF|G|N|N|100|Y|N
+AAME|Atlantic American Corporation - Common Stock|G|N|E|100|N|N
+AAOI|Applied Optoelectronics, Inc. - Common Stock|G|N|N|100|N|N
+AAON|AAON, Inc. - Common Stock|Q|N|N|100|N|N
+AAPB|GraniteShares 2x Long AAPL Daily ETF|G|N|N|100|Y|N
+AAPD|Direxion Daily AAPL Bear 1X ETF|G|N|N|100|Y|N
+AAPG|Ascentage Pharma Group International - American Depository Shares|G|N|N|100|N|N
+AAPL|Apple Inc. - Common Stock|Q|N|N|40|N|N
+AAPU|Direxion Daily AAPL Bull 2X ETF|G|N|N|100|Y|N
+AAPL|Apple Inc. - Common Stock|Q|N|N|40|N|N
+QQQ|Invesco QQQ Trust, Series 1|G|N|N|40|Y|N
+File Creation Time: 1028202603:02|||||||
