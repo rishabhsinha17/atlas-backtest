@@ -56,9 +56,12 @@ def baseline_activity(opts, sid: str, plan_row: dict) -> dict:
     return st
 
 
-def audit_rows(opts, ids=None, allow_stock: bool = False) -> list[dict]:
+def audit_rows(opts, ids=None, allow_stock: bool = False, variants: bool = True) -> list[dict]:
+    """``ids=None``: every registered strategy plus (``variants=True``) every registered proxy variant
+    (run/variants.py), audited by the same rules on its own baseline (runs/<SID@tag>/)."""
     from atlasbt.strategies import registry as R
 
+    from . import variants as V
     from .activity import declared_note_for
     from .holds import held, is_stale
     from .plan import load_plan
@@ -66,10 +69,11 @@ def audit_rows(opts, ids=None, allow_stock: bool = False) -> list[dict]:
     plan = load_plan(Path(opts.results_dir))
     rows = {r["id"]: r for r in plan.to_dict("records")} if len(plan) else {}
     out = []
-    for sid in ids or R.all_ids():
+    for sid in ids or (list(R.all_ids()) + (V.variant_ids() if variants else [])):
         pr = rows.get(sid, {})
         note = declared_note_for(sid)
-        rec = {"id": sid, "family": pr.get("family", ""), "bar_freq": pr.get("bar_freq", ""), "declared_note": note}
+        rec = {"id": sid, "variant_of": V.base_of(sid) if V.is_variant(sid) else "", "family": pr.get("family", ""),
+               "bar_freq": pr.get("bar_freq", ""), "declared_note": note}
         h = held(sid, allow_stock)
         if pr.get("testable") == "N":
             rec.update(verdict="PASS", status="NOT_TESTABLE (plan)", detail=pr.get("reason", ""))
@@ -118,7 +122,8 @@ def audit_rows(opts, ids=None, allow_stock: bool = False) -> list[dict]:
     return out
 
 
-def run_audit(opts, ids=None, live: bool = False, allow_stock: bool = False, log=print) -> list[str]:
+def run_audit(opts, ids=None, live: bool = False, allow_stock: bool = False, log=print,
+              variants: bool = True) -> list[str]:
     from .holds import held
     from .plan import annotate_plan, load_plan, make_plan, write_plan
     from .scheduler import Scheduler
@@ -126,17 +131,17 @@ def run_audit(opts, ids=None, live: bool = False, allow_stock: bool = False, log
     res_dir = Path(opts.results_dir)
     plan = load_plan(res_dir)
     if not len(plan):
-        write_plan(make_plan(None, res_dir, log=log), res_dir)
+        write_plan(make_plan(None, res_dir, log=log, variants=variants), res_dir)
         plan = load_plan(res_dir)
     if live:
         rows = {r["id"]: r for r in plan.to_dict("records")}
         todo = [s for s in (ids or list(rows)) if rows.get(s, {}).get("testable") == "Y" and not held(s, allow_stock)
-                and not P.baseline_status(opts, s)]
+                and not P.baseline_status(opts, s) and (variants or not rows.get(s, {}).get("variant_of"))]
         if todo:
             opts.extra["baseline_only"] = True
             log(f"audit: running {len(todo)} missing baselines")
             Scheduler(rows, opts, log=log).run(todo)
-    recs = audit_rows(opts, ids, allow_stock)
+    recs = audit_rows(opts, ids, allow_stock, variants)
     annotate_plan(res_dir, allow_stock)
     write_json(res_dir / "audit.json", recs)
     _write_md(res_dir / "AUDIT.md", recs)
@@ -162,7 +167,8 @@ def _write_md(path: Path, recs: list[dict]) -> None:
             continue
         L += [f"## {verdict} ({len(sub)})", "", "| Strategy | Family | Freq | Status | Detail |", "|---|---|---|---|---|"]
         for r in sub:
-            L.append(f"| {r['id']} | {str(r.get('family', ''))[:26]} | {r.get('bar_freq', '')} | {r.get('status', '')} | "
+            vtag = f" (PROXY VARIANT of {r['variant_of']}, T2)" if r.get("variant_of") else ""
+            L.append(f"| {r['id']}{vtag} | {str(r.get('family', ''))[:26]} | {r.get('bar_freq', '')} | {r.get('status', '')} | "
                      f"{str(r.get('detail', '')).replace('|', '/')[:400]}"
                      + (f" (declared: {r['declared_note']})" if r.get("declared_note") else "") + " |")
         L.append("")

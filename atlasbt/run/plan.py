@@ -246,27 +246,53 @@ def _fid_name(f) -> str:
 
 
 def plan_strategy(sid: str, pc: PlanContext) -> dict:
+    """Plan one sheet strategy or one proxy variant (``<SID>@<tag>``, run/variants.py). A variant is
+    instantiated with its proxy params, so its requirements, bar frequency and window are the proxy's;
+    its row carries ``variant_of`` and an expected fidelity of at least T2_PROXY."""
     from atlasbt.strategies import registry as R
 
-    row = {"id": sid, "family": "", "module": "", "bar_freq": "", "sizing": "", "testable": "N", "reason": "",
-           "start": "", "end": "", "n_sessions": 0, "expected_fidelity": "", "fidelity_notes": "",
+    from . import variants as V
+
+    row = {"id": sid, "variant_of": "", "family": "", "module": "", "bar_freq": "", "sizing": "", "testable": "N",
+           "reason": "", "start": "", "end": "", "n_sessions": 0, "expected_fidelity": "", "fidelity_notes": "",
            "n_grid": 0, "universe": "", "n_symbols": 0, "binding_constraint": "",
            "est_runtime_min_baseline": np.nan, "est_runtime_min_grid": np.nan}
+    var = V.get(sid) if V.is_variant(sid) else None
+    if V.is_variant(sid) and var is None:
+        row["reason"] = f"unknown proxy variant (registered: {', '.join(V.variant_ids())})"
+        return row
+    if var is not None:
+        row["variant_of"] = var.base
     try:
-        cls = R.get(sid)
+        cls = V.strategy_class(sid)
     except KeyError:
         errs = R.load_all()
         row["reason"] = f"strategy module not loaded: {errs or 'not registered'}"
         return row
     row["module"] = cls.__module__.split(".")[-1]
-    row["family"] = _family(sid)
+    row["family"] = _family(V.base_of(sid))
     try:
-        inst = cls()
+        inst = V.instantiate(sid) if var is not None else cls()
     except Exception as e:
         row["reason"] = f"strategy instantiation failed: {type(e).__name__}: {e}"
         return row
     freq = str(inst.bar_freq)
-    row.update(bar_freq=freq, sizing=str(inst.sizing or ""), n_grid=len(R.expand_grid(cls.grid)))
+    row.update(bar_freq=freq, sizing=str(inst.sizing or ""), n_grid=len(V.expand_grid(sid)))
+    if var is not None:
+        row["fidelity_notes"] = f"PROXY VARIANT of {var.base} {var.params}: {var.reason}"
+    out = _plan_instance(sid, inst, freq, pc, row)
+    if var is not None and out.get("testable") == "Y":
+        fid = out.get("expected_fidelity") or "T0_QUOTE"
+        try:
+            if Fidelity[fid] < Fidelity.T2_PROXY:
+                out["expected_fidelity"] = Fidelity.T2_PROXY.name
+        except KeyError:
+            pass
+    return out
+
+
+def _plan_instance(sid: str, inst, freq: str, pc: PlanContext, row: dict) -> dict:
+    var_note = row.get("fidelity_notes", "")
     intraday = is_intraday(freq)
     universe = [s.upper() for s in (getattr(inst, "universe", None) or [])]
     uname = getattr(inst, "universe_name", None)
@@ -474,7 +500,8 @@ def plan_strategy(sid: str, pc: PlanContext) -> dict:
     syms_n = len(resolve_members()[0]) if (uname or universe) else 1
     row.update(start=str(pd.Timestamp(d0).date()), end=str(pd.Timestamp(d1).date()), n_sessions=n,
                binding_constraint=why, n_symbols=syms_n,
-               expected_fidelity=_fid_name(worst), fidelity_notes="; ".join(dict.fromkeys(notes)))
+               expected_fidelity=_fid_name(worst),
+               fidelity_notes="; ".join(dict.fromkeys(filter(None, [var_note] + notes))))
     if uname and uname.upper().startswith("SP500"):
         row["fidelity_notes"] = "; ".join(filter(None, [row["fidelity_notes"],
                                                         "PIT S&P 500 universe; sectors not PIT (DATA.md §8)"]))
@@ -522,14 +549,16 @@ def all_sheet_ids() -> list[str]:
 
 
 def make_plan(ids=None, results_dir: Path = DEFAULT_RESULTS, portal=None, log=print,
-              min_coverage: float = 0.95) -> pd.DataFrame:
+              min_coverage: float = 0.95, variants: bool = True) -> pd.DataFrame:
     """min_coverage: PIT stock-universe price coverage required at the window start (1.0 = engine-strict;
-    the default 0.95 matches the runner's --universe-coverage filter mode)."""
+    the default 0.95 matches the runner's --universe-coverage filter mode). ``ids=None`` plans all 172
+    sheet ids plus (``variants=True``) every registered proxy variant; explicit ids may name variants."""
+    from . import variants as V
     from .fastportal import FastPortal
 
     portal = portal or FastPortal()
     pc = PlanContext(portal, results_dir, min_coverage)
-    ids = ids or all_sheet_ids()
+    ids = ids or (all_sheet_ids() + (V.variant_ids() if variants else []))
     rows = []
     for sid in ids:
         try:
@@ -549,7 +578,7 @@ def make_plan(ids=None, results_dir: Path = DEFAULT_RESULTS, portal=None, log=pr
 def write_plan(df: pd.DataFrame, results_dir: Path = DEFAULT_RESULTS) -> Path:
     out = Path(results_dir) / "plan.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
-    cols = ["id", "family", "module", "bar_freq", "sizing", "testable", "reason", "start", "end", "n_sessions",
+    cols = ["id", "variant_of", "family", "module", "bar_freq", "sizing", "testable", "reason", "start", "end", "n_sessions",
             "expected_fidelity", "fidelity_notes", "n_grid", "est_runtime_min_baseline", "est_runtime_min_grid",
             "universe", "n_symbols", "binding_constraint"]
     df = df.copy()

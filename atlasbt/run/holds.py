@@ -50,11 +50,11 @@ def etf_set() -> frozenset:
 
 def stock_symbols(sid: str) -> list[str]:
     """Non-ETF, non-index symbols (or stock universe names) the strategy trades at baseline params."""
-    from atlasbt.strategies import registry as R
+    from .variants import default_params, strategy_class
 
-    cls = R.get(sid)
+    cls = strategy_class(sid)                       # proxy variants (S031@proxy) -> base class, variant params
     try:
-        inst = cls()
+        inst = cls(**default_params(sid))
     except Exception:
         inst = cls
     out = []

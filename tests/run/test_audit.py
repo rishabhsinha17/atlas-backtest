@@ -7,9 +7,10 @@ import pytest
 from atlasbt.run.audit import audit_rows
 from atlasbt.run.common import DEFAULT_RESULTS
 from atlasbt.run.pipeline import RunOptions
+from atlasbt.run.variants import variant_ids
 from atlasbt.strategies import registry as Reg
 
-IDS = Reg.all_ids()
+IDS = Reg.all_ids() + variant_ids()          # proxy variants (S031@proxy ...) are gated the same way
 ROWS = None
 
 

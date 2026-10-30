@@ -203,8 +203,8 @@ def diagnose(result, log_path: str = "") -> dict:
 
 def declared_note_for(sid: str) -> str:
     try:
-        from atlasbt.strategies import registry as R
+        from .variants import strategy_class
 
-        return str(getattr(R.get(sid), "activity_note", "") or "")
+        return str(getattr(strategy_class(sid), "activity_note", "") or "")
     except Exception:
         return ""

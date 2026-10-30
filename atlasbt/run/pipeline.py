@@ -129,10 +129,10 @@ def _spread_model(opts) -> str:
 
 
 def strategy_params(sid: str, combo: Optional[dict] = None) -> dict:
-    from atlasbt.strategies import registry as R
+    """Sheet params (proxy variants: the base sheet params overlaid with the variant's proxy params)."""
+    from .variants import default_params
 
-    cls = R.get(sid)
-    p = dict(cls.params)
+    p = default_params(sid)
     if combo:
         p.update(combo)
     return p
@@ -161,16 +161,32 @@ def _prune_diagnostics(diag: dict) -> dict:
 
 def run_engine(sid: str, params: dict, start: str, end: str, opts: RunOptions, portal=None, **cfg_over):
     from atlasbt.engine import Backtester
-    from atlasbt.strategies import registry as R
 
     from .fastportal import CoverageFilteredPortal, FastPortal
+    from .variants import is_variant, strategy_class
 
     portal = portal or (CoverageFilteredPortal() if opts.universe_coverage == "filter" else FastPortal())
     # engine mode: FastPortal + BacktestConfig.min_universe_coverage (make_config)
-    cls = R.get(sid)
+    cls = strategy_class(sid)                  # proxy variants run the BASE class with the variant params
     strat = cls(**params)
     bt = Backtester(strat, portal, make_config(opts, **cfg_over))
-    return bt.run(start, end), strat, portal
+    res = bt.run(start, end)
+    if is_variant(sid):
+        _label_variant(res, sid)
+    return res, strat, portal
+
+
+def _label_variant(res, sid: str) -> None:
+    """A proxy variant's result carries the variant id (reports/<SID@tag>/, leaderboard rows) and the
+    variant record in meta, so it can never be mistaken for the faithful strategy."""
+    from .variants import info
+
+    res.strategy_id = sid
+    try:
+        res.meta = dict(res.meta or {})
+        res.meta["variant"] = info(sid)
+    except Exception:  # pragma: no cover
+        pass
 
 
 def _metrics_quick(returns: pd.Series) -> dict:
@@ -230,7 +246,8 @@ def task_baseline(sid: str, plan_row: dict, opts: RunOptions) -> dict:
     if cs is not None and len(cs):
         cs.to_csv(d / "baseline" / "universe_coverage.csv", index=False)
     write_json(d / "config.json", {
-        "strategy_id": sid, "params": params, "grid": strat.grid, "window": [start, end], "seed": seed,
+        "strategy_id": sid, "variant": _variant_info(sid), "params": params, "grid": strat.grid,
+        "window": [start, end], "seed": seed,
         "plan": plan_row, "options": opts.to_dict(), "engine_config": res.meta.get("config"),
         "spread_model": _spread_model(opts),
         "deviations": list(getattr(strat, "deviations", []) or []), "provenance": environment_info(),
@@ -240,7 +257,7 @@ def task_baseline(sid: str, plan_row: dict, opts: RunOptions) -> dict:
     if len(res.equity):
         pd.DataFrame({"nav": res.equity, "ret": res.returns}).to_csv(d / "baseline" / "equity.csv")
     st = {"status": status, "runtime_sec": t.sec, "reason": res.not_testable_reason,
-          "activity": act.get("activity"), "activity_detail": act, "universe_coverage": ucov,
+          "variant": _variant_info(sid), "activity": act.get("activity"), "activity_detail": act, "universe_coverage": ucov,
           "spread_model": _spread_model(opts), "code_sha_at_launch": opts.extra.get("code_sha_at_launch"),
           "traceback": res.diagnostics.get("traceback", ""), "n_days": int(len(res.equity)),
           "n_fills": int(len(res.fills)), "params": params, "window": [start, end],
@@ -248,6 +265,12 @@ def task_baseline(sid: str, plan_row: dict, opts: RunOptions) -> dict:
           **_metrics_quick(res.returns)}
     write_json(d / "baseline" / "status.json", st)
     return st
+
+
+def _variant_info(sid: str) -> dict:
+    from .variants import info
+
+    return info(sid)
 
 
 def universe_coverage_record(portal, strat, start: str, end: str, res=None) -> dict:
@@ -284,11 +307,10 @@ def universe_coverage_record(portal, strat, start: str, end: str, res=None) -> d
 
 def grid_plan(sid: str, plan_row: dict, opts: RunOptions, baseline_runtime: float) -> dict:
     """Configs to run for the grid (deterministic subset when capped)."""
-    from atlasbt.strategies import registry as R
+    from .variants import default_params, expand_grid, is_variant
 
-    cls = R.get(sid)
-    combos = R.expand_grid(cls.grid)
-    base = dict(cls.params)
+    combos = expand_grid(sid)                 # proxy variants: base grid restricted to the variant params
+    base = default_params(sid)
     is_base = [all(base.get(k) == v for k, v in c.items()) for c in combos]
     n_full = len(combos)
     cap = n_full
@@ -316,6 +338,7 @@ def grid_plan(sid: str, plan_row: dict, opts: RunOptions, baseline_runtime: floa
     selected = [{"cfg": config_id(combos[i]), "combo": combos[i], "params": {**base, **combos[i]},
                  "is_baseline": bool(is_base[i])} for i in order]
     gp = {"n_full": n_full, "n_selected": len(selected), "subset": cap < n_full, "reasons": reasons,
+          "variant": _variant_info(sid) if is_variant(sid) else None,
           "selection": "seeded permutation (sha256(sid|'grid_subset')); baseline config always kept",
           "configs": selected}
     write_json(run_dir(opts, sid) / "grid_plan.json", gp)
@@ -373,6 +396,21 @@ def atlas_trial_total() -> int:
     return int(max(total_atlas_trials(grids), total_atlas_trials()))
 
 
+def variant_trial_total(results_dir=None) -> int:
+    """DSR N for PROXY VARIANTS: the primary atlas N plus the restricted grid of every variant the plan
+    marks testable (all registered variants when there is no plan). Never used for primary strategies."""
+    from . import variants as V
+
+    testable = None
+    if results_dir is not None:
+        from .plan import load_plan
+
+        plan = load_plan(Path(results_dir))
+        if len(plan) and "variant_of" in plan.columns:
+            testable = [r["id"] for r in plan.to_dict("records") if r.get("variant_of") and r.get("testable") == "Y"]
+    return V.trials_total(atlas_trial_total(), testable)
+
+
 def to_offset(x):
     """'3Y' / '1Y' / '6M' / '2M' -> pd.DateOffset (pandas 3 rejects the 'Y' alias in to_offset)."""
     if not isinstance(x, str):
@@ -422,7 +460,8 @@ def task_finalize(sid: str, plan_row: dict, opts: RunOptions) -> dict:
     seed_everything(sid, "finalize")
     t = Timer()
     bst = baseline_status(opts, sid)
-    summary: dict = {"strategy_id": sid, "status": bst.get("status", "MISSING"), "plan": plan_row,
+    summary: dict = {"strategy_id": sid, "variant": _variant_info(sid),
+                     "status": bst.get("status", "MISSING"), "plan": plan_row,
                      "universe_coverage": bst.get("universe_coverage"), "window": bst.get("window"),
                      "spread_model": bst.get("spread_model"),
                      "run_label": opts.extra.get("label") or ("window-override" if opts.start_override else "full"),
@@ -444,7 +483,10 @@ def task_finalize(sid: str, plan_row: dict, opts: RunOptions) -> dict:
     res = read_pickle(d / "baseline" / "result.pkl.gz")
     idx = pd.DatetimeIndex(res.returns.index)
     freq = plan_row.get("bar_freq", "1d")
-    N_atlas = atlas_trial_total()
+    var = _variant_info(sid)
+    summary["variant"] = var
+    # proxy variants are deflated against N incl. every variant trial; primary strategies keep the primary N
+    N_atlas = variant_trial_total(opts.results_dir) if var else atlas_trial_total()
     M, info, gp = load_grid_matrix(opts, sid, idx, "ret")
     Mx, _, _ = load_grid_matrix(opts, sid, idx, "excess")
     summary["grid"] = {"n_full": gp.get("n_full"), "n_selected": gp.get("n_selected"), "subset": gp.get("subset"),
@@ -553,6 +595,12 @@ def task_finalize(sid: str, plan_row: dict, opts: RunOptions) -> dict:
                            break_even_bp=be_bp, n_trials=gp.get("n_full"))
     row["activity"] = bst.get("activity")
     row["run_label"] = summary.get("run_label")
+    row["variant_of"] = (var or {}).get("variant_of", "")
+    if var and row.get("fidelity_grade") in ("A", "B"):
+        # the fills are real auction prints (T1), but the decision TIMING is the proxy (T2, a strategy flag, not a
+        # fill tier): a proxy variant is never graded better than C ("proxies")
+        row["fidelity_grade_fills"] = row["fidelity_grade"]
+        row["fidelity_grade"] = "C"
     uc = bst.get("universe_coverage") or {}
     sb = uc.get("survivorship_bias") or {}
     row["universe_coverage_start"] = (sb.get("start") or {}).get("coverage")
@@ -628,6 +676,12 @@ def _append_report_section(path: Path, s: dict, plan_row: dict) -> None:
              f"on full-window runs): folds {wf.get('n_folds', 0)}, OOS Sharpe {_f(wf.get('oos_sharpe'))}, OOS total "
              f"return {_f(wf.get('oos_total_return'), 'pct')}, WF efficiency {_f(wf.get('wf_efficiency'))}, "
              f"parameter stability {_f(wf.get('param_stability'))}.", ""]
+    if s.get("variant"):
+        v = s["variant"]
+        lines += [f"> **PROXY VARIANT ({v.get('variant_id')}) - T2, not faithful to the sheet's timing.** Base "
+                  f"strategy {v.get('variant_of')} run with the opt-in params `{v.get('variant_params')}`: "
+                  f"{v.get('variant_reason')}. Listed in its own atlas table, never ranked with faithful results; "
+                  f"DSR deflated with N incl. every variant trial.", ""]
     if str(s.get("run_label") or "").upper().startswith("EXTENDED"):
         lines += ["> **EXTENDED_SURVIVORSHIP_BIASED**: extended-history run from the first month with >= 60% PIT "
                   "price coverage. Delisted / failed names are under-represented, so results are likely OPTIMISTIC. "

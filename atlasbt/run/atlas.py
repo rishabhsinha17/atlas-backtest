@@ -94,62 +94,116 @@ def _spa_block(M: pd.DataFrame, bench: pd.Series | None, label: str, reps: int =
     return out
 
 
+def _status_row(opts, res_dir: Path, sid: str, pr: dict, allow_stock: bool):
+    """(leaderboard/status row, final summary, grid per-period Sharpes) for one id (sheet id or variant)."""
+    from .holds import held, is_stale
+
+    fs = P.final_status(opts, sid)
+    srs: list = []
+    if fs and fs.get("leaderboard_row"):
+        row = dict(fs["leaderboard_row"])
+        if fs.get("status") != "OK":
+            row["status"] = fs.get("status")
+            row["reason"] = row.get("reason") or fs.get("reason", "")
+        srs = [x for x in fs.get("grid_sr_period", []) if x is not None and np.isfinite(x)]
+    elif fs:
+        row = {"strategy_id": sid, "status": fs.get("status", "FAILED"), "reason": fs.get("reason", ""),
+               "fidelity_grade": "NA"}
+    elif pr and pr.get("testable") == "N":
+        row = {"strategy_id": sid, "status": "NOT_TESTABLE", "reason": f"plan: {pr.get('reason')}",
+               "fidelity_grade": "NA"}
+    else:
+        row = {"strategy_id": sid, "status": "NOT_RUN", "reason": "no finalized run in results/runs",
+               "fidelity_grade": "NA"}
+    stale, h = is_stale(res_dir, sid), held(sid, allow_stock)
+    if stale or (h and fs):
+        row = {"strategy_id": sid, "status": "STALE", "fidelity_grade": row.get("fidelity_grade", "NA"),
+               "reason": (stale or h) + f" | last status {row.get('status')}"}
+    elif h:
+        row = {"strategy_id": sid, "status": "HOLD", "reason": h, "fidelity_grade": "NA"}
+    if row.get("status") == "FAILED":
+        tb = (fs or {}).get("baseline_traceback") or ""
+        last = [l for l in tb.strip().splitlines() if l.strip()][-1:] if tb else []
+        row["reason"] = (str(row.get("reason") or "") + (f" | {last[0]}" if last and last[0] not in str(row.get('reason')) else "")
+                         + f" | log: results/logs/{sid}.log")[:400]
+    return row, fs, srs
+
+
+def _extra_cols(fs, pr: dict, row: dict) -> dict:
+    win = ((fs or {}).get("baseline") or {}).get("window") or [pr.get("start", ""), pr.get("end", "")]
+    return {"family": pr.get("family", ""), "bar_freq": pr.get("bar_freq", ""), "start": win[0],
+            "end": win[1], "run_label": (fs or {}).get("run_label", ""), "holdout_sharpe": row.get("holdout_sharpe"),
+            "holdout_params": row.get("holdout_params"),
+            "grid_run": (fs or {}).get("grid", {}).get("n_ok"), "grid_full": (fs or {}).get("grid", {}).get("n_full"),
+            "grid_subset": (fs or {}).get("grid", {}).get("subset")}
+
+
+_XCOLS = ("family", "bar_freq", "start", "end", "run_label", "holdout_sharpe", "holdout_params", "grid_run",
+          "grid_full", "grid_subset")
+
+
+def variant_table(opts, res_dir: Path, prow: dict, allow_stock: bool, primary_sr: list) -> tuple:
+    """PROXY VARIANTS (run/variants.py): their own leaderboard, never merged with the primary one.
+
+    DSR is deflated with N = primary atlas trials + every planned-testable variant grid
+    (``pipeline.variant_trial_total``); V[SR] from the primary AND variant grid Sharpes. Returns
+    (table incl. untested rows, N, number of variant trial Sharpes)."""
+    from atlasbt.reporting import build_leaderboard
+
+    from . import variants as V
+
+    vrows, vsr, vextra = [], [], {}
+    for vid in V.variant_ids():
+        pr = prow.get(vid, {})
+        row, fs, srs = _status_row(opts, res_dir, vid, pr, allow_stock)
+        row["variant_of"] = V.base_of(vid)
+        vrows.append(row)
+        vsr += srs
+        vextra[vid] = _extra_cols(fs, pr, row)
+    Nv = P.variant_trial_total(res_dir)
+    srs_all = list(primary_sr) + vsr
+    tested, other = build_leaderboard(vrows, n_trials_total=Nv, trial_sharpes=srs_all if len(srs_all) >= 2 else None)
+    if len(tested):
+        tested["status"] = "OK"
+        tested["activity"] = [next((r.get("activity") for r in vrows if r["strategy_id"] == s), None)
+                              for s in tested["strategy_id"]]
+        for c in _XCOLS:
+            tested[c] = [vextra[s][c] for s in tested["strategy_id"]]
+    if len(other):
+        other = other.copy()
+        for c in ("bar_freq", "start", "end"):
+            other[c] = [vextra[s][c] for s in other["strategy_id"]]
+    tab = pd.concat([t for t in (tested, other) if len(t)], ignore_index=True) if (len(tested) or len(other)) \
+        else pd.DataFrame(columns=["strategy_id", "status"])
+    tab.insert(list(tab.columns).index("strategy_id") + 1, "variant_of", [V.base_of(s) for s in tab["strategy_id"]])
+    tab["variant_params"] = [str(V.require(s).params) for s in tab["strategy_id"]]
+    tab["fidelity_floor"] = "T2_PROXY"
+    return tab, Nv, len(vsr)
+
+
 def run_atlas(opts: P.RunOptions, log=print, allow_stock: bool = False) -> dict:
     from atlasbt.reporting import build_leaderboard, render_leaderboard_md
 
     from .fastportal import FastPortal
-    from .holds import held, is_stale
     from .plan import annotate_plan
 
     res_dir = Path(opts.results_dir)
     annotate_plan(res_dir, allow_stock)
     plan = load_plan(res_dir)
     prow = {r["id"]: r for r in plan.to_dict("records")} if len(plan) else {}
-    ids = all_sheet_ids()
+    ids = all_sheet_ids()                    # primary = the 172 sheet ids; proxy variants are tabled separately
     rows, sr_all, extra = [], [], {}
     for sid in ids:
-        fs = P.final_status(opts, sid)
-        pr = prow.get(sid, {})
-        if fs and fs.get("leaderboard_row"):
-            row = dict(fs["leaderboard_row"])
-            if fs.get("status") != "OK":
-                row["status"] = fs.get("status")
-                row["reason"] = row.get("reason") or fs.get("reason", "")
-            sr_all += [x for x in fs.get("grid_sr_period", []) if x is not None and np.isfinite(x)]
-        elif fs:
-            row = {"strategy_id": sid, "status": fs.get("status", "FAILED"), "reason": fs.get("reason", ""),
-                   "fidelity_grade": "NA"}
-        elif pr and pr.get("testable") == "N":
-            row = {"strategy_id": sid, "status": "NOT_TESTABLE", "reason": f"plan: {pr.get('reason')}",
-                   "fidelity_grade": "NA"}
-        else:
-            row = {"strategy_id": sid, "status": "NOT_RUN", "reason": "no finalized run in results/runs",
-                   "fidelity_grade": "NA"}
-        stale, h = is_stale(res_dir, sid), held(sid, allow_stock)
-        if stale or (h and fs):
-            row = {"strategy_id": sid, "status": "STALE", "fidelity_grade": row.get("fidelity_grade", "NA"),
-                   "reason": (stale or h) + f" | last status {row.get('status')}"}
-        elif h:
-            row = {"strategy_id": sid, "status": "HOLD", "reason": h, "fidelity_grade": "NA"}
-        if row.get("status") == "FAILED":
-            tb = (fs or {}).get("baseline_traceback") or ""
-            last = [l for l in tb.strip().splitlines() if l.strip()][-1:] if tb else []
-            row["reason"] = (str(row.get("reason") or "") + (f" | {last[0]}" if last and last[0] not in str(row.get('reason')) else "")
-                             + f" | log: results/logs/{sid}.log")[:400]
+        row, fs, srs = _status_row(opts, res_dir, sid, prow.get(sid, {}), allow_stock)
+        sr_all += srs
         rows.append(row)
-        win = ((fs or {}).get("baseline") or {}).get("window") or [pr.get("start", ""), pr.get("end", "")]
-        extra[sid] = {"family": pr.get("family", ""), "bar_freq": pr.get("bar_freq", ""), "start": win[0],
-                      "end": win[1], "run_label": (fs or {}).get("run_label", ""), "holdout_sharpe": row.get("holdout_sharpe"),
-                      "holdout_params": row.get("holdout_params"),
-                      "grid_run": (fs or {}).get("grid", {}).get("n_ok"), "grid_full": (fs or {}).get("grid", {}).get("n_full"),
-                      "grid_subset": (fs or {}).get("grid", {}).get("subset")}
+        extra[sid] = _extra_cols(fs, prow.get(sid, {}), row)
     N = P.atlas_trial_total()
     tested, other = build_leaderboard(rows, n_trials_total=N, trial_sharpes=sr_all if len(sr_all) >= 2 else None)
     if len(tested):
         tested["activity"] = [next((r.get("activity") for r in rows if r["strategy_id"] == s), None)
                               for s in tested["strategy_id"]]
-        for c in ("family", "bar_freq", "start", "end", "run_label", "holdout_sharpe", "holdout_params", "grid_run", "grid_full",
-                  "grid_subset"):
+        for c in _XCOLS:
             tested[c] = [extra[s][c] for s in tested["strategy_id"]]
     tested.to_csv(res_dir / "leaderboard.csv", index=False)
     other.to_csv(res_dir / "not_testable.csv", index=False)
@@ -189,12 +243,16 @@ def run_atlas(opts: P.RunOptions, log=print, allow_stock: bool = False) -> dict:
     out = {"n_strategies": len(ids), "n_trials_total": N, "n_trial_sharpes": len(sr_all),
            "status_counts": pd.Series([r.get("status") for r in rows]).value_counts().to_dict(),
            "spa": spa, "spa_dropped_short_overlap": dropped, "fdr_pass": int(tested["fdr_pass"].sum()) if len(tested) else 0}
+    vtab, Nv, nvsr = variant_table(opts, res_dir, prow, allow_stock, sr_all)
+    vtab.to_csv(res_dir / "proxy_variants.csv", index=False)
+    out["proxy_variants"] = {"n": int(len(vtab)), "n_trials_total": Nv, "n_variant_trial_sharpes": nvsr,
+                             "status_counts": vtab["status"].value_counts().to_dict() if len(vtab) else {}}
     ext = extended_table(res_dir / "extended")
     if len(ext):
         ext.to_csv(res_dir / "extended_survivorship_biased.csv", index=False)
     out["n_extended"] = int(len(ext))
     write_json(res_dir / "atlas_stats.json", out)
-    _write_report(res_dir, out, tested, other, fdist, plan, rows, ext)
+    _write_report(res_dir, out, tested, other, fdist, plan, rows, ext, vtab)
     log(f"atlas: {out['status_counts']} N={N}; report -> {res_dir / 'ATLAS_REPORT.md'}")
     return out
 
@@ -228,7 +286,7 @@ def extended_table(ext_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _write_report(res_dir: Path, out, tested, other, fdist, plan, rows, ext=None):
+def _write_report(res_dir: Path, out, tested, other, fdist, plan, rows, ext=None, vtab=None):
     from .common import environment_info
     from .notices import banner_md
 
@@ -297,6 +355,8 @@ def _write_report(res_dir: Path, out, tested, other, fdist, plan, rows, ext=None
         for r in sub:
             L.append(f"| {r['strategy_id']} | {str(r.get('reason', '')).replace('|', '/').replace(chr(10), ' ')[:300]} |")
         L.append("")
+    if vtab is not None and len(vtab):
+        L += variant_section_md(vtab, out.get("proxy_variants") or {}, out["n_trials_total"])
     if ext is not None and len(ext):
         L += ["## EXTENDED_SURVIVORSHIP_BIASED runs (NOT part of the leaderboard)", "",
               "Secondary extended-history runs of stock strategies from the first month with >= 60% PIT S&P 500 "
@@ -316,6 +376,33 @@ def _write_report(res_dir: Path, out, tested, other, fdist, plan, rows, ext=None
           "the pre-holdout grid matrix; cost stress A-E and break-even via validation.cost_stress; bootstrap CIs "
           "via validation.bootstrap (stationary).", ""]
     (res_dir / "ATLAS_REPORT.md").write_text("\n".join(L) + "\n")
+
+
+def variant_section_md(vtab: pd.DataFrame, info: dict, n_primary: int) -> list[str]:
+    L = ["## PROXY VARIANTS — T2, not faithful to the sheet's timing", "",
+         "Strategies that are NOT_TESTABLE at their faithful (intraday) resolution, run with the opt-in proxy the "
+         "strategy itself documents and flags T2_PROXY (registry: atlasbt/run/variants.py; e.g. daily bars with "
+         "'15:50' -> market-on-close and '09:35' -> market-on-open). These runs are NOT the sheet's strategy: they "
+         "are excluded from the leaderboard above, from its DSR trial count (N = "
+         f"{n_primary}) and from SPA/RC. Their own DSR is deflated with **N = {info.get('n_trials_total')}** "
+         "(primary trials + every planned-testable variant grid); BH q-values are within this table only. "
+         "Also in proxy_variants.csv.", "",
+         "| # | Variant | Of | Status | DSR | PSR(0) | q | PBO | WF OOS SR | Holdout SR | raw SR | CAGR | MaxDD | "
+         "Grade | Activity | Window / reason |",
+         "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:-:|---|---|"]
+    for r in vtab.to_dict("records"):
+        ok = r.get("status") == "OK"
+        g = (lambda k, f="f2": _fmt(r.get(k), f) if ok else "")
+        rk = r.get("rank")
+        rk = "" if rk is None or (isinstance(rk, float) and not math.isfinite(rk)) else int(rk)
+        tail = (f"{r.get('start', '')}..{r.get('end', '')}" if ok else
+                str(r.get("reason", "")).replace("|", "/").replace(chr(10), " ")[:200])
+        L.append(f"| {rk} | {r['strategy_id']} | {r.get('variant_of', '')} | {r.get('status')} | {g('dsr', 'p')} | "
+                 f"{g('psr_0', 'p')} | {g('q_value', 'p')} | {g('pbo')} | {g('oos_sharpe')} | {g('holdout_sharpe')} | "
+                 f"{g('sharpe')} | {g('cagr', 'pct')} | {g('max_drawdown', 'pct')} | "
+                 f"{r.get('fidelity_grade', '') if ok else ''} | {r.get('activity', '') if ok else ''} | {tail} |")
+    L.append("")
+    return L
 
 
 def _tab() -> bool:

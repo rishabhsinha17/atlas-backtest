@@ -56,12 +56,30 @@ and the red-team tests stay in `tests/redteam/` as regressions.
 | Cause | Strategies | What unlocks them |
 |---|---|---|
 | No multi-year 1-minute or 5-minute bars for stocks | S001–S014, S016–S022, S027, S030, S039, S040 | Alpaca key (free SIP minute bars since 2016) |
-| Intraday decision times (15:45/15:50) need 1-minute bars across the ETF universe | S031–S037 | Alpaca key; or the opt-in daily proxy (T2) these strategies provide |
-| Quotes required (09:29 / 15:25 midpoints) | S015 | Alpaca key |
+| Intraday decision times (15:45/15:50) need 1-minute bars across the ETF universe | S031–S037 | Alpaca key; or the opt-in daily proxy (T2), run as proxy variants (below) |
+| Quotes required (09:29 / 15:25 midpoints) | S015 | Alpaca key; or the T2 mid proxy, run as a proxy variant (below) |
 | Intraday option quotes required | S158–S160, S164, S171 | Databento OPRA |
 | SPX minute bars / SPX quotes required | S161–S163, S172 | Databento / Cboe data |
 | No free point-in-time source | S041 (analyst revisions), S045 (buyback announcements), S110 (iNAV) | paid data |
 | Missing ETF history in cache | S108 (Vanguard sector ETFs) | add them to the fetch set |
+
+**Proxy variants.** Some NOT_TESTABLE strategies ship an opt-in proxy that the strategy documents and
+flags T2_PROXY. These run as separate variants:
+
+* **S031@proxy and S034@proxy–S037@proxy**: daily bars, with 15:50 -> market-on-close and 09:35 ->
+  market-on-open. Testable from 2004-04.
+* **S015@mid_proxy**: the 15:25 midpoint is proxied by the 15:24 1-minute close. Testable only on the short
+  1-minute ETF window.
+
+S032@proxy and S033@proxy stay NOT_TESTABLE, because the strategy refuses a daily proxy for a 15:45-price
+signal.
+
+Variants are planned in `plan.csv` with a `variant_of` column and run under `runs/<SID>@<tag>/`. The atlas
+reports them only in their own table, "PROXY VARIANTS — T2, not faithful to the sheet's timing". They are
+never ranked with faithful results, and they are excluded from the primary DSR trial count and from SPA. Their
+own DSR is deflated with N that includes the variant trials. The registry, the inclusion rules and the
+excluded candidates are in `atlasbt/run/variants.py` and RUNNING.md §2b. The counts above (126 testable,
+46 not testable) are faithful strategies only.
 
 ## Known limitations
 

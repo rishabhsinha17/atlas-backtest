@@ -5,8 +5,9 @@ Owner: RUNNER agent. Package `atlasbt/run/`, tests `tests/run/`, outputs `result
 windows, runs the engine, applies the validation and reporting functions, and writes the evidence.
 
 ```
-python -m atlasbt.run plan                       # results/plan.csv for all 172 strategies
-python -m atlasbt.run run [--ids S046-S084,S103]  # default: every plan-testable, non-held strategy
+python -m atlasbt.run plan                       # results/plan.csv: all 172 strategies + proxy variants (§2b)
+python -m atlasbt.run run [--ids S046-S084,S103]  # default: every plan-testable, non-held strategy and variant
+python -m atlasbt.run run --ids S031@proxy,S034@proxy   # proxy variants by id (`--ids variants` = all of them)
 python -m atlasbt.run atlas                      # results/ATLAS_REPORT.md, leaderboard.csv
 python -m atlasbt.run audit [--live]             # results/AUDIT.md (activity safeguard)
 python -m atlasbt.run replicate [--quick]        # results/REPLICATION.md (known-answer checks)
@@ -17,7 +18,7 @@ budget per strategy, default 30), `--daily-budget MIN` (same for daily+ strategi
 `--force` (wipe and rerun a strategy), `--timeout MIN` (per task, default 360), `--mem-reserve GB`
 (default 3), `--start/--end` (window override, smoke tests only; recorded in config.json),
 `--use-quotes never|auto|always` (default `auto`, the engine default since its per-window quote-coverage fix; see §8), `--universe-coverage filter|strict` and
-`--min-universe-coverage 0.95` (§2), `--label TEXT` (a run label shown in summaries and the leaderboard,
+`--min-universe-coverage 0.95` (§2), `--skip-variants` (plan/run/audit/final: leave the proxy variants of §2b out), `--label TEXT` (a run label shown in summaries and the leaderboard,
 e.g. `shakeout-2y`), `--extend-grid` (grows existing grid subsets to the current caps; the seeded subsets
 are prefix-stable, so it only adds configs and re-finalizes), `--allow-stock-universes`/env
 `ATLASBT_STOCK_HOLD=1` (data holds, §8), `--no-charts`, `--bootstrap-reps`.
@@ -34,8 +35,9 @@ python -m atlasbt.run launch replicate
 explicit hash (`--commit 4ea9ad1`) so that no uncommitted edits by other agents can leak in. `python -m
 atlasbt.run launch --commit <hash> --no-overlay final ...` runs the whole atlas in one pinned process:
 plans (primary >= 95%, extended >= 60%); primary runs with per-group grid budgets (`--etf-budget` -1 =
-full, `--options-budget 45`, `--stock-budget 0`); all replications; audit; atlas; the
-EXTENDED_SURVIVORSHIP_BIASED stock runs; then atlas again.
+full, `--options-budget 45`, `--stock-budget 0`); then the testable proxy variants (§2b) as a separate group
+(`--variant-budget`, default -1 = full grid; `--skip-variants` to leave them out); all replications; audit;
+atlas; the EXTENDED_SURVIVORSHIP_BIASED stock runs; then atlas again.
 
 `launch` (`worktree.py`) creates `results/_worktrees/<commit12>` with `git worktree add --detach`, with no
 commits or branches. It overlays the runner package `atlasbt/run` when the commit lacks it, and records
@@ -84,8 +86,64 @@ intraday history through the PIT portal. Window end is the last cached session c
 bars. Minimum windows are 252 sessions (daily+) and 10 sessions (intraday). `plan.csv` columns: id,
 family, module, bar_freq, sizing, testable, reason, start, end, n_sessions, expected_fidelity (worst
 critical tier), fidelity_notes, n_grid, est_runtime_min_baseline/grid (cost model in `plan.py`,
-calibrated on S050/S105 runs), universe, n_symbols, binding_constraint, hold, activity, stale. Facts
+calibrated on S050/S105 runs), universe, n_symbols, binding_constraint, hold, activity, stale; plus `variant_of`
+(base id of a proxy variant, §2b; empty for sheet strategies). Facts
 (bar ranges, SP500 coverage) are memoized in `results/plan_cache.json`. Delete that file after a data refresh.
+
+## 2b. Proxy variants (`variants.py`)
+
+Some strategies are NOT_TESTABLE at their faithful resolution but ship an opt-in proxy param that the strategy
+documents in its `deviations` and flags `T2_PROXY` at run time. A proxy variant runs the BASE strategy class
+with that param under its own id `<SID>@<tag>`. It is declared in the registry `VARIANTS` in
+`atlasbt/run/variants.py` (`{variant_id: Variant(base, params, reason)}`). A variant is registered only when
+all four rules hold:
+
+1. The proxy is the strategy's own documented, T2-flagged opt-in: the same signal, with proxied timing or input.
+2. The base strategy is NOT_TESTABLE on free data.
+3. The variant is runnable on cached data.
+4. It never uses `allow_synthetic=True` for options signals (OPTIONS.md: synthetic smiles never drive signals).
+
+Rejected candidates and their reasons are listed in `EXCLUDED`.
+
+| Variant | Proxy | Plan (current cache) |
+|---|---|---|
+| S031@proxy, S034@proxy–S037@proxy | daily bars; "15:50" -> MOC at the official close, "09:35" -> MOO at the official open | testable 2004-04 -> today |
+| S032@proxy, S033@proxy | refused by the strategy (the signal is the 15:45 price; a daily version would signal and fill on the same close) | NOT_TESTABLE (registered so the plan records the refusal) |
+| S015@mid_proxy | 15:25 quote midpoint -> close of the 15:24 1-minute bar | testable on the short ETF 1-minute window |
+
+Excluded:
+
+* **S005/S006 `pm_mid_proxy`**: still need 1-minute PRE bars for single stocks.
+* **S042 `proxy`**: the base is testable. A daily run would also need the stacked `decl_proxy` portal decorator.
+* **S038 `posthoc_consensus`, S130 `earnings_proxy`, S165 `vix_proxy`**: the base is testable.
+* **S160 `timing_proxy`**: 5-minute stock bars exist only from 2026-08-31, so a 2018+ window would be ~95% empty.
+* **S158–S172 `allow_synthetic`**: excluded by rule 4.
+
+What changes for a variant:
+
+* **`plan`** instantiates the variant with its params, so the requirements, bar frequency and window are the
+  proxy's. The `plan.csv` row has `variant_of` = base id and expected fidelity >= T2_PROXY. `plan` with no
+  `--ids` plans the 172 sheet ids plus every variant.
+* **`run`** uses the base strategy's grid restricted to the variant params (`variants.expand_grid`: combos
+  that contradict a variant key are dropped; `proxy` is not a grid key, so S031@proxy runs the full 9-config
+  grid with `proxy=True`).
+* **Outputs** go to `runs/<SID@tag>/` and `reports/<SID@tag>/`. The result's `strategy_id` is the variant id.
+  `config.json`, `status.json`, `grid_plan.json`, `summary.json` and `result.meta` carry the variant record.
+* **The report** opens its runner section with a "PROXY VARIANT - T2, not faithful to the sheet's timing"
+  banner.
+* **The fidelity grade** is capped at C. The fills are real auction prints (T1), so the fill-tier grade is kept
+  as `fidelity_grade_fills`.
+* **`atlas`** lists variants only in their own table, "PROXY VARIANTS — T2, not faithful to the sheet's
+  timing" (also `proxy_variants.csv`). They are excluded from:
+  * the primary leaderboard;
+  * the primary status counts;
+  * the primary DSR trial count;
+  * SPA/RC.
+
+  Their DSR uses N = primary N + the restricted grid of every planned-testable variant
+  (`pipeline.variant_trial_total`). V[SR] uses the primary and variant grid Sharpes, and BH q-values are
+  computed within the variant table.
+* **`audit`** covers variants by the same rules, and `tests/run/test_audit.py` gates them.
 
 ## 3. `run`: per-strategy pipeline (`pipeline.py`, `scheduler.py`)
 
@@ -169,6 +227,8 @@ in the offender's row: combos submitted but never filled, and option selection f
   Intraday strategies (20 sessions) are never in SPA.
 * Tables: ZERO_ACTIVITY, FAILED (last traceback line + log path), TIMEOUT, STALE, HOLD, NOT_TESTABLE
   (plan or engine reason), NOT_RUN. Also the fidelity grade distribution by status.
+* PROXY VARIANTS: their own table with their own DSR (N incl. variant trials). They are never part of the
+  above (§2b).
 
 ## 5b. EXTENDED_SURVIVORSHIP_BIASED runs (stock strategies)
 
