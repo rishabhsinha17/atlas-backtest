@@ -31,7 +31,12 @@ LEVERAGED_ETFS = ["SSO", "UPRO", "QLD", "TQQQ", "SH", "SDS", "PSQ"]
 LEVERAGED_REFERENCE = {"SSO": ("SPY", 2), "UPRO": ("SPY", 3), "QLD": ("QQQ", 2), "TQQQ": ("QQQ", 3),
                        "SH": ("SPY", -1), "SDS": ("SPY", -2), "PSQ": ("QQQ", -1)}
 
+# ETFs named by strategy universes beyond the core lists (S108 SPDR-vs-Vanguard sector pairs, S111 same-index
+# pairs). Kept here so `fetch --set core` covers every static strategy symbol.
+PAIR_ETFS = ["VGT", "VFH", "VHT", "VPU", "VDC", "VCR", "VAW", "VDE", "VIS",   # Vanguard sector (S108)
+             "IVV", "MDY", "IJH", "IJR", "VIOO", "VTWO", "QQQM"]              # same-index pairs (S111)
 CORE_ETFS = BROAD_ETFS + list(SECTOR_SPDRS) + BOND_CASH_ETFS + OTHER_ETFS + LEVERAGED_ETFS
+CORE_ETFS = CORE_ETFS + [s for s in PAIR_ETFS if s not in CORE_ETFS]
 
 MEGACAPS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "GOOG", "META", "TSLA", "BRK-B", "AVGO", "JPM", "LLY",
             "V", "UNH", "XOM", "MA", "COST", "HD", "PG", "JNJ", "WMT", "NFLX", "AMD", "BAC", "ABBV", "CRM",
