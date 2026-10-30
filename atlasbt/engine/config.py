@@ -61,6 +61,9 @@ class BacktestConfig:
     #: "conservative" -> portfolio.hooks.DefaultOptionLifecycle; or any OptionLifecycle instance
     option_lifecycle: Union[None, str, OptionLifecycle] = None
     check_margin_on_submit: bool = True
+    #: FINRA 4210(f)(8)(B) pattern-day-trader rule for REG_T_MARGIN accounts (from 2001-09-28):
+    #: with prior-close equity < USD 25,000 the 4th day trade within 5 business days is rejected
+    pdt_rule: bool = True
     margin_calls: bool = True
     rf_tenor: str = "3M"
     # engine

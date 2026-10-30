@@ -246,3 +246,129 @@ SETTLEMENT_CYCLE = [
     (pd.Timestamp("2017-09-05"), 2),   # T+2
     (pd.Timestamp("2024-05-28"), 1),   # T+1
 ]
+
+
+# --------------------------------------------------------------------------
+# IBKR Pro commission history (opt-in: ``IBKRProTiered(historical=True)`` /
+# fee schedule names ``IBKR_PRO_TIERED_HISTORICAL`` / ``IBKR_PRO_FIXED_HISTORICAL``).
+#
+# Verified points (retrieved 2026-10-30, User-Agent atlasbt-research/0.1):
+# * IBG annual report 2013 (interactivebrokers.com/download/2013_IBG_AR.pdf, "Rates were
+#   obtained on February 3, 2014"): US stocks $0.0005-$0.0035/share, US options
+#   $0.075-$0.70 per contract; "Our transparent cost-plus commission is subject to USD 0.35
+#   minimum on equities per order for monthly volume exceeding 100,000,000 shares and USD 0.70
+#   minimum per order for monthly volume up to 100,000,000 shares. USD 1.00 minimum on options."
+# * IBG annual report 2014 (rates obtained 2015-02-02): same minimums; "USD 1.00 minimum on
+#   stocks and options" (Fixed).
+# * IBG annual report 2016 (rates obtained 2017-03-02): options "$0.00 base, $0.70 per contract".
+# * interactivebrokers.com/en/pricing/commissions-stocks.php and commissions-options.php
+#   (live, 2026-10-30): Tiered min USD 0.35, Fixed USD 0.005/sh min USD 1.00, max 1% of trade
+#   value; options USD 0.65 (premium >= 0.10) / 0.50 / 0.25, min USD 1.00.
+# The exact date of the $0.70 -> $0.65 option cut and the tiered-minimum cut is NOT verified
+# (web.archive.org was unreachable from this environment). Both are placed on 2019-09-26, the
+# IBKR Pro/Lite repricing (IBKR Lite introduced on that date per the 2019 IBG annual report),
+# and flagged approx. Rows before 2014-02-03 apply the earliest verified schedule (approx).
+# --------------------------------------------------------------------------
+_IBKR_HIST = [
+    # date, opt rate (prem>=0.10, <=10k contracts/mo), tiered min (<=100M sh/mo), tiered min (>100M),
+    # fixed min, source, approx
+    ("1990-01-01", 0.70, 0.70, 0.35, 1.00,
+     "IBG AR 2013 (2014-02-03) schedule applied retroactively (approx)", True),
+    ("2014-02-03", 0.70, 0.70, 0.35, 1.00, "IBG AR 2013 (rates obtained 2014-02-03)", False),
+    ("2019-09-26", 0.65, 0.35, 0.35, 1.00,
+     "IBKR Pro/Lite repricing (date of the $0.65 / $0.35 change approx; verified 2026-10-30)", True),
+]
+IBKR_PRO_HISTORY = RateTable("IBKR Pro commission history", [
+    RateRow(_d(d), {"opt_top": o, "tiered_min": m1, "tiered_min_high_volume": m2, "fixed_min": fm}, src, ap)
+    for d, o, m1, m2, fm, src, ap in _IBKR_HIST
+])
+
+
+# --------------------------------------------------------------------------
+# IBKR Pro USD interest schedule (opt-in: ``FinancingConfig(schedule="ibkr_pro")``).
+# Benchmark (BM) = Fed Funds Effective (FRED DFF, ``portal.risk_free_rate(as_of, "ON")``):
+# IBKR "US Dollar Fed Funds Effective" (interestPaid examples, interactivebrokers.com
+# index.php?f=5424); before 2007-09 IBKR used USD LIBOR (not in the cache: DFF is used and
+# the run is flagged).
+#
+# Margin loans (blended over tiers, BM + spread):
+# * 2013-02-01 .. 2020-02-10 verified from the "US Margin Loan Rates" tables in the IBG annual
+#   reports 2012/2013/2016/2019 (blended APR at $25K/$200-300K/$1.5M/$3.5M minus DFF on the
+#   quoted date reproduces BM+1.5% <= 100K, +1.0% to 1M, +0.5% to 3M, +0.25% above to 0.02%).
+# * 2021-01-04 (IBG AR 2020) and 2026-10-30 (live margin-rates page): BM+1.5% <= 100K, +1% to
+#   1M, +0.75% to 50M, +0.5% above. The change date between 2020-02-10 and 2021-01-04 is not
+#   verified; it is placed on 2020-02-11 (the earliest possible date: the newer tiers cost
+#   more on large loans, i.e. conservative) and flagged approx.
+# Credit on cash (IBKR Pro): 0% on the first USD 10,000, BM - 0.5% above, floored at 0
+# (Attachment C "Brokerage Websites July 2017": USD 0-10,000 0%, 10,000.01+ BM-0.5% at
+# BM 1.16% -> 0.66%; IBG AR 2017: 0.92% at BM 1.42% on 2018-02-05; live page 2026-10-30).
+# Eligibility: July 2017 "only accounts with NAV exceeding USD 100,000 will be eligible";
+# from the 2019 annual report (rates as of 2020-02-10) accounts below USD 100,000 are paid
+# pro rata NAV/100,000. The switch is placed on 2020-02-10 (first verified date; the earlier
+# all-or-nothing rule pays less, i.e. conservative before it).
+# Short-sale proceeds (collateral) credit: USD 0-100K 0%, 100K-1M BM-1.25%, 1M-3M BM-0.5%,
+# 3M+ BM-0.25% (identical in July 2017 and on the live short-sale-cost page 2026-10-30),
+# same NAV eligibility; the borrow fee is charged separately (portal.borrow).
+# Rows before the first verified date apply the earliest verified schedule (approx).
+# --------------------------------------------------------------------------
+FFE_BENCHMARK_START = pd.Timestamp("2007-09-01")    # IBKR USD benchmark LIBOR -> Fed Funds Effective (approx)
+_INF = float("inf")
+_IBKR_INT = [
+    # date, debit tiers [(upper, spread)], credit threshold, credit spread, short tiers, nav proration, src, approx
+    ("1990-01-01", ((1e5, 0.015), (1e6, 0.010), (3e6, 0.005), (_INF, 0.0025)), 10_000.0, 0.005,
+     ((1e5, None), (1e6, 0.0125), (3e6, 0.005), (_INF, 0.0025)), False,
+     "IBG AR 2012 (2013-02-01) / July 2017 schedule applied retroactively (approx)", True),
+    ("2013-02-01", ((1e5, 0.015), (1e6, 0.010), (3e6, 0.005), (_INF, 0.0025)), 10_000.0, 0.005,
+     ((1e5, None), (1e6, 0.0125), (3e6, 0.005), (_INF, 0.0025)), False,
+     "IBG AR 2012/2013/2016/2019 margin tables; Attachment C July 2017 credit & short-proceeds tables", False),
+    ("2020-02-10", ((1e5, 0.015), (1e6, 0.010), (3e6, 0.005), (_INF, 0.0025)), 10_000.0, 0.005,
+     ((1e5, None), (1e6, 0.0125), (3e6, 0.005), (_INF, 0.0025)), True,
+     "IBG AR 2019 (rates as of 2020-02-10): NAV < USD 100K paid pro rata", False),
+    ("2020-02-11", ((1e5, 0.015), (1e6, 0.010), (5e7, 0.0075), (_INF, 0.005)), 10_000.0, 0.005,
+     ((1e5, None), (1e6, 0.0125), (3e6, 0.005), (_INF, 0.0025)), True,
+     "IBG AR 2020 (2021-01-04) / live margin-rates page 2026-10-30 (change date approx)", True),
+]
+IBKR_PRO_INTEREST = RateTable("IBKR Pro USD interest", [
+    RateRow(_d(d), {"debit": deb, "credit_threshold": th, "credit_spread": cs, "short_proceeds": sp,
+                    "nav_proration": pr}, src, ap)
+    for d, deb, th, cs, sp, pr, src, ap in _IBKR_INT
+])
+IBKR_NAV_ELIGIBILITY = 100_000.0
+
+
+def tiered_blend(balance: float, tiers, bm: float, sign: int = +1) -> float:
+    """Annual interest AMOUNT on ``balance`` (>= 0) over IBKR-style tiers.
+
+    ``tiers`` = ((upper_bound, spread), ...); a tier spread of None pays 0. ``sign=+1``:
+    rate = BM + spread (debit); ``sign=-1``: rate = max(BM - spread, 0) (credit)."""
+    total, lo = 0.0, 0.0
+    for hi, spread in tiers:
+        if balance <= lo:
+            break
+        amt = min(balance, hi) - lo
+        if spread is not None:
+            rate = bm + spread if sign > 0 else max(bm - spread, 0.0)
+            total += amt * rate
+        lo = hi
+    return total
+
+
+# --------------------------------------------------------------------------
+# FINRA Rule 4210(f)(8)(B) pattern day trader: approved by SEC Rel. 34-44009 (2001-02-27),
+# effective 2001-09-28 (NASD NtM 01-26 / NYSE IM 01-20). Minimum equity USD 25,000.
+# --------------------------------------------------------------------------
+PDT_EFFECTIVE = pd.Timestamp("2001-09-28")
+PDT_MIN_EQUITY = 25_000.0
+PDT_MAX_DAY_TRADES = 3          # a 4th day trade within 5 business days designates the account
+PDT_WINDOW_SESSIONS = 5
+
+
+def settlement_days(date) -> int:
+    """Regular-way US equity settlement cycle in force on ``date`` (T+3 from 1995-06-07,
+    T+2 from 2017-09-05, T+1 from 2024-05-28; T+5 before)."""
+    d = _as_naive_date(date)
+    n = 5
+    for eff, k in SETTLEMENT_CYCLE:
+        if d >= eff:
+            n = k
+    return n

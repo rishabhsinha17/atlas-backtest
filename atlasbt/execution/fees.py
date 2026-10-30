@@ -229,17 +229,19 @@ class FeeSchedule:
 # --------------------------------------------------------------------------
 # IBKR Pro option commission (same table for Fixed and Tiered accounts)
 # --------------------------------------------------------------------------
-def ibkr_option_rate(premium: float, mtd_contracts: float) -> float:
+def ibkr_option_rate(premium: float, mtd_contracts: float, top: float = 0.65) -> float:
     """IBKR Pro US option commission per contract (2026 schedule).
 
     <=10,000 contracts/month: premium>=0.10 -> 0.65; 0.05<=p<0.10 -> 0.50; p<0.05 -> 0.25
     10,001-50,000:            p>=0.05 -> 0.50; p<0.05 -> 0.25
     50,001-100,000:           0.25
     >=100,001:                0.15
+    ``top`` replaces the 0.65 rate (historical schedule: 0.70 before the IBKR Pro repricing,
+    rates.IBKR_PRO_HISTORY).
     """
     if mtd_contracts < 10_000:
         if premium >= 0.10:
-            return 0.65
+            return top
         return 0.50 if premium >= 0.05 else 0.25
     if mtd_contracts < 50_000:
         return 0.50 if premium >= 0.05 else 0.25
@@ -250,11 +252,23 @@ def ibkr_option_rate(premium: float, mtd_contracts: float) -> float:
 
 class _IBKROptionsMixin:
     option_min_per_order = 1.00
+    #: True: point-in-time IBKR Pro commission history (rates.IBKR_PRO_HISTORY); False (default):
+    #: the current (2026) schedule applied to every date
+    historical = False
+
+    def _init_history(self, historical: bool) -> None:
+        self.historical = bool(historical)
+        if self.historical:
+            self.name = type(self).name + "_HISTORICAL"
+
+    def _hist(self, date, key: str, default):
+        return rates.IBKR_PRO_HISTORY.at(date, key) if self.historical else default
 
     def _option_commission(self, inst, contracts, premium, date, order_id) -> float:  # type: ignore[override]
         raw = 0.0
         remaining = contracts
         mtd = self._mtd_contracts  # type: ignore[attr-defined]
+        top = self._hist(date, "opt_top", 0.65)
         # marginal tiering within the fill
         for lo, hi in ((0, 10_000), (10_000, 50_000), (50_000, 100_000), (100_000, math.inf)):
             if remaining <= 0:
@@ -262,7 +276,7 @@ class _IBKROptionsMixin:
             if mtd >= hi:
                 continue
             take = min(remaining, hi - max(mtd, lo))
-            raw += take * ibkr_option_rate(premium, max(mtd, lo))
+            raw += take * ibkr_option_rate(premium, max(mtd, lo), top)
             mtd += take
             remaining -= take
         return self._apply_min_max(order_id, raw, contracts * premium * inst.multiplier,  # type: ignore[attr-defined]
@@ -281,9 +295,14 @@ class IBKRProFixed(_IBKROptionsMixin, FeeSchedule):
     min_per_order = 1.00
     max_frac = 0.01
 
+    def __init__(self, historical: bool = False):
+        super().__init__()
+        self._init_history(historical)
+
     def _stock_commission(self, inst, qty, price, date, liquidity, order_id):
         raw = qty * self.per_share
-        comm = self._apply_min_max(order_id, raw, qty * price, self.min_per_order, self.max_frac)
+        mn = self._hist(date, "fixed_min", self.min_per_order)
+        comm = self._apply_min_max(order_id, raw, qty * price, mn, self.max_frac)
         return comm, 0.0
 
 
@@ -311,6 +330,18 @@ class IBKRProTiered(_IBKROptionsMixin, FeeSchedule):
     auction_fee_per_share = 0.0010
     maker_fee_per_share = 0.0
 
+    def __init__(self, historical: bool = False):
+        super().__init__()
+        self._init_history(historical)
+
+    def tiered_min(self, date) -> float:
+        """Per-order minimum in force (historical: USD 0.70 below 100M shares/month before the
+        IBKR Pro repricing, USD 0.35 above; current: USD 0.35)."""
+        if not self.historical:
+            return self.min_per_order
+        key = "tiered_min_high_volume" if self._mtd_shares >= 100_000_000 else "tiered_min"
+        return rates.IBKR_PRO_HISTORY.at(date, key)
+
     def tiered_raw(self, qty: float) -> float:
         raw = 0.0
         remaining = qty
@@ -329,7 +360,7 @@ class IBKRProTiered(_IBKROptionsMixin, FeeSchedule):
 
     def _stock_commission(self, inst, qty, price, date, liquidity, order_id):
         raw = self.tiered_raw(qty)
-        comm = self._apply_min_max(order_id, raw, qty * price, self.min_per_order, self.max_frac)
+        comm = self._apply_min_max(order_id, raw, qty * price, self.tiered_min(date), self.max_frac)
         if liquidity == "MAKER":
             exch = qty * self.maker_fee_per_share
         elif liquidity == "AUCTION":
@@ -403,6 +434,10 @@ class NoFees(FeeSchedule):
 
 
 def make_fee_schedule(name: str = "IBKR_PRO_TIERED", **kw) -> FeeSchedule:
+    up = name.upper()
+    if up in ("IBKR_PRO_TIERED_HISTORICAL", "IBKR_PRO_FIXED_HISTORICAL"):
+        cls = IBKRProTiered if "TIERED" in up else IBKRProFixed
+        return cls(historical=True, **kw)
     table = {
         "IBKR_PRO_TIERED": IBKRProTiered,
         "IBKR_PRO_FIXED": IBKRProFixed,
@@ -412,5 +447,6 @@ def make_fee_schedule(name: str = "IBKR_PRO_TIERED", **kw) -> FeeSchedule:
     try:
         cls = table[name.upper()]
     except KeyError:
-        raise ValueError(f"unknown fee schedule {name!r}; choose from {sorted(table)}") from None
+        raise ValueError(f"unknown fee schedule {name!r}; choose from "
+                         f"{sorted(table) + ['IBKR_PRO_FIXED_HISTORICAL', 'IBKR_PRO_TIERED_HISTORICAL']}") from None
     return cls(**kw)

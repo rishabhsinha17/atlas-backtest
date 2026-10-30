@@ -83,11 +83,28 @@ def cboe_index_history(name: str, directory: str | None = None) -> pd.Series:
     p = Path(directory) if directory else CBOE_DIR
     f = p / f"{name}_History.csv"
     if not f.exists():
+        if directory is None:       # gitignored CSVs are absent in pinned worktrees: use the cache store
+            s = _store_index_history(name)
+            if not s.empty:
+                return s
         raise FileNotFoundError(f)
     df = pd.read_csv(f)
     col = "CLOSE" if "CLOSE" in df.columns else df.columns[-1]
     s = pd.Series(pd.to_numeric(df[col], errors="coerce").values,
                   index=pd.to_datetime(df["DATE"], format="%m/%d/%Y"), name=name).dropna()
+    s = s[s > 0]
+    return s[~s.index.duplicated(keep="last")].sort_index()
+
+
+def _store_index_history(name: str) -> pd.Series:
+    """Same Cboe close series from the cache store (bars_1d/cboe/<NAME>, fetched from cdn.cboe.com)."""
+    from atlasbt.data.store import default_store
+    df = default_store().read("bars_1d", "cboe", name)
+    if df.empty or "close" not in df.columns:
+        return pd.Series(dtype=float, name=name)
+    start = df["start"] if "start" in df.columns else df.index.to_series()
+    idx = pd.DatetimeIndex(pd.to_datetime(start, utc=True)).tz_convert("America/New_York").normalize().tz_localize(None)
+    s = pd.Series(pd.to_numeric(df["close"], errors="coerce").values, index=idx, name=name).dropna()
     s = s[s > 0]
     return s[~s.index.duplicated(keep="last")].sort_index()
 

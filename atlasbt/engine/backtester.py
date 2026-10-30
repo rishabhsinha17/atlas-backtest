@@ -147,6 +147,13 @@ class Backtester:
         self._flat_by_ns: Optional[int] = None
         self._no_entry_ns: Optional[int] = None
         self.prior_nav = self.cfg.initial_cash
+        # FINRA 4210(f)(8)(B) pattern-day-trader state (see _pdt_*)
+        self._pdt_track = bool(cfg.pdt_rule) and self.account.account_type == AccountType.REG_T_MARGIN
+        self._pdt_live = False
+        self._pdt_opened: dict[str, set] = {}
+        self._pdt_sessions: list[int] = []
+        self._pdt_trades: list[tuple[int, int, str]] = []      # (session ns, order id, symbol)
+        self._pdt_diag: Optional[dict] = None
         self.now = pd.Timestamp(0, tz="UTC")
         self.now_ns = 0
         self.session = pd.Timestamp(0)
@@ -634,6 +641,8 @@ class Backtester:
         self._flattened_session = False
         self._borrow_cache.clear()
         self._setup_session_rules(session, steps)
+        if self._pdt_track:
+            self._pdt_session_start(session)
         ts = self.now
         # 1. dividends due
         for a in self.ca.pay_due(self.account, session, ts):
@@ -1062,6 +1071,8 @@ class Backtester:
 
         def get():
             self._clamp_reduce_only(sym)
+            if self._pdt_live:
+                self._pdt_screen(sym)
             return [(o, om.extras[o.id]) for o in om.active(sym)
                     if o.type not in (OrderType.MOO, OrderType.MOC)]
         return get
@@ -1162,6 +1173,9 @@ class Backtester:
         return ("POST" if t_ns < c + 4 * 3600 * 10**9 else "CLOSED"), key
 
     def _fill_auction(self, sym: str, inst: Instrument, orders: list[Order], lo: int, hi: int) -> None:
+        if self._pdt_live:
+            self._pdt_screen(sym)
+            orders = [o for o in orders if o.status in ACTIVE]
         o_ts, c_ts = self.session_open_close
         sess_ns = int(self.session.value)
         b, i0, i1 = self.md.window(sym, lo, hi)
@@ -1203,6 +1217,9 @@ class Backtester:
         impact), never from a close known at submission."""
         for od in orders:
             ex = self.om.extras[od.id]
+            if self._pdt_live and od.type != OrderType.COMBO and od.instrument is not None \
+                    and od.status in ACTIVE:
+                self._pdt_screen(od.instrument.symbol)
             if ex.eligible_ns >= hi or od.status not in ACTIVE:
                 continue
             legs = od.legs if od.type == OrderType.COMBO else (Leg(od.instrument, 1),)
@@ -1353,6 +1370,8 @@ class Backtester:
         pos_before = self.account.position(inst.symbol)
         self.account.apply_fill(fill)
         self._state_ver += 1
+        if self._pdt_track:
+            self._pdt_on_fill(o.id, inst.symbol, pos_before, d.qty)
         ex = self.om.extras.get(o.id)
         istop = None
         planned = None
@@ -1744,6 +1763,12 @@ class Backtester:
                     self.now_ns > self._no_entry_ns or
                     (self.now_ns == self._no_entry_ns and order.type != OrderType.MARKET)):
                 return self.om.reject(order, f"no new entries after {ne} ET (close-adjusted)", now)
+        # FINRA 4210 pattern day trader: no 4th day trade in 5 business days below USD 25,000
+        if self._pdt_live and not internal and sym is not None and t != OrderType.COMBO:
+            why = self._pdt_block_reason(sym, q, None)
+            if why:
+                self._pdt_note_block(sym, None, why)
+                return self.om.reject(order, why, now)
         # short sales: locate + account type
         if inst is not None and not inst.is_option and t != OrderType.COMBO and q < 0:
             projected = self._projected_position(sym, order, int((now + lat).value))
@@ -1958,7 +1983,11 @@ class Backtester:
             rf = 0.0
             if self.account.cash != 0:
                 self.fid.note(Fidelity.T2_PROXY, "risk-free rate unavailable: 0 used")
-        fin = accrue_financing(self.account, ts, days, rf, lambda s: self._borrow(s)[1], self.cfg.financing)
+        bm = None
+        if self.cfg.financing.schedule == "ibkr_pro":
+            bm = self._financing_benchmark(ts, session, rf)
+        fin = accrue_financing(self.account, ts, days, rf, lambda s: self._borrow(s)[1], self.cfg.financing,
+                               benchmark=bm)
         f = self.diag["financing"]
         f["credit"] += fin.credit; f["debit"] += fin.debit; f["borrow"] += fin.borrow; f["rebate"] += fin.rebate
         for s_, amt in fin.by_symbol.items():
@@ -2005,6 +2034,104 @@ class Backtester:
         self.prior_nav = nav
         if self.cfg.debug:
             self._check_invariants()
+
+    # ================================================================= pattern day trader
+    def _pdt_session_start(self, session: pd.Timestamp) -> None:
+        """FINRA Rule 4210(f)(8)(B) (effective 2001-09-28), margin accounts only. Day trade = a
+        purchase and sale (or short sale and purchase) of the same security on the same day: a
+        fill that REDUCES a position on a side that was opened or added to earlier in the same
+        session (an overnight position sold before any new purchase is not one, rule exception).
+        Counted once per order and symbol. With equity at the prior close below USD 25,000 the
+        order that would be the 4th day trade within 5 business days (this session and the 4
+        before) is rejected (at submission, and working strategy orders when they come up for a
+        fill), reason 'PDT ...'. Engine liquidation/flatten orders are never blocked (they count).
+        Equity >= USD 25,000 at the prior close: exempt for that day. The 6%-of-trades
+        designation test is ignored (brokers block the 4th day trade outright)."""
+        from ..execution.rates import PDT_EFFECTIVE, PDT_MIN_EQUITY, PDT_WINDOW_SESSIONS
+        self._pdt_opened = {}
+        sn = int(pd.Timestamp(session).value)
+        self._pdt_sessions.append(sn)
+        if len(self._pdt_sessions) > PDT_WINDOW_SESSIONS:
+            del self._pdt_sessions[:-PDT_WINDOW_SESSIONS]
+        lo = self._pdt_sessions[0]
+        self._pdt_trades = [x for x in self._pdt_trades if x[0] >= lo]
+        live = pd.Timestamp(session) >= PDT_EFFECTIVE and self.prior_nav < PDT_MIN_EQUITY
+        self._pdt_live = live
+        if live:
+            if self._pdt_diag is None:
+                self._pdt_diag = {"restricted_sessions": 0, "day_trades": 0, "blocked": []}
+                self.diag["pdt"] = self._pdt_diag
+            self._pdt_diag["restricted_sessions"] += 1
+
+    def _pdt_on_fill(self, oid: int, sym: str, pos_before: float, q: float) -> None:
+        if q == 0:
+            return
+        sq = 1 if q > 0 else -1
+        opened = self._pdt_opened.get(sym)
+        if pos_before != 0 and (pos_before > 0) != (q > 0):
+            side = 1 if pos_before > 0 else -1
+            if opened and side in opened:
+                sn = int(self.session.value)
+                if not any(x[0] == sn and x[1] == oid and x[2] == sym for x in self._pdt_trades):
+                    self._pdt_trades.append((sn, oid, sym))
+                    if self._pdt_diag is not None:
+                        self._pdt_diag["day_trades"] += 1
+            if abs(q) <= abs(pos_before) + 1e-12:
+                return                              # pure reduction: opens nothing
+        if opened is None:
+            opened = self._pdt_opened[sym] = set()
+        opened.add(sq)
+
+    def _pdt_block_reason(self, sym: str, q: float, oid: Optional[int]) -> Optional[str]:
+        from ..execution.rates import PDT_MAX_DAY_TRADES, PDT_MIN_EQUITY
+        pos = self.account.position(sym)
+        if pos == 0 or (pos > 0) == (q > 0):
+            return None
+        opened = self._pdt_opened.get(sym)
+        if not opened or (1 if pos > 0 else -1) not in opened:
+            return None
+        sn = int(self.session.value)
+        if oid is not None and any(x[0] == sn and x[1] == oid and x[2] == sym for x in self._pdt_trades):
+            return None                             # this order's day trade is already counted
+        n = len(self._pdt_trades)
+        if n < PDT_MAX_DAY_TRADES:
+            return None
+        return (f"PDT rule (FINRA 4210(f)(8)(B)): would be day trade #{n + 1} within 5 business days "
+                f"with prior-close equity {self.prior_nav:,.2f} < {PDT_MIN_EQUITY:,.0f}")
+
+    def _pdt_note_block(self, sym: str, oid: Optional[int], why: str) -> None:
+        if self._pdt_diag is not None:
+            self._pdt_diag["blocked"].append({"ts": self.now, "symbol": sym, "order_id": oid, "reason": why})
+
+    def _pdt_screen(self, sym: str) -> None:
+        """Reject working strategy orders on ``sym`` that would now be a blocked day trade."""
+        for o in self.om.active(sym):
+            ex = self.om.extras[o.id]
+            if ex.is_flatten or o.instrument is None:
+                continue
+            why = self._pdt_block_reason(sym, o.remaining, o.id)
+            if why:
+                self._pdt_note_block(sym, o.id, why)
+                self._reject_working(o, why)
+
+    def _financing_benchmark(self, ts: pd.Timestamp, session: pd.Timestamp, rf: float) -> float:
+        """IBKR USD benchmark (Fed Funds Effective, FRED DFF via portal tenor 'ON'), PIT at ``ts``.
+        Before 2007-09 IBKR used USD LIBOR (not available): DFF is used and the run is flagged;
+        if DFF is unavailable the ``rf_tenor`` rate stands in (flagged)."""
+        from ..execution.rates import FFE_BENCHMARK_START
+        try:
+            bm = float(self.portal.risk_free_rate(ts, "ON"))
+        except Exception:
+            bm = float("nan")
+        if bm != bm:
+            bm = rf
+            if self.account.cash != 0:
+                self.fid.note(Fidelity.T2_PROXY, f"financing benchmark: Fed Funds unavailable, {self.cfg.rf_tenor} "
+                                                 f"rate used")
+        elif pd.Timestamp(session) < FFE_BENCHMARK_START and self.account.cash != 0:
+            self.fid.note(Fidelity.T2_PROXY, "financing benchmark: Fed Funds Effective used for the IBKR "
+                                             "USD LIBOR era (before 2007-09)")
+        return bm
 
     def _check_stale_prices(self, session: pd.Timestamp) -> None:
         n = self.cfg.stale_price_sessions
@@ -2116,7 +2243,18 @@ def _config_summary(cfg: BacktestConfig) -> dict:
         "credit_spread": cfg.financing.credit_spread, "debit_spread": cfg.financing.debit_spread,
         "borrow_default_fee": cfg.borrow.default_fee, "resolve_intrabar_freq": cfg.resolve_intrabar_freq,
         "use_quotes": cfg.use_quotes,
-    }
+    } | _nondefault_extras(cfg)
+
+
+def _nondefault_extras(cfg: BacktestConfig) -> dict:
+    """Config keys added after the golden recordings: reported only when they differ from the
+    default, so default runs keep a byte-identical ``meta['config']``."""
+    out = {}
+    if cfg.financing.schedule != "flat":
+        out["financing_schedule"] = cfg.financing.schedule
+    if not cfg.pdt_rule:
+        out["pdt_rule"] = False
+    return out
 
 
 class EngineExecutionState:

@@ -205,6 +205,20 @@ modelled". Run-level flags (SSR inputs, default borrow, rates) are recorded in t
   0.50/0.25, 0.25, 0.15; min $1.00 per order (per leg); + OCC clearing, aggregate ORF, exchange fee
   (equity options $0.10/contract blended approx.; SPX/SPXW Cboe proprietary schedule), SEC + TAF on sales, CAT.
   IBKR published examples are tests. Exercise/assignment: no commission; SEC fee on resulting stock sales.
+* **IBKR Pro commission history (opt-in, point-in-time)**: `fees="IBKR_PRO_TIERED_HISTORICAL"` /
+  `"IBKR_PRO_FIXED_HISTORICAL"` (or `IBKRProTiered(historical=True)`) read `rates.IBKR_PRO_HISTORY` on the
+  trade date. Default stays the current (2026) schedule applied to all dates. Eras:
+
+  | Era | Options (premium ≥ $0.10, ≤ 10k/month) | Tiered stock min / order | Source |
+  |---|---|---|---|
+  | before 2014-02-03 | $0.70 | $0.70 (≤ 100M sh/month), $0.35 above | earliest verified schedule applied retroactively (approx) |
+  | 2014-02-03 – 2019-09-25 | $0.70 (0.50 / 0.25 lower premium; min $1.00) | $0.70 / $0.35 | IBG annual reports 2013 ("rates obtained February 3, 2014": "$0.075 - $0.70 per contract", "USD 0.35 minimum ... exceeding 100,000,000 shares and USD 0.70 minimum per order ... up to 100,000,000 shares. USD 1.00 minimum on options"), 2014 (2015-02-02, same minimums), 2016 (2017-03-02: "$0.00 base, $0.70 per contract") |
+  | from 2019-09-26 | $0.65 | $0.35 | live IBKR commissions-stocks / -options pages (retrieved 2026-10-30). The change date is NOT verified: placed on the IBKR Pro/Lite repricing (IBKR Lite introduced 2019-09-26, IBG AR 2019) and flagged approx |
+
+  Fixed: $0.005/sh, min $1.00, max 1% in every era (no contrary evidence found). The per-share tiers
+  ($0.0035..$0.0005) and the exchange/clearing/NYSE/FINRA pass-throughs are unchanged across eras (the IBG
+  reports quote the same $0.0005-$0.0035 range); web.archive.org was unreachable from this environment, so
+  monthly-granularity dates could not be checked (NEEDS archive access to tighten).
 * **Zero-commission retail**: $0 stock/ETF commission from 2019-10-07 (industry move led by Schwab); before that
   (with `historical=True`) $4.95/order + $0.65/contract; SEC/TAF/OCC/ORF passed through; no PFOF price
   improvement credited.
@@ -255,6 +269,39 @@ modelled". Run-level flags (SSR inputs, default borrow, rates) are recorded in t
   fee on short market value at the `portal.borrow` rate; short rebate 0 (retail). Defaults reflect IBKR Pro's
   benchmark ± spread schedule for small balances. `rf` = `portal.risk_free_rate(as_of, '3M')`; recorded per session
   in `meta["rf_daily"]`.
+* **IBKR Pro dated financing (opt-in, `FinancingConfig(schedule="ibkr_pro")`)**, point-in-time on the accrual
+  date (`rates.IBKR_PRO_INTEREST`); benchmark BM = Fed Funds Effective (FRED DFF via
+  `portal.risk_free_rate(as_of, "ON")`, IBKR's USD benchmark; before 2007-09 IBKR used USD LIBOR, which is not in
+  the cache: DFF stands in and the run is flagged T2 "LIBOR era"); `meta["rf_daily"]` (Sharpe) stays on `rf_tenor`.
+  * Debit (blended over tiers): 2013-02-01..2020-02-10 BM+1.5% ≤ $100K, +1.0% to $1M, +0.5% to $3M, +0.25% above
+    (reproduces the blended APRs in the IBG annual reports 2012 (2013-02-01), 2013, 2016 and 2019 (2020-02-10) to
+    ±0.03% using DFF on the quoted date); from 2020-02-11 BM+1.5% / +1.0% / +0.75% to $50M / +0.5% above (IBG AR
+    2020 (2021-01-04), AR 2021, live margin-rates page 2026-10-30; the change date inside 2020-02-10..2021-01-04 is
+    unknown and placed at the earliest date: the new tiers cost more on large loans). Before 2013: 2013 tiers (approx).
+  * Credit on cash: 0 on the first $10,000, max(BM − 0.5%, 0) above ("none before rates > 0": the floor);
+    accounts with NAV ≤ $100K earn nothing before 2020-02-10 ("only accounts with NAV exceeding USD 100,000 will be
+    eligible", IBKR site snapshot July 2017, Attachment C) and NAV/100K of the rate from 2020-02-10 (IBG AR 2019
+    footnote, live page). Cash = cash net of short-sale proceeds, as in the flat schedule.
+  * Short-sale proceeds: 0% ≤ $100K, BM − 1.25% to $1M, BM − 0.5% to $3M, BM − 0.25% above, floored at 0, same NAV
+    eligibility (identical in July 2017 and on the live short-sale-cost page), posted as SHORT_REBATE pro rata by
+    short market value; the borrow fee is still charged separately at the `portal.borrow` rate (unchanged).
+  * Known answers (tests/portfolio/test_pf_financing_ibkr.py, tests/execution/test_exec_fees_history.py).
+  The default stays `schedule="flat"` (golden results unchanged): for a $1M account the flat schedule is close
+  (credit on the first $10K is the only difference) and for loans above $100K it is more conservative.
+* **Pattern day trader (FINRA Rule 4210(f)(8)(B), effective 2001-09-28; `BacktestConfig.pdt_rule=True`)**: REG_T_MARGIN
+  accounts whose equity at the prior session close is below $25,000 may not make a 4th day trade within 5
+  business days (this session and the 4 before). Day trade = a fill that reduces a position on a side opened or
+  added to earlier in the same session (rule text: purchase and sale, or short sale and purchase, of the same
+  security on the same day; an overnight position sold before any new purchase is not one); counted once per order
+  and symbol (stocks and options). The offending order is rejected with reason `PDT rule (FINRA 4210(f)(8)(B)):
+  would be day trade #4 ...` — at submission, and working strategy orders (e.g. a bracket stop on a position opened
+  today) are rejected when they come up for a fill (they would close a same-day position). Engine flatten /
+  margin-call orders are never blocked (they count). Equity ≥ $25K at the prior close: exempt that day. CASH
+  accounts and dates before 2001-09-28: not applied. `diagnostics["pdt"]` (restricted sessions, day trades,
+  blocked orders) exists only when the restriction was ever active, so default $1M runs are byte-identical. The
+  6%-of-trades designation test and the 90-day "closing only" freeze after a violation are not modelled (the 4th
+  day trade is blocked outright, as IBKR does). Tests: tests/engine/test_eng_pdt.py (both sides of $25K, window
+  roll-off, pre-2001, cash account, working child order).
 * Reg-T margin (`margin.py`): initial 50% long / 50% short (150% total); maintenance 25% long, short max($5/sh, 30%)
   at ≥ $5 and max($2.50/sh, 100%) below $5 (FINRA 4210). Long options have no loan value: 100% of their market value
   is added to the requirement (75% when more than 9 months to expiry, FINRA 4210(f)(2)(C)). Pre-trade check includes
@@ -292,6 +339,29 @@ modelled". Run-level flags (SSR inputs, default borrow, rates) are recorded in t
   * Splits of an underlying apply the OCC contract adjustment from `atlasbt.options.lifecycle.adjust_for_split`
     (OPTIONS agent) to every option position and working option order on it (logged as `OCC_SPLIT_ADJUSTMENT`).
 * Options are marked at session ends from `portal.option_quote` mids (intraday option NAV is stale).
+
+### Corporate-action cross-check (`atlasbt/data/ca_crosscheck.py`)
+The actions the ledger applies are validated offline against an independent vendor and independent prices:
+Yahoo actions (classified by `actions_classify`, as the portal serves them) vs DoltHub's split table (from
+2014-03-28) and dividend table, matched within ±3 days (split ratio to 1 %, dividend amount to 1 % or on a
+split-adjusted basis), plus the overnight gap on DoltHub's as-traded bars (Yahoo's raw bars are un-adjusted with
+Yahoo's own split factors, so a gap test on them would be circular). An identity guard (Yahoo and DoltHub closes
+within 5 % before the ex-date) excludes reused tickers. Nothing is corrected: rows get severity `error` (a served
+split contradicted by prices, a real split missing from the served actions, a pure spin-off still served as a
+SPLIT row) or `warn`; `flags(report)` returns them for fail-closed handling. CLI / report hook:
+`python -m atlasbt.data.ca_crosscheck [SYMBOL ...]` -> `cache/qa/ca_crosscheck_<date>.csv` + `_summary.json`.
+
+Result on the cache 2026-10-30 (657 symbols with Yahoo actions): **splits** 171 events comparable in both
+sources with identity confirmed, 128 agree, **43 disagree (25.1 %)** -- 35 Yahoo splits absent from DoltHub, of
+which every one with a usable gap is confirmed by DoltHub's own prices (leveraged ETFs, TJX, EW, ODFL, GOOGL
+2014 ...: DoltHub omissions), 4 DoltHub-only, 1 date mismatch (CMCSA 2017: price supports Yahoo), 1 ratio
+mismatch (TSLA 2020: Yahoo 5:1, DoltHub 4:1; price supports Yahoo), 1 price-contradicted Yahoo split (SSP
+2025-12-08 ratio 1.33, gap 1.000) and **GE 2024-04-02: the GE Vernova spin-off is served twice (SPINOFF and a
+1.253 SPLIT), multiplying the share count** (DATA-layer fix needed; flagged `error`). 13 extra DoltHub rows on
+announcement/record dates are not counted. **Dividends**: 29,300 comparable events, 27,296 agree, **1,439
+disagree (4.9 %)**: 607 missing in DoltHub, 264 missing in Yahoo, 568 amount mismatches; another 565 differ only
+by split basis (DoltHub pre-split amounts adjusted) and are flagged separately. Tests:
+tests/data/test_ca_crosscheck.py (synthetic store).
 
 ## 4. Results (`core.types.BacktestResult`, columns per `core/schemas.py`)
 * `equity` NAV at each session close (UTC); `returns` daily simple (first vs initial cash).
@@ -357,13 +427,14 @@ name cap), `size_swing_notional` also nets the existing same-side notional in th
 
 ## 6. Configuration (`engine/config.py: BacktestConfig`)
 `initial_cash` (1e6), `account_type` (REG_T_MARGIN | CASH), `fees` (name or `FeeSchedule`, default
-IBKR_PRO_TIERED), `latency_bars` (0), `latency_quotes` (1 s), `bar_fill` (`participation_cap` 0.10,
+IBKR_PRO_TIERED; `*_HISTORICAL` variants are point-in-time), `latency_bars` (0), `latency_quotes` (1 s), `bar_fill` (`participation_cap` 0.10,
 `allow_fractional` False, `ssr_mode` 'ask_limit', `same_bar_exit` True, `limit_through_ticks` 1), `auction`
 (cutoffs 2/10 min, auction volume shares), `combo` (`price_improvement` 0, `snapshot_tolerance` 0),
 `spread_model` ("calibrated" | "corwin_schultz"), `spread_calibrated` (`CalibratedSpreadConfig`, docs/SPREADS.md), `spread` (legacy `SpreadConfig`: method/window/floors/time-of-day/default/`tick_floor`), `impact` (`SquareRootImpact(k=0.1)`),
 `daily_open_spread_mult` (1.0), `use_quotes` ('auto'), `resolve_intrabar_freq` ('1m'), `short_sale_rules`,
 `borrow` (`BorrowConfig`: default 0.30%, `require_borrow_data`), `enforce_locates`, `halt_events`,
-`financing` (`FinancingConfig`: spreads 0.50%/1.50%, rebate 0, day count 360), `corporate_actions`
+`financing` (`FinancingConfig`: spreads 0.50%/1.50%, rebate 0, day count 360, `schedule` 'flat' | 'ibkr_pro'),
+`pdt_rule` (True), `corporate_actions`
 (withholding, fractional shares), `quote_min_per_hour` (60), `option_margin` (None/'cboe'/'conservative'/instance), `option_lifecycle` (None/'occ'/'conservative'/instance), `check_margin_on_submit`, `margin_calls`,
 `rf_tenor` ('3M'), `stats_window` (20), `lookback_sessions` (60), `debug` (invariants every step),
 `record_intraday_equity`, `max_option_mark_staleness` (5 days), `stale_price_sessions` (5),
@@ -392,9 +463,17 @@ reflects machine load); ~10-20 s for 2 years × 1,000 symbols daily with ~500 op
 * Bar-mode fills assume trade prints are mid prices; maker fills ignore queue position beyond the 1-tick rule and
   adverse selection; maker rebates are ignored.
 * ORF aggregate and pre-2003 TAF rows are approximate; Cboe SPX fees before 2026-10 use the 2026 schedule; IBKR
-  commission schedules are the 2026 ones applied to all history.
-* Leveraged-ETF maintenance surcharges, portfolio margin, pattern-day-trader rules, settlement-date (T+1/T+2) cash
-  restrictions and good-faith violations in cash accounts are not modelled.
+  commission schedules are the 2026 ones applied to all history by default (the opt-in `*_HISTORICAL` schedules
+  have two eras with an unverified change date, see §2 Fees).
+* Leveraged-ETF maintenance surcharges, portfolio margin, settlement-date (T+1/T+2) cash restrictions and
+  good-faith violations in cash accounts are not modelled (`rates.settlement_days(date)` gives the cycle: T+3 from
+  1995-06-07, T+2 from 2017-09-05, T+1 from 2024-05-28). The PDT rule is modelled (§3) except the 90-day freeze.
+* MOC/LOC entry cutoffs use 15:50 ET for all history and all venues. Sourced history (not applied, because the
+  engine does not yet model each listing venue's cutoff and NYSE Arca ETFs accept MOC orders until 15:59): NYSE
+  15:40 before 2010 (Amex also 15:40: Federal Register doc 99-24802, 1999-09-23), 15:45 proposed in SR-NYSE-2009-111
+  (Federal Register doc E9-27503, 2009-11-17; in force by late 2010, exact date not verified), 15:50 from
+  2019-04-01 (NYSE trader notice 2018-12-14; SEC approval of SR-NYSE-2018-58, Federal Register doc 2019-01175,
+  2019-02-06). A pre-2019 intraday MOC submitted 15:45-15:50 on an NYSE-listed stock would have been rejected.
 * Early exercise/assignment and pin risk come from the OPTIONS agent's `OccOptionLifecycle` (default); its
   physical-delivery price is the strike per share, which is only exact for standard 100-share deliverables (the
   conservative `DefaultOptionLifecycle` handles non-standard deliverables). Option marks are updated only at session
