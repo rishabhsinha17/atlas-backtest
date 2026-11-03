@@ -10,7 +10,8 @@ Rules (documented in docs/RUNNING.md §2):
   the reason: intraday OPTION quotes (none exist in the free data), quote requirements whose cached quote
   history covers fewer sessions than the minimum window, ``inav``-type kinds without a source.
 * Window start = the first session at which every critical input exists:
-  - bars of explicitly named symbols: the latest first bar among them;
+  - bars of explicitly named symbols: the latest first bar among them; bars declared for the whole
+    universe (``symbols=("*",)``) are checked like bars without symbols (next two rules);
   - bars of the strategy universe (no explicit symbols): all members for small universes (<= 6 names);
     otherwise the first date by which >= 80% of the members have bars (the
     strategies trade late listers once they have bars);
@@ -58,6 +59,26 @@ def _today_utc() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 
+def _data_version(portal) -> str:
+    try:
+        from atlasbt.data.identity import BUILD_VERSION
+    except Exception:            # pragma: no cover
+        BUILD_VERSION = "?"
+    mem = ""
+    try:
+        meta = portal.store.meta("reference", "sp500", "membership") or {}
+        mem = str(meta.get("fetched_at", ""))
+    except Exception:
+        pass
+    ev = ""
+    try:
+        root = Path(portal.store.root) / "events"
+        ev = str(max((f.stat().st_mtime_ns for f in root.rglob("*.parquet")), default=0))
+    except Exception:
+        pass
+    return f"identity={BUILD_VERSION};membership={mem};events={ev}"
+
+
 class PlanContext:
     """Memoized availability facts (persisted in results/plan_cache.json)."""
 
@@ -67,6 +88,13 @@ class PlanContext:
         self.path = Path(results_dir) / "plan_cache.json"
         self.cache: dict = read_json(self.path, {}) or {}
         self.dirty = False
+        # memoized availability facts are only valid for the data they were computed on: the identity
+        # layer's build version and the S&P membership table (survivorship patches move the SP500
+        # coverage start) -> a changed data version drops the memo
+        dv = _data_version(portal)
+        if self.cache.get("_data_version") != dv:
+            self.cache = {"_data_version": dv}
+            self.dirty = True
         from atlasbt.core.clock import nyse
 
         self.cal = nyse()
@@ -214,6 +242,33 @@ class PlanContext:
 
         return self._memo(f"sp500|coverage_start|{th:.3f}", f)
 
+    #: long-lived issuers used to probe when a fundamentals field becomes available through the portal
+    FIELD_PROBE = ("AAPL", "MSFT", "JPM", "XOM", "JNJ", "PG", "KO", "WMT", "IBM", "GE")
+
+    def field_start(self, field: str) -> Optional[str]:
+        """First month end at which portal.fundamentals(field) already had a value ONE month earlier
+        (a level AND its change/revision are computable): estimates 2017-10-31 -> 2017-11-30; XBRL
+        revenue_q 2009-08 -> 2009-09-30. None if the portal never serves the field for the probe set."""
+        def known(d) -> bool:
+            a = pd.Timestamp(d, tz="UTC") + pd.Timedelta(hours=21)
+            try:
+                r = self.portal.fundamentals(list(self.FIELD_PROBE), [field], a)
+            except Exception:
+                return False
+            return bool(len(r)) and bool(pd.to_numeric(r.get("value"), errors="coerce").notna().any())
+
+        def f():
+            now = _today_utc().tz_localize(None)
+            years = list(range(2000, now.year + 1))
+            y0 = next((y for y in years if known(pd.Timestamp(f"{y}-12-31"))), None)
+            if y0 is None:
+                return None
+            mes = pd.date_range(f"{y0}-01-31", f"{y0}-12-31", freq="ME")
+            first = next(m for m in mes if known(m))
+            return str((first + pd.offsets.MonthEnd(1)).date())
+
+        return self._memo(f"fundamentals|start|{field}", f)
+
     def sp500_coverage_note(self) -> str:
         def f():
             notes = []
@@ -343,10 +398,37 @@ def _plan_instance(sid: str, inst, freq: str, pc: PlanContext, row: dict) -> dic
             return row
     for r in reqs:
         if not r.critical:
+            # non-critical inputs never block a run, but when available they TIER it exactly like the
+            # engine's fidelity ledger does (S042 DIVIDEND_DECL events are T2 -> the run is T2)
+            fid_nc, what = _noncritical_fidelity(p, r)
+            if fid_nc is None:
+                notes.append(f"non-critical {what} unavailable (run proceeds without it)")
+            else:
+                worst = max(worst, fid_nc)
+                if fid_nc > Fidelity.T1_BAR:
+                    notes.append(f"non-critical {what} used at {fid_nc.name}")
             continue
         kind = r.kind
         rfreq = r.freq
         explicit = r.symbols is not None and len(r.symbols) > 0
+        star = explicit and all(str(s) == "*" for s in r.symbols)
+        if kind == "bars" and star:
+            # bars of the WHOLE universe ("*"): verified exactly like a bars requirement without
+            # symbols -- per-member availability, the PIT coverage rule for SP500 (min_coverage) and the
+            # 80 %-listed rule for larger static universes. Without any universe it is a portal-wide
+            # check (portal.has('*', 'bars', freq), the engine's semantics for "*").
+            explicit = False
+            if not uname and not universe:
+                f = rfreq or freq
+                f = "1d" if f in ("1mo", "1w", "event") else f
+                try:
+                    ok = bool(p.has("*", "bars", f))
+                except Exception:
+                    ok = False
+                if not ok:
+                    row["reason"] = f"required bars {f} for the whole universe ('*') unavailable (no universe, portal-wide check failed)"
+                    return row
+                continue
         if explicit:
             syms = [s.upper() for s in r.symbols]
         else:
@@ -368,8 +450,20 @@ def _plan_instance(sid: str, inst, freq: str, pc: PlanContext, row: dict) -> dic
             if not p.has("*", "fundamentals", rfreq):
                 row["reason"] = f"required fundamentals {rfreq or ''} unavailable"
                 return row
-            starts.append((FUNDAMENTALS_START, "fundamentals (XBRL era)", False))
-            worst = max(worst, Fidelity.T1_BAR)
+            # per-field availability start and tier come from the portal (XBRL fields 2009 T1; analyst
+            # consensus eps_consensus_ntm 2017-11 T2), never from constants
+            f0 = pc.field_start(rfreq) if rfreq else None
+            starts.append((pd.Timestamp(f0) if f0 else FUNDAMENTALS_START,
+                           f"fundamentals {rfreq or ''} first usable month end".strip() if f0 else
+                           "fundamentals (XBRL era)", False))
+            try:
+                ff = Fidelity(int(p.fidelity_of("*", "fundamentals", rfreq)))
+            except Exception:
+                ff = Fidelity.T1_BAR
+            if ff == Fidelity.NA or ff > r.min_fidelity:
+                row["reason"] = f"required fundamentals {rfreq or ''} unavailable (fidelity {ff.name})"
+                return row
+            worst = max(worst, ff)
             continue
         if kind == "options":
             # availability and tier from the portal (OPTION_SOURCE_FIDELITY: Databento/Polygon/Alpaca T0,
@@ -508,11 +602,98 @@ def _plan_instance(sid: str, inst, freq: str, pc: PlanContext, row: dict) -> dic
     if n < need:
         row["reason"] = f"window {row['start']}..{row['end']} has {n} sessions < minimum {need}"
         return row
+    # universes the strategy asks the portal for at RUN time (S042: ETF_CORE + 'SP500_TOP50_DV'): the
+    # engine filters each one through its coverage rule (members with base-frequency bars in the run
+    # window, BacktestConfig.min_universe_coverage) and refuses the run below the threshold
+    for un in _runtime_universes(inst, uname):
+        bad = _runtime_coverage(pc, un, freq, pd.Timestamp(d0), pd.Timestamp(d1))
+        if bad:
+            row["reason"] = bad
+            return row
     row["testable"] = "Y"
     est = estimate_runtime_sec(freq, n, syms_n, is_option=str(inst.asset).upper().startswith("OPT"))
     row["est_runtime_min_baseline"] = round(est / 60, 1)
     row["est_runtime_min_grid"] = round(est * row["n_grid"] / 60, 1)
     return row
+
+
+def _noncritical_fidelity(p, r) -> tuple[Optional[Fidelity], str]:
+    """(fidelity, label) of a non-critical requirement when the portal has it, else (None, label)."""
+    kind = r.kind
+    if kind == "events":
+        k = (r.freq or "").upper()
+        what, sym, fq = f"events {k}", "*", k
+    else:
+        syms = [s for s in (r.symbols or ()) if s] or ["*"]
+        sym, fq = syms[0], r.freq
+        what = f"{kind} {r.freq or ''}".strip() + ("" if sym == "*" else f" for {sym}")
+    try:
+        if not bool(p.has(sym, kind, fq)):
+            return None, what
+        f = Fidelity(int(p.fidelity_of(sym, kind, fq)))
+    except Exception:
+        return None, what
+    return (None if f == Fidelity.NA else f), what
+
+
+_RT_UNIVERSE_PATTERNS = (r"""_universe\(\s*ctx\s*,\s*["']([A-Z0-9_]+)["']\s*\)""",
+                         r"""\.universe\(\s*["']([A-Z0-9_]+)["']""")
+
+
+def _runtime_universes(inst, uname: Optional[str]) -> list[str]:
+    """Portal universes a strategy queries at run time besides its declared ``universe_name``: an explicit
+    ``runtime_universes`` attribute, else the literal names in its class source (``_universe(ctx, "X")``,
+    ``portal().universe("X")``) -- every such call goes through the engine's coverage filter."""
+    names = getattr(inst, "runtime_universes", None)
+    if names is None:
+        import inspect
+        import re
+
+        found: list[str] = []
+        for cls in type(inst).__mro__:
+            if not cls.__module__.startswith("atlasbt.strategies") or cls.__name__.startswith("_"):
+                continue                       # shared bases (e.g. _TimedBase) are generic helpers
+            try:
+                src = inspect.getsource(cls)
+            except (OSError, TypeError):
+                continue
+            for pat in _RT_UNIVERSE_PATTERNS:
+                found += re.findall(pat, src)
+        names = found
+    out = []
+    for n in names:
+        n = str(n).upper()
+        if n and n != (uname or "").upper() and n not in out:
+            out.append(n)
+    return out
+
+
+def _runtime_coverage(pc: "PlanContext", name: str, freq: str, d0: pd.Timestamp, d1: pd.Timestamp) -> str:
+    """'' when a run-time universe meets the engine's coverage rule at the window's first and last
+    session (members with ``freq`` bars inside [d0, d1] / members >= min_coverage), else the reason."""
+    f = "1d" if freq in ("1mo", "1w", "event") else freq
+    th = pc.min_coverage
+    for d in (d0, d1):
+        try:
+            members = pc.universe_at(name, d)
+        except Exception as e:
+            return f"run-time universe {name} unavailable ({type(e).__name__}: {e})"
+        if not members:
+            continue
+        missing = []
+        for s_ in members:
+            br = pc.bar_range(s_, f)
+            if br is None or pd.Timestamp(br[1]) < d0 or pd.Timestamp(br[0]) > d1:
+                missing.append(s_)
+        cov = 1 - len(missing) / len(members)
+        if cov < th:
+            from .common import display_symbol
+
+            return (f"run-time universe {name}: {f} bar coverage {cov:.0%} on {pd.Timestamp(d).date()} "
+                    f"({len(missing)}/{len(members)} members without {f} bars in {d0.date()}..{d1.date()}, e.g. "
+                    f"{', '.join(display_symbol(x) for x in missing[:4])}) < min_universe_coverage {th:.0%} "
+                    f"(the engine refuses the run)")
+    return ""
 
 
 def estimate_runtime_sec(freq: str, n_sessions: int, n_symbols: int, is_option: bool = False) -> float:
