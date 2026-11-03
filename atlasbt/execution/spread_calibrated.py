@@ -169,6 +169,7 @@ def normalize_calibration(cal: dict, source: str = "<dict>") -> dict:
     cal.setdefault("sigma_prior", _DEFAULT_SIGMA_PRIOR)
     cal.setdefault("sigma_ref_etf", 0.012)
     cal.setdefault("version", 1)
+    cal.setdefault("nbbo_evidence", None)      # v4: Alpaca SIP NBBO validation of 2016-2025 (docs/SPREADS.md §10)
     return cal
 
 
@@ -188,6 +189,8 @@ class CalibratedSpreadConfig:
     relative_liquidity: bool = True    # deflate ADV$ by market dollar volume (calibration 'market_volume')
     stress_sigma_mult: float = 3.0     # 'stress regime' qualifier when sigma >= mult x reference sigma
     pessimistic_floor_2010_2025: bool = True   # 2010-2025 (no NBBO evidence): max(relative, nominal-ADV 2026) estimate
+    nbbo_evidence: bool = True         # v4: where SIP NBBO evidence exists (2016-2025, ADV$ band) replace the floor
+                                       # by the relative model x evidence multiplier (>= 1); ignored for v1-v3 files
     etf_monotone: bool = True          # ETF branch: running minimum over ADV$
     tod: bool = True
     extended_hours_mult: float = 3.0
@@ -256,6 +259,16 @@ class CalibratedSpreadModel:
         self._sp_ub = np.array([x[0] for x in sp], float)
         self._sp_v = np.array([x[1] for x in sp], float)
         self._calib0 = np.datetime64(pd.Timestamp(cal["calib_years"][0]))
+        ev = cal.get("nbbo_evidence")
+        if ev and self.cfg.nbbo_evidence:
+            yrs = sorted(int(y) for y in ev["multipliers"])
+            self._ev = {"t0": np.datetime64(pd.Timestamp(ev["start"])), "t1": np.datetime64(pd.Timestamp(ev["end"])),
+                        "band": (math.log(float(ev["adv_band"][0])), math.log(float(ev["adv_band"][1]))),
+                        "years": np.array(yrs, int),
+                        "m_stk": np.array([float(ev["multipliers"][str(y)]["stock"]) for y in yrs]),
+                        "m_etf": np.array([float(ev["multipliers"][str(y)]["etf"]) for y in yrs])}
+        else:
+            self._ev = None
         self.method = "calibrated"
 
     # ------------------------------------------------------------------ era
@@ -430,7 +443,25 @@ class CalibratedSpreadModel:
                 gi = np.nonzero(gap)[0]
                 Ln = self._latent_frac(np.where(ok, adv, 1e7)[gi], sig[gi], np.where(ok, price, 50.0)[gi], etf[gi], None)
                 bind = Ln > L[gi]
-                L[gi] = np.maximum(L[gi], Ln)
+                Lf = np.maximum(L[gi], Ln)
+                if self._ev is not None:
+                    # v4: SIP NBBO evidence (Alpaca 2016-2025): inside its window and ADV$ band the relative
+                    # model x a per-year evidence multiplier (>= 1, so never below the relative model)
+                    # replaces the nominal floor; log-linear blend across the band's lower edge
+                    ev = self._ev
+                    dg = dates[gi]
+                    inev = (dg >= ev["t0"]) & (dg <= ev["t1"]) & ok[gi]
+                    a0, a1 = ev["band"]
+                    w = np.where(inev, np.clip((np.log(np.maximum(adv[gi], 1.0)) - a0) / (a1 - a0), 0.0, 1.0), 0.0)
+                    yr = pd.DatetimeIndex(dg).year.to_numpy()
+                    iy = np.clip(np.searchsorted(ev["years"], yr), 0, len(ev["years"]) - 1)
+                    mult = np.where(etf[gi] > 0, ev["m_etf"][iy], ev["m_stk"][iy])
+                    Le = L[gi] * mult
+                    L[gi] = np.exp(w * np.log(Le) + (1.0 - w) * np.log(Lf))
+                    code[gi[(w > 0) & ok[gi]]] |= 128
+                    bind = bind & (w < 1)
+                else:
+                    L[gi] = Lf
                 code[gi[bind & ok[gi]]] |= 64
         p = np.where(ok, price, 50.0)
         r = L * p / k + self._cd
@@ -502,6 +533,8 @@ class CalibratedSpreadModel:
             parts.append("stress regime: spread uncertainty high")
         if code & 64 and base != 3:
             parts.append("no NBBO evidence for era: pessimistic floor")
+        if code & 128 and base != 3:
+            parts.append("era checked against SIP NBBO 2016-2025")
         if ac_unknown:
             parts.append("asset class inferred STK")
         return ", ".join(parts)

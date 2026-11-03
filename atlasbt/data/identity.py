@@ -49,14 +49,17 @@ from . import config, frames, qa
 
 log = logging.getLogger("atlasbt.data.identity")
 ZL = config.DATA_RAW / "hf_ziplime_earnings_calendar" / "data"
-BUILD_VERSION = "2026-10-29.10"     # bump when the series construction rules change
+BUILD_VERSION = "2026-10-30.6"     # bump when the series construction rules change
 MAX_EVIDENCE_GAP_DAYS = 548
 EDGE_DAYS = 120
 COMMON_SPLITS = np.array([2, 3, 4, 5, 6, 7, 8, 10, 15, 20, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 8, 1 / 10, 1 / 15,
                           1 / 20, 3 / 2, 2 / 3, 5 / 4, 4 / 5, 4 / 3, 3 / 4, 5 / 2, 2 / 5])
 # ratios we are willing to INFER from an unexplained DoltHub jump (volume must scale too)
 INFER_SPLITS = np.array([2, 3, 4, 5, 10, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 10, 1 / 20])
-SOURCE_RANK = {"yahoo": 0, "dolthub": 1, "dolthub_agreed": 2}
+# lower = preferred on a date served by several segments; '?' = rows of unknown identity
+SOURCE_RANK = {"yahoo": 0, "dolthub": 1, "alpaca_eod": 1.5, "tiingo": 1.8, "dolthub?": 2, "alpaca_eod?": 2.5,
+               "tiingo?": 2.8}
+AS_TRADED_SOURCES = ("dolthub", "alpaca_eod")
 
 
 def norm(t) -> str:
@@ -176,6 +179,13 @@ class IdentityIndex:
             first = self.first_asof.get(c) if c is not None else None
             if c is not None and first is not None:
                 out[d >= first.to_datetime64()] = c
+            elif c is None:
+                sib = self.class_sibling(t)
+                if sib is not None:
+                    # share class without own evidence and no current SEC owner (VIAB 2006-2019 =
+                    # Viacom class B, evidenced as 'VIA'; DISCK = Discovery class C, 'DISCA'):
+                    # the class line denotes the sibling's issuer on the dates the sibling does
+                    return self.label_dates(sib, dates)
             return out
         ec = e[e["conf"] == 0]
         if not len(ec):
@@ -201,6 +211,28 @@ class IdentityIndex:
         near_next = has_next & (dnext <= edge)
         pick = np.where(near_prev & (~near_next | (dprev <= dnext)), ck[pi], np.where(near_next, ck[ni], 0))
         return np.where(out == 0, pick, out)
+
+    def class_sibling(self, ticker: str) -> Optional[str]:
+        """Evidenced sibling share class of a class ticker with NO evidence of its own and no current
+        SEC owner: 'VIAB' -> 'VIA', 'DISCK' -> 'DISCA', 'CMCSK' -> 'CMCSA', 'LBTYK' -> 'LBTYA'.
+        Only class letters B / C / K (A is the usual primary line, and other suffixes are not class
+        markers: 'CCEP' is NOT 'CCE'); the sibling must have as-of evidence. Dates are attributed by the
+        sibling's own date labels (VIA = Viacom 2006-2019, Via Renewables 2021-2024), so the class line
+        is only ever attributed to the issuer the sibling denoted on that date. None otherwise."""
+        t = norm(ticker)
+        if len(t) < 4 or t[-1] not in "BCK" or "-" in t:
+            return None
+        if self.by_ticker.get(t) is not None or t in self.sec_now:
+            return None
+        for sib in (t[:-1] + "A", t[:-1]):
+            if sib == t:
+                continue
+            e = self.by_ticker.get(sib)
+            if e is None or not len(e):
+                continue
+            if len(e[e["conf"] == 0]):
+                return sib
+        return None
 
     def pre_evidence_cik(self, ticker: str, date, renamed_before=None) -> Optional[int]:
         """Candidate issuer of `ticker` on a date BEFORE its first as-of evidence (ZipLime's as-of
@@ -344,6 +376,32 @@ def _dolt_actions(portal, ticker: str) -> pd.DataFrame:
     return a if a is not None else pd.DataFrame()
 
 
+def _off_tape(portal, ticker: str, dates: pd.DatetimeIndex, min_run: int = 5) -> np.ndarray:
+    """True for dates inside Alpaca's fetched range for `ticker` on which the SIP tape has no trade
+    under that symbol, in runs of >= `min_run` consecutive sessions (isolated gaps are ignored).
+    All False when the ticker was not fetched from Alpaca (no tape evidence)."""
+    out = np.zeros(len(dates), dtype=bool)
+    if not len(dates) or not portal.store.exists("bars_1d", "alpaca_eod", ticker):
+        return out
+    meta = portal.store.meta("bars_1d", "alpaca_eod", ticker) or {}
+    a = portal._read("bars_1d", "alpaca_eod", ticker)
+    if not len(a):
+        return out
+    have = set(frames.to_naive_date(a.index))
+    lo = pd.Timestamp("2016-01-04")
+    hi = pd.Timestamp(str(meta.get("fetched_at", ""))[:10] or frames.to_naive_date(a.index)[-1]) - pd.Timedelta(days=1)
+    sch = frames.schedule().index
+    sch = sch[(sch >= lo) & (sch <= hi)]
+    miss = ~sch.isin(list(have))
+    run = np.zeros(len(sch), dtype=bool)
+    edges = np.flatnonzero(np.diff(np.r_[0, miss.astype(int), 0]))
+    for i0, i1 in zip(edges[::2], edges[1::2]):
+        if i1 - i0 >= min_run:
+            run[i0:i1] = True
+    gone = set(sch[run])
+    return np.array([d in gone for d in pd.DatetimeIndex(dates)], dtype=bool)
+
+
 def _close_series(b: pd.DataFrame) -> pd.Series:
     return pd.Series(b["close"].to_numpy(), index=frames.to_naive_date(b.index))
 
@@ -479,17 +537,30 @@ def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = N
             pending.append([0, f"yahoo~:{y}", b, y])
         else:
             lg.append(f"skip yahoo {y}: current owner CIK {owner} != {cik}")
-    for t in main:
-        if not st.exists("bars_1d", "dolthub", t):
+    # as-traded BY-TICKER sources (rows filed under the symbol that traded on each date): DoltHub
+    # (2011 ->, but nothing for symbols gone before 2018) and Alpaca SIP daily bars (2016 ->, incl.
+    # since-delisted symbols; providers/alpaca_eod.py). Rows on dates the ticker is evidenced to
+    # denote this CIK are segments; rows of unknown identity need price agreement / continuity.
+    for t, src in [(t_, s_) for s_ in AS_TRADED_SOURCES for t_ in main]:
+        if not st.exists("bars_1d", src, t):
             continue
-        b = portal._read("bars_1d", "dolthub", t)
+        b = portal._read("bars_1d", src, t)
         if not len(b):
             continue
         lab = idx.label_dates(t, frames.to_naive_date(b.index))
+        if src != "alpaca_eod":
+            gone = _off_tape(portal, t, frames.to_naive_date(b.index))
+            if gone.any():
+                # the consolidated tape shows NO trade under t on these dates (DoltHub files a renamed
+                # company's history under its later ticker: DowDuPont 2017-09 .. 2019-05 under 'DD'
+                # while old DuPont's 'DD' had stopped trading) -> identity of those rows unknown
+                lg.append(f"{src} {t}: {int(gone.sum())} sessions not on the SIP tape under {t} -> identity unknown")
+                lab = np.where(gone, 0, lab)
         nother = int(((lab != cik) & (lab != 0)).sum())
         if nother:
-            lg.append(f"dolthub {t}: {nother} sessions belong to other CIKs -> excluded")
-        for name, part, rank in ((f"dolthub:{t}", b[lab == cik], 1), (f"dolthub?:{t}", b[lab == 0], 2)):
+            lg.append(f"{src} {t}: {nother} sessions belong to other CIKs -> excluded")
+        r_lab, r_unk = SOURCE_RANK[src], SOURCE_RANK[src + "?"]
+        for name, part, rank in ((f"{src}:{t}", b[lab == cik], r_lab), (f"{src}?:{t}", b[lab == 0], r_unk)):
             if not len(part):
                 continue
             gl = _glitches(part["close"], portal)
@@ -502,7 +573,68 @@ def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = N
                 bad = frames.to_naive_date(part.index[gl.to_numpy()])
                 lg.append(f"{name}: dropped {ng} glitch sessions {[str(x.date()) for x in bad][:5]}")
                 part = part[~gl.to_numpy()]
-            (segs if rank == 1 else pending).append([rank, name, part, t])
+            (segs if rank == r_lab else pending).append([rank, name, part, t])
+    # Tiingo lines are keyed by the ticker a security LAST traded under and carry its whole
+    # history (providers/tiingo.py): usable for this CIK only if the line's owner (issuer the ticker
+    # denoted at the line's end) is this CIK, on dates inside the CIK's evidence span; rows on dates
+    # the ticker denoted another issuer are dropped, rows before the ticker denoted anyone (renamed
+    # history) and every row of an ambiguous ticker (several Tiingo lines) need price agreement.
+    first_seen = idx.first_seen.get(int(cik))
+    for t in main:
+        if not st.exists("bars_1d", "tiingo", t):
+            continue
+        b = portal._read("bars_1d", "tiingo", t)
+        if not len(b):
+            continue
+        meta = st.meta("bars_1d", "tiingo", t) or {}
+        d = frames.to_naive_date(b.index)
+        line_end = pd.Timestamp(meta["line_end"]) if meta.get("line_end") else d[-1]   # stored rows may be truncated
+        own = int(idx.label_dates(t, pd.DatetimeIndex([line_end]))[0])
+        if not own and (pd.Timestamp.now().normalize() - line_end).days <= 10:
+            own = idx.cik_now(t) or 0
+        elif not own:
+            # dead line whose issuer stopped filing > 120 days before its last trade (CVH, MHS, AYE
+            # acquired): the ticker's last as-of issuer, if its evidence ends <= 548 days before the
+            # line's end and no other issuer was evidenced on the ticker since
+            ev = idx.by_ticker.get(norm(t))
+            ea = ev[(ev["conf"] == 0) & (ev["date"] <= line_end + pd.Timedelta(days=EDGE_DAYS))] if ev is not None else None
+            if ea is not None and len(ea):
+                c_last = int(ea["cik"].iloc[-1])
+                last_d = ea["date"].iloc[-1]
+                later = ev[(ev["conf"] == 0) & (ev["date"] > last_d) & (ev["cik"] != c_last)]
+                if (line_end - last_d).days <= MAX_EVIDENCE_GAP_DAYS and \
+                        not len(later[later["date"] <= line_end + pd.Timedelta(days=EDGE_DAYS)]):
+                    own = c_last
+                    lg.append(f"tiingo {t}: dead line ending {line_end.date()} owned by CIK {c_last} (last evidence "
+                              f"{last_d.date()}, no later issuer)")
+        if own != cik:
+            lg.append(f"skip tiingo {t}: line owner CIK {own or 'unknown'} != {cik}")
+            continue
+        lab = idx.label_dates(t, d)
+        ok = (lab == cik) | (lab == 0)
+        if first_seen is not None:
+            ok &= np.asarray(d >= first_seen - pd.Timedelta(days=EDGE_DAYS))
+        nother = int((lab != cik).sum() - (lab == 0).sum())
+        if nother:
+            lg.append(f"tiingo {t}: {nother} sessions belong to other CIKs -> excluded")
+        amb = int(meta.get("n_lines", 1) or 1) > 1
+        r_lab = SOURCE_RANK["tiingo?"] if amb else SOURCE_RANK["tiingo"]
+        if amb:
+            lg.append(f"tiingo {t}: {meta.get('n_lines')} Tiingo lines share the ticker -> agreement required")
+        for name, part, rank in ((f"tiingo{'?' if amb else ''}:{t}", b[ok & (lab == cik)], r_lab),
+                                 (f"tiingo?:{t}", b[ok & (lab == 0)], SOURCE_RANK["tiingo?"])):
+            if not len(part):
+                continue
+            gl = _glitches(part["close"], portal)
+            ng = int(gl.sum())
+            clustered = int(gl.astype(int).rolling(20, min_periods=1).sum().max()) if ng else 0
+            if ng > max(3, int(0.01 * len(part))) or clustered >= 3:
+                lg.append(f"reject {name}: collision test failed ({ng} spike-and-revert days of {len(part)})")
+                continue
+            if ng:
+                lg.append(f"{name}: dropped {ng} glitch sessions")
+                part = part[~gl.to_numpy()]
+            (segs if rank == SOURCE_RANK["tiingo"] else pending).append([rank, name, part, t])
     # --- agreement / renamed-history continuity gate
     accepted = sorted(segs, key=lambda x: x[0])
     for sgm in sorted(pending, key=lambda x: x[0]):
@@ -527,7 +659,7 @@ def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = N
         ce = idx.by_cik.get(cik)
         other_ev = ce is not None and len(ce[(ce["conf"] == 0) & (ce["ticker"] != sgm[3]) &
                                             (ce["date"] >= rd[0]) & (ce["date"] <= rd[-1])])
-        if sgm[1].startswith("dolthub?") and later_use and other_ev and _junction_ok(sgm[2], nxt):
+        if "?:" in sgm[1] and sgm[1].split("?:")[0] in AS_TRADED_SOURCES + ("tiingo",) and later_use and other_ev and _junction_ok(sgm[2], nxt):
             # DoltHub (like Yahoo) files a renamed company's history under its later ticker
             accepted.append(sgm)
             lg.append(f"accept {sgm[1]} as renamed history (CIK lineage + price continuity at the junction)")
@@ -559,9 +691,19 @@ def build_series(portal, idx: IdentityIndex, cik: int, ticker: Optional[str] = N
 def _segment_actions(portal, m: pd.DataFrame, keep) -> pd.DataFrame:
     parts = []
     d = frames.to_naive_date(m.index)
+    seen = set()
     for rank, name, b, t in keep:
         src = name.split(":")[0].rstrip("?~")
-        a = portal._yahoo_actions(t) if src == "yahoo" else _dolt_actions(portal, t)
+        if (src, t) in seen:                       # labelled + unlabelled chunks of one source/ticker:
+            continue                               # its actions once (ETFC 2010 1:10 was applied twice)
+        seen.add((src, t))
+        # by-ticker as-traded segments (DoltHub, Alpaca) take DoltHub's dividend / split tables,
+        # which are keyed by the ticker as traded and include since-delisted symbols
+        if src == "tiingo":                        # Tiingo's own divCash / splitFactor (as traded)
+            from .providers.tiingo import actions as _tiingo_actions
+            a = _tiingo_actions(portal, t)
+        else:
+            a = portal._yahoo_actions(t) if src == "yahoo" else _dolt_actions(portal, t)
         if a is None or not len(a):
             continue
         a = a.copy()
@@ -575,10 +717,12 @@ def _segment_actions(portal, m: pd.DataFrame, keep) -> pd.DataFrame:
     # DoltHub segments carry no spin-offs: add known ones (value-based) on their days
     from .actions_classify import known_spinoff_rows
     have = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["type", "ex_date"])
+    seen = set()
     for rank, name, b, t in keep:
         src = name.split(":")[0].rstrip("?~")
-        if src != "dolthub":
+        if src not in AS_TRADED_SOURCES or (src, t) in seen:
             continue
+        seen.add((src, t))
         sel = m[(m["src_ticker"] == t) & (m["src"] == src)]
         extra = known_spinoff_rows(t, have, sel, portal._child_close)
         if len(extra):
@@ -624,7 +768,12 @@ def _validate(m: pd.DataFrame, acts: pd.DataFrame, lg: list) -> tuple[pd.DataFra
             for amt in same["amount"].fillna(0):
                 if amt > 0:
                     q *= max(1e-6, 1 - amt / close.iloc[j - 1])
-            if np.isfinite(g) and abs(np.log(g * r["ratio"] / q)) > 0.35 and abs(np.log(g / q)) < 0.15:
+            e_split, e_none = abs(np.log(g * r["ratio"] / q)), abs(np.log(g / q))
+            # (a) clear miss; (b) the prices fit "no split" far better than the split: a fractional
+            # split that only re-encodes a same-day spin-off already carried as SPINOFF (Yahoo GE
+            # 2024-04-02 1.253 + GEV spin-off -> shares were multiplied twice), or a split with no
+            # price gap at all (SSP 2025-12-08 1.33)
+            if np.isfinite(g) and ((e_split > 0.35 and e_none < 0.15) or (e_none < 0.08 and e_split > 2 * e_none + 0.1)):
                 drop.append(i)
                 expect.loc[ex] = 1.0
                 lg.append(f"drop split {ex.date()} ratio {r['ratio']}: no price jump (gap {g:.3f})")
@@ -639,7 +788,7 @@ def _validate(m: pd.DataFrame, acts: pd.DataFrame, lg: list) -> tuple[pd.DataFra
     # infer unrecorded splits inside DoltHub chunks (as-traded data, split table only from 2014)
     inferred = []
     for j in np.where(big & ~sw)[0]:
-        if not m["src"].iloc[j].startswith("dolthub"):
+        if m["src"].iloc[j] not in AS_TRADED_SOURCES:
             continue
         g = open_.iloc[j] / close.iloc[j - 1]
         k = np.argmin(np.abs(np.log(g) - np.log(1 / INFER_SPLITS)))
@@ -656,8 +805,20 @@ def _validate(m: pd.DataFrame, acts: pd.DataFrame, lg: list) -> tuple[pd.DataFra
                              "fidelity": int(Fidelity.T2_PROXY), "src": "inferred", "src_ticker": m["src_ticker"].iloc[j]})
             big[j] = False
             lg.append(f"infer split {d[j].date()} ratio {ratio:g} from DoltHub price jump {g:.3f}")
-    # splice points: unexplained jump -> drop the lower-priority chunk
     chunk_id = np.cumsum(sw)
+    # identity break INSIDE a by-ticker Alpaca / Tiingo chunk: an unexplained x3 (or /3) close-to-close
+    # move (no split / distribution, no inferable split) is a different security under the same
+    # ticker+CIK labels (AmSurg -> Envision 'EVHC' 2016-12-02 x3.1, Valaris new equity 'VAL'
+    # 2021-05-03 x72) -> the rest of that chunk is dropped (fail closed)
+    srcs = m["src"].to_numpy()
+    for j in np.where(big & ~sw)[0]:
+        if srcs[j] in ("alpaca_eod", "tiingo") and abs(ret.iloc[j]) > np.log(3.0) and not dropmask[j]:
+            tail = (chunk_id == chunk_id[j]) & (np.arange(len(m)) >= j)
+            dropmask |= tail
+            big[j] = False
+            lg.append(f"identity break in {src[j]} at {d[j].date()} (move {np.exp(ret.iloc[j]):.2f}x unexplained): "
+                      f"dropped {int(tail.sum())} later sessions of that chunk")
+    # splice points: unexplained jump -> drop the lower-priority chunk
     sch_idx = frames.schedule().index
     for j in np.where(big & sw)[0]:
         prev_rank, cur_rank = rank[j - 1], rank[j]

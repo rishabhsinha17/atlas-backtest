@@ -682,6 +682,9 @@ class S037(_TimedBase):
 
 # ================================================================== S042
 DECL_LEAD_KIND = "dividend_declaration_lead"
+#: events kind with point-in-time dividend DECLARATIONS (docs/DATA.md: providers/dividends_decl.py;
+#: payload ex_date, amount; known_at = SEC acceptance of the declaring 8-K / exhibit)
+DECL_EVENT_KIND = "DIVIDEND_DECL"
 
 
 class DividendDeclarationLeadPortal:
@@ -751,20 +754,25 @@ class S042(_TimedBase):
     universe = ETF_CORE
     params = {"window": 1, "yield_split": "all", "decl_proxy": False, "decl_lead": 10, "proxy": False}
     grid = {"yield_split": ["high", "low"], "window": [1, 2]}
-    requires = _INTRADAY_REQS + [Requirement("actions", symbols=("SPY",), min_fidelity=Fidelity.T1_BAR,
-                                             note="cash dividends with point-in-time DECLARATION timestamps "
-                                                  "(known_at); SPY probes the portal's corporate actions. "
-                                                  "Project data (Yahoo/DoltHub) has none -> NOT_TESTABLE "
-                                                  "unless decl_proxy=True")]
+    requires = _INTRADAY_REQS + [
+        Requirement("actions", symbols=("SPY",), min_fidelity=Fidelity.T2_PROXY,
+                    note="cash dividends; a dividend is usable only with a point-in-time DECLARATION timestamp: "
+                         "a T1 action (known_at = declaration) or a DIVIDEND_DECL event. Without a DIVIDEND_DECL "
+                         "source a T2 action (known_at proxied) stops the run as NOT_TESTABLE at run time"),
+        Requirement("events", DECL_EVENT_KIND, symbols=("*",), critical=False, min_fidelity=Fidelity.T2_PROXY,
+                    note="dividend declarations (SEC EDGAR 8-K acceptance; providers/dividends_decl.py)")]
     deviations = COMMON_DEVIATIONS + (
         "Universe ETF_CORE + portal 'SP500_TOP50_DV' (STRATEGY_GUIDE 'STK/ETF'); requirements are checked on "
         "ETF_CORE (static part). ETF-only results when no 1m stock bars: megacaps without intraday bars are "
         "skipped, logged and flagged (T2 'partial universe coverage').",
         "Only regular CASH_DIVIDEND actions whose declaration known_at <= decision time and whose ex-date is "
         "exactly `window` sessions after the entry session; special dividends excluded.",
-        "Default needs declaration-timestamped dividends (critical requirement, min fidelity T1); a dividend "
-        "seen with fidelity >= T2 (known_at proxied, e.g. prior-session close) stops the run as NOT_TESTABLE "
-        "(the 15:50 decision could never see it).",
+        "Default needs declaration-timestamped dividends: T1 actions (known_at = declaration) and/or "
+        "DIVIDEND_DECL events (known_at = SEC acceptance of the declaring 8-K, association inferred -> T2 flag). "
+        "When the portal has a DIVIDEND_DECL source, dividends with no declaration record (ETFs: no 8-Ks; "
+        "issuers that do not file one) are skipped and flagged T2 (partial coverage); without such a source a "
+        "dividend seen with fidelity >= T2 (known_at proxied, e.g. prior-session close) stops the run as "
+        "NOT_TESTABLE (the 15:50 decision could never see it).",
         "decl_proxy=True (opt-in, T2_PROXY): ex-date and amount treated as known `decl_lead` (10) sessions "
         "before the ex-date (docs/DATA.md: real declarations 2-6 weeks ahead); needs the portal wrapped in "
         "calendar_events.DividendDeclarationLeadPortal(portal, lead_sessions=decl_lead) - the PIT guard "
@@ -794,6 +802,7 @@ class S042(_TimedBase):
         self.st["yields"] = {}        # (sym, ex_date) -> yield at first sight
         self.st["today"] = None
         self.st["no_intraday"] = set()
+        self.st["decl_src"] = None
         if self.params["decl_proxy"]:
             _flag_once(self.st, ctx, Fidelity.T2_PROXY,
                        f"S042: dividend ex-date/amount assumed known {int(self.params['decl_lead'])} sessions "
@@ -829,10 +838,17 @@ class S042(_TimedBase):
                                                       pd.Timestamp(session) + pd.Timedelta(days=21))
             except Exception:
                 acts = []
+            decl = {} if self.params["decl_proxy"] else self._declared(ctx, session)
             for a in acts:
                 if a.type != ActionType.CASH_DIVIDEND or not (a.amount > 0):
                     continue
                 if not self.params["decl_proxy"] and int(a.fidelity) >= Fidelity.T2_PROXY:
+                    if self.st["decl_src"]:
+                        if (a.symbol, as_session_date(a.ex_date)) not in decl:
+                            _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                                       "S042: dividends without a point-in-time declaration record (ETFs; issuers "
+                                       "without a declaring 8-K) skipped - partial coverage")
+                        continue                       # served (if at all) by its DIVIDEND_DECL event below
                     raise NotTestableError(
                         f"S042: dividend {a.symbol} ex {as_session_date(a.ex_date).date()} has no declaration "
                         f"timestamp (known_at proxied, fidelity {Fidelity(int(a.fidelity)).name}); the 15:50 "
@@ -846,9 +862,49 @@ class S042(_TimedBase):
                         self.st["yields"][key] = a.amount / px
                 if exd == target:
                     out[a.symbol] = (exd, float(a.amount))
+            for (sym, exd), amt in decl.items():
+                key = (sym, exd)
+                if key not in self.st["yields"]:
+                    px = ctx.mark(sym)
+                    if px == px and px > 0:
+                        self.st["yields"][key] = amt / px
+                if exd == target and sym not in out:
+                    out[sym] = (exd, float(amt))
             self.st["today"] = (session, ctx.now.value)
             self.st["divs_today"] = out
         return self.st["divs_today"]
+
+    def _declared(self, ctx, session) -> dict:
+        """(symbol, ex_date) -> amount of DIVIDEND_DECL events known now with ex-date in [session,
+        session + 21 days]; {} when the portal has no such source."""
+        if self.st.get("decl_src") is None:
+            try:
+                self.st["decl_src"] = bool(ctx.portal().has("*", "events", DECL_EVENT_KIND))
+            except Exception:
+                self.st["decl_src"] = False
+        if not self.st["decl_src"]:
+            return {}
+        try:
+            # end far ahead: portals differ on whether [start, end] bounds known_at or effective_at (the
+            # ex-date); the PIT guard still serves only events known at ctx.now
+            evs = ctx.portal().events(DECL_EVENT_KIND, self.symbols_today(ctx), ctx.now - pd.Timedelta(days=120),
+                                      ctx.now + pd.Timedelta(days=60))
+        except Exception:
+            evs = []
+        lo, hi = pd.Timestamp(session), pd.Timestamp(session) + pd.Timedelta(days=21)
+        out = {}
+        for e in evs:
+            p = e.payload or {}
+            try:
+                exd, amt = as_session_date(pd.Timestamp(p["ex_date"])), float(p["amount"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if lo <= exd <= hi and amt > 0 and to_utc(e.known_at) <= ctx.now:
+                out[(e.symbol, exd)] = amt
+                _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                           "S042: dividend declaration time = SEC acceptance of the latest 8-K with a declaration "
+                           "phrase before the ex-date (EDGAR full-text search; dividend association inferred)")
+        return out
 
     def signal(self, ctx, sym, session):
         dv = self._divs_for(ctx, session).get(sym)
@@ -1572,15 +1628,19 @@ class S041(Strategy):
     FIELD_EPS = "eps_consensus_ntm"
     FIELD_N = "eps_num_analysts_ntm"
     requires = [Requirement("bars", "1d"),
-                Requirement("fundamentals", "eps_consensus_ntm", symbols=("*",),
-                            note="PIT history of next-12m consensus EPS and analyst counts (I/B/E/S-like); "
-                                 "DoltHub eps_estimate snapshots hold only quarter/year consensus since ~2019 "
-                                 "and are not ingested as NTM -> NOT_TESTABLE by design")]
+                Requirement("fundamentals", "eps_consensus_ntm", symbols=("*",), min_fidelity=Fidelity.T2_PROXY,
+                            note="PIT history of next-12m consensus EPS and analyst counts: DoltHub eps_estimate "
+                                 "weekly FY1/FY2 snapshots blended to NTM (providers/estimates.py, 2017-10-26 ->, "
+                                 "known at the close of the session after each snapshot; T2)")]
     deviations = (
         "Universe SP500 point-in-time. Consensus read through portal.fundamentals fields "
         "'eps_consensus_ntm' / 'eps_num_analysts_ntm' (known_at = snapshot time); value 30 days ago = "
         "fundamentals(as_of = now - window).",
         "Revision = (C_now - C_then) / |C_then|; analyst count measured now.",
+        "Data (T2): consensus = DoltHub weekly snapshots (2017-10-26 ->; first usable month-end 2017-11), NTM = "
+        "time-weighted blend of FY1/FY2 consensus (weight = share of FY1 remaining), analyst count = min(FY1, FY2) "
+        "counts; snapshot known at the close of the first session after its date, so 'now' / '30 days ago' "
+        "values can be up to ~1 week old. Snapshots older than 21 days are not used.",
         "Month end = last NYSE session (decision at its close, orders fill next open). Buckets via "
         "indicators.cross_section.quantile_bucket; held names are kept while in the top/bottom quintile, new "
         "names enter from the top/bottom `bucket`; all names rebalanced to CROSS_SECTION weights monthly "
@@ -1605,6 +1665,8 @@ class S041(Strategy):
         then = p.fundamentals(members, [self.FIELD_EPS], as_of=ctx.now - pd.Timedelta(days=int(self.params["window_days"])))
         if now is None or len(now) == 0 or then is None or len(then) == 0:
             return
+        _flag_once(self.st, ctx, Fidelity.T2_PROXY,
+                   "S041: NTM consensus = FY1/FY2 time-weighted blend of DoltHub weekly snapshots (not I/B/E/S NTM)")
         cn = now[now["field"] == self.FIELD_EPS].set_index("symbol")["value"].astype(float)
         na = now[now["field"] == self.FIELD_N].set_index("symbol")["value"].astype(float)
         c0 = then[then["field"] == self.FIELD_EPS].set_index("symbol")["value"].astype(float)

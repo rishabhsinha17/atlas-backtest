@@ -225,6 +225,10 @@ class OptionsEventBase(Strategy):
     CHAIN_MAX_FID: Fidelity = Fidelity.T2_PROXY
     #: max age of the chain snapshot at a decision (None: same session for daily strategies)
     QUOTE_MAX_AGE: Optional[pd.Timedelta] = None
+    #: worst chain fidelity accepted for the DAILY CLOSE metric history (IV percentile / z-score inputs);
+    #: None = CHAIN_MAX_FID. An intraday-decision strategy may accept real EOD snapshots (T2) for the
+    #: history of a daily statistic while its decisions stay on timestamped quotes (S160).
+    HISTORY_MAX_FID: Optional[Fidelity] = None
     #: trailing window of the IV-metric statistics
     LOOKBACK: int = 252
     QUALITY = QualityRules(max_rel_spread=0.50)
@@ -575,9 +579,12 @@ class OptionsEventBase(Strategy):
 
     # ------------------------------------------------------------------ IV metric history
     def _metrics_at(self, ctx, und: str, session, as_of) -> Optional[dict]:
-        ch = self.get_chain(ctx, und, as_of=as_of, session=session, quiet=True)
+        ch = self.get_chain(ctx, und, as_of=as_of, session=session, quiet=True, max_fid=self.HISTORY_MAX_FID)
         if ch is None:
             return None
+        if self.HISTORY_MAX_FID is not None and self.chain_fidelity(ch) > int(self.CHAIN_MAX_FID):
+            self.flag_once(ctx, Fidelity.T2_PROXY, f"{self.id}: daily IV history from real EOD chain snapshots "
+                                                   f"(capture minute approximate, T2)")
         S = self.chain_spot(ch)
         if not np.isfinite(S):
             try:

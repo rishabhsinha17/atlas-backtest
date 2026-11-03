@@ -273,7 +273,7 @@ def test_relative_liquidity_and_stress_flag():
         seq = [float(M.era_multiplier([np.datetime64(f"{y}-06-01")], relative_adv=[rel])[0]) for y in range(1993, 2027)]
         assert all(x >= y - 1e-12 for x, y in zip(seq, seq[1:])) and min(seq) >= 1 - 1e-12
     h, why = M.half_spread("SPY", "2020-03-18", 252.8, 6.8e10, 0.0517, "ETF")
-    assert why.endswith("stress regime: spread uncertainty high")
+    assert "stress regime: spread uncertainty high" in why       # (v4 may append the NBBO-evidence qualifier)
     assert "stress" not in M.half_spread("SPY", "2020-01-15", 330.0, 2.5e10, 0.006, "ETF")[1]
     assert "stress" not in M.half_spread("X", "2024-03-01", 30.0, 5e7, 0.02, "STK")[1]
 

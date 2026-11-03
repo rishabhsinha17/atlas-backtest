@@ -32,13 +32,15 @@ from .store import ParquetStore, default_store
 log = logging.getLogger("atlasbt.data.portal")
 
 DAILY_SOURCES = ("yahoo", "dolthub", "tiingo", "cboe")
-INTRADAY_SOURCES = ("yahoo", "alpaca", "polygon", "databento", "alphavantage", "tiingo")   # T1 sources
+# Alpaca SIP (2016->, identity-routed) outranks Yahoo's ~30/60-day intraday window (docs/DATA.md §4.15)
+INTRADAY_SOURCES = ("alpaca", "yahoo", "polygon", "databento", "alphavantage", "tiingo",   # T1 sources
+                    "opra_parity")   # SPX 1m levels from OPRA SPXW 0DTE put-call parity (T2, DATA.md §4.15c)
 PROXY_INTRADAY_SOURCES = ("dukascopy",)                                                       # T2, opt-in
 QUOTE_SOURCES = ("alpaca", "databento", "iex", "dukascopy")
 SOURCE_FIDELITY = {"yahoo": Fidelity.T1_BAR, "dolthub": Fidelity.T1_BAR, "tiingo": Fidelity.T1_BAR,
                    "cboe": Fidelity.T1_BAR, "alpaca": Fidelity.T1_BAR, "polygon": Fidelity.T1_BAR,
                    "databento": Fidelity.T1_BAR, "alphavantage": Fidelity.T1_BAR,
-                   "dukascopy": Fidelity.T2_PROXY, "qlib": Fidelity.T2_PROXY}
+                   "dukascopy": Fidelity.T2_PROXY, "qlib": Fidelity.T2_PROXY, "opra_parity": Fidelity.T2_PROXY}
 QUOTE_FIDELITY = {"alpaca": Fidelity.T0_QUOTE, "databento": Fidelity.T2_PROXY, "iex": Fidelity.T2_PROXY,
                   "dukascopy": Fidelity.T2_PROXY}
 INDEX_SYMBOLS = {"VIX", "VIX9D", "VIX3M", "VIX6M", "VIX1Y", "VIX1D", "VVIX", "SKEW", "VXN", "RVX", "VXD", "GVZ",
@@ -118,6 +120,11 @@ class Portal:
         return t, kc, (t if ok else None)
 
     def _bar_source(self, symbol: str, freq: str, source: Optional[str] = None) -> Optional[str]:
+        if freq != "1d" and "~" in str(symbol):
+            # identity-routed intraday stores (Alpaca) are filed under the security key itself
+            for s in ((source,) if source else INTRADAY_SOURCES):
+                if self.store.exists(f"bars_{freq}", s, symbol):
+                    return s
         symbol = self.resolve_symbol(symbol)[2]
         if symbol is None:
             return None
@@ -521,6 +528,12 @@ class Portal:
                 native = "identity"
         else:
             native = self._bar_source(symbol, freq, source)
+            if native and freq != "1m" and source is None:
+                # a higher-priority 1m source (Alpaca SIP, 2016->) beats a lower-priority native coarse
+                # store (Yahoo's ~60-day 5m): resample the 1m bars instead
+                one = self._bar_source(symbol, "1m")
+                if one and _src_rank(one) < _src_rank(native):
+                    native = None
         resample_from = None
         if native is None and freq not in ("1d", "1m"):
             # build coarser intraday bars from 1m (causal: a bar is known at its end)
@@ -1304,16 +1317,78 @@ class Portal:
 
     def quotes(self, symbol: str, start, end, as_of, source: Optional[str] = None) -> pd.DataFrame:
         as_of, start, end = _utc(as_of), _utc(start), _utc(end)
+        key = str(symbol).upper()
         symbol = self.resolve_symbol(symbol)[2] or "~none~"
+        uncovered = None
         for s in ((source,) if source else QUOTE_SOURCES):
-            if self.store.exists("quotes", s, symbol):
-                q = self._store_read_memo("quotes", s, symbol, start=start,
+            ss = key if ("~" in key and self.store.exists("quotes", s, key)) else symbol
+            if self.store.exists("quotes", s, ss):
+                if s == "alpaca" and not self._alpaca_covered(ss, start, end):
+                    # Alpaca NBBO exists only in decision windows: outside them the engine must see NO
+                    # quotes (bar fills), never a partial window (docs/DATA.md §4.15)
+                    uncovered = s
+                    continue
+                q = self._store_read_memo("quotes", s, ss, start=start,
                                           end=min(end, as_of + pd.Timedelta(microseconds=1)))
                 q = q[(q.index >= start) & (q.index < end) & (q.index <= as_of)]
                 q = q[[c for c in ("bid", "ask", "bid_size", "ask_size") if c in q.columns]]
                 q.attrs.update({"source": s, "fidelity": int(QUOTE_FIDELITY.get(s, Fidelity.T2_PROXY))})
                 return q
+        if uncovered:
+            q = pd.DataFrame({c: pd.Series(dtype="float64") for c in ("bid", "ask", "bid_size", "ask_size")},
+                             index=pd.DatetimeIndex([], tz="UTC", name="ts"))
+            q.attrs.update({"source": uncovered, "fidelity": int(Fidelity.NA),
+                            "note": "outside the recorded Alpaca quote windows"})
+            return q
         raise DataUnavailableError(f"no quotes for {symbol}")
+
+    #: requests longer than this are availability scans (engine probes), never fill windows
+    ALPACA_SCAN_DAYS = 7
+
+    def _alpaca_windows(self, sym: str):
+        """Merged closed UTC intervals [w0, w1] (ns arrays) fully fetched from Alpaca for `sym`."""
+        ck = ("alpaca_windows",)
+        tab = self._cache.get(ck)
+        if tab is None:
+            w = self.store.read("reference", "alpaca", "quote_windows")
+            tab = {}
+            if len(w):
+                for s_, g in w.groupby("symbol"):
+                    a = pd.DatetimeIndex(g["w0"]).tz_convert("UTC").as_unit("ns").asi8
+                    b = pd.DatetimeIndex(g["w1"]).tz_convert("UTC").as_unit("ns").asi8
+                    o = np.argsort(a, kind="stable")
+                    a, b = a[o], b[o]
+                    m0, m1 = [], []
+                    for x, y in zip(a, b):
+                        if m1 and x <= m1[-1]:
+                            m1[-1] = max(m1[-1], y)
+                        else:
+                            m0.append(x)
+                            m1.append(y)
+                    tab[str(s_).upper()] = (np.asarray(m0, np.int64), np.asarray(m1, np.int64))
+            self._cache[ck] = tab
+        return tab.get(sym.upper())
+
+    def _alpaca_covered(self, sym: str, start: pd.Timestamp, end: pd.Timestamp) -> bool:
+        """Serve Alpaca quotes for [start, end) only if (a) a recorded window contains it, (b) it is an
+        availability scan (> ALPACA_SCAN_DAYS), or (c) it is a premarket last-quote lookup: it ends at or
+        before the session open and its last minute lies in a recorded window (09:29 midpoint)."""
+        if end - start > pd.Timedelta(days=self.ALPACA_SCAN_DAYS):
+            return True
+        w = self._alpaca_windows(sym)
+        if w is None or not len(w[0]):
+            return False
+        w0, w1 = w
+        s_ns, e_ns = start.value, end.value - 1
+        i = int(np.searchsorted(w0, s_ns, side="right")) - 1
+        if i >= 0 and e_ns <= w1[i]:
+            return True
+        j = int(np.searchsorted(w0, e_ns, side="right")) - 1
+        if j < 0 or e_ns > w1[j] or w0[j] > e_ns - 60_000_000_000 + 1:
+            return False
+        sd = _session_date(pd.Timestamp(e_ns, tz="UTC"))
+        sch = frames.schedule()
+        return sd in sch.index and end <= sch.loc[sd, "open"]
 
     def _store_read_memo(self, kind: str, source: str, symbol: str, start=None, end=None) -> pd.DataFrame:
         """``self.store.read(kind, source, symbol, start=, end=)`` with the parquet files' frames
@@ -1378,7 +1453,12 @@ class Portal:
     EVENT_SOURCES = {"EARNINGS": [("events", "ziplime", "EARNINGS"), ("reference", "dolthub", "earnings_calendar")],
                      "EARNINGS_SCHEDULE": [("reference", "dolthub", "earnings_calendar")],
                      "INDEX_ADD": [("events", "sp500", "INDEX")], "INDEX_DEL": [("events", "sp500", "INDEX")],
-                     "FOMC": [("events", "fomc", "FOMC")], "FOMC_SCHEDULE": [("events", "fomc", "FOMC")]}
+                     "FOMC": [("events", "fomc", "FOMC")], "FOMC_SCHEDULE": [("events", "fomc", "FOMC")],
+                     # stored-as-is event tables (one file per kind, symbol + cik columns; docs/DATA.md)
+                     "DIVIDEND_DECL": [("events", "sec_fts", "DIVIDEND_DECL")],
+                     "BUYBACK": [("events", "sec_fts", "BUYBACK")]}
+    #: kinds served straight from their single stored table (EVENT_SOURCES[kind][0])
+    STORED_EVENT_KINDS = ("DIVIDEND_DECL", "BUYBACK")
 
     def _event_symbols(self, kind: str) -> set:
         key = ("event_symbols", kind)
@@ -1395,10 +1475,19 @@ class Portal:
                 syms = set(e.loc[e["kind"] == kind, "symbol"]) if len(e) else set()
             elif kind == "EARNINGS_RELEASE":
                 syms = {s.replace("EARNINGS_RELEASE_", "") for s in self.store.symbols("events", "sec")}
+            elif kind in self.STORED_EVENT_KINDS:
+                e = self._read(*self.EVENT_SOURCES[kind][0])
+                syms = set(e["symbol"].str.upper()) if len(e) else set()
             self._cache[key] = syms
         return self._cache[key]
 
     def _fundamental_fields(self, symbol: Optional[str] = None) -> set:
+        from .providers.estimates import SOURCE as EST_SOURCE
+        est = self.store.symbols("fundamentals", EST_SOURCE) if symbol is None else \
+            ([1] if self.store.exists("fundamentals", EST_SOURCE, self._split_key(symbol)[0]) else [])
+        return self._fundamental_fields_sec(symbol) | (set(self.ESTIMATE_FIELDS) if est else set())
+
+    def _fundamental_fields_sec(self, symbol: Optional[str] = None) -> set:
         from .providers.sec import FIELD_MAP
         if symbol is None:
             if not self.store.symbols("fundamentals", "sec"):
@@ -1425,6 +1514,9 @@ class Portal:
         except DataUnavailableError as e:
             out["reason"] = str(e)
             return out
+        finally:
+            if freq != "1d":
+                self._evict_intraday(symbol)
         if not len(b):
             out["reason"] = "no bars in window"
             return out
@@ -1433,6 +1525,14 @@ class Portal:
                     "coverage": float(len(d) / len(exp)) if len(exp) else 1.0,
                     "security_id": b.attrs.get("security_id"), "fidelity": int(b.attrs.get("fidelity", 1))})
         return out
+
+    def _evict_intraday(self, symbol: str) -> None:
+        """Drop memoized intraday frames of `symbol` (a multi-year Alpaca 1m history is ~100-250 MB in
+        memory; coverage scans over a universe must not keep them all). Pure cache hygiene."""
+        su = str(symbol).upper()
+        for k in [k for k in self._cache if isinstance(k, tuple) and len(k) >= 3 and k[2] == su and
+                  ((isinstance(k[0], str) and k[0].startswith("bars_") and k[0] != "bars_1d") or k[0] == "resampled")]:
+            self._cache.pop(k, None)
 
     def has(self, symbol: str, kind: str, freq: Optional[str] = None,
             sessions: Optional[Sequence[str]] = None, *, start=None, end=None, as_of=None) -> bool:
@@ -1493,7 +1593,8 @@ class Portal:
             return True
         ss_ = self.resolve_symbol(symbol)[2]
         if kind == "quotes":
-            return ss_ is not None and any(self.store.exists("quotes", s, ss_) for s in QUOTE_SOURCES)
+            keyed = symbol.upper() if "~" in symbol else None     # identity-routed (Alpaca) quote stores
+            return any(self.store.exists("quotes", s, x) for s in QUOTE_SOURCES for x in (ss_, keyed) if x)
         if kind == "options":
             return bool(self._option_sources(symbol, freq))
         if kind == "actions":
@@ -1531,8 +1632,9 @@ class Portal:
                 return Fidelity.T2_PROXY       # only CFD proxy bars exist (opt-in)
             return SOURCE_FIDELITY.get(src, Fidelity.T1_BAR) if src else Fidelity.NA
         if kind == "quotes":
+            keyed = symbol.upper() if "~" in str(symbol) else None     # identity-routed (Alpaca) quote stores
             for s in QUOTE_SOURCES:
-                if ss_ is not None and self.store.exists("quotes", s, ss_):
+                if any(x is not None and self.store.exists("quotes", s, x) for x in (ss_, keyed)):
                     return QUOTE_FIDELITY[s]
             return Fidelity.NA
         if kind == "options":
@@ -1548,7 +1650,9 @@ class Portal:
         if kind == "borrow":
             return Fidelity.T1_BAR if self.has(symbol, "borrow") else Fidelity.T2_PROXY
         if kind == "fundamentals":
-            return Fidelity.T1_BAR if self.has(symbol, "fundamentals", freq) else Fidelity.NA
+            if not self.has(symbol, "fundamentals", freq):
+                return Fidelity.NA
+            return Fidelity.T2_PROXY if freq in self.ESTIMATE_FIELDS else Fidelity.T1_BAR
         if kind == "events":
             k = (freq or "").upper()
             if not self.has(symbol, "events", k):
@@ -1689,7 +1793,11 @@ class Portal:
                 t, kc = self._split_key(k)
                 keymap.setdefault(t, []).append((k, kc))
             symbols = list(keymap)
-        df = ev.load_events(self, kind, symbols, _utc(start), _utc(end))
+        if kind.upper() in self.STORED_EVENT_KINDS:
+            df = self._read(*self.EVENT_SOURCES[kind.upper()][0])
+            df = ev._window(ev._sym_filter(df, symbols), _utc(start), _utc(end)) if len(df) else pd.DataFrame()
+        else:
+            df = ev.load_events(self, kind, symbols, _utc(start), _utc(end))
         if df.empty:
             return []
         if any(kc is not None for v in keymap.values() for _, kc in v) and "symbol" in df.columns:
@@ -1756,6 +1864,55 @@ class Portal:
                     return df, src
         return pd.DataFrame(), ""
 
+    # ---------------------------------------------------------------- Databento OPRA (T0, DATA.md §4.15c)
+    def _opra(self):
+        r = self._cache.get("opra_reader")
+        if r is None:
+            from .providers.databento import OpraReader
+            r = self._cache["opra_reader"] = OpraReader(self.store.root)
+        return r
+
+    def _opra_spot(self, u: str, ts: pd.Timestamp) -> float:
+        """Underlying price known at ts for an OPRA chain: close of the last 1m (else 5m) bar ending <= ts."""
+        for f in ("1m", "5m"):
+            if self._bar_source(u, f):
+                try:
+                    b = self.bars(u, f, ts - pd.Timedelta(minutes=30), ts, ts, sessions=("RTH",))
+                except Exception:
+                    b = None
+                if b is not None and len(b) and pd.Timestamp(b["known_at"].iloc[-1]) <= ts:
+                    return float(b["close"].iloc[-1])
+        return float("nan")
+
+    def _opra_chain(self, su, u: str, as_of: pd.Timestamp, other_ts, min_dte: int, max_dte: int):
+        """Latest OPRA chain snapshot (chain-flagged samples) if it is <= CHAIN_FRESH old at as_of and
+        strictly newer than the EOD chain snapshot; else None (EOD / synthetic path unchanged)."""
+        if su is None or not self._opra().has(su):
+            return None
+        rows = self._opra().snapshot(su, as_of)
+        if rows.empty or (other_ts is not None and not rows["ts"].iloc[0] > other_ts):
+            return None
+        from .providers import databento as _db
+        ch = _db.chain_frame(rows, u if u != "SPXW" else "SPX", spot_fn=lambda t: self._opra_spot(su, t))
+        ts = pd.Timestamp(rows["ts"].iloc[0])
+        dte = (pd.to_datetime(ch["expiry"]) - _session_date(ts)).dt.days
+        ch = ch[(dte >= min_dte) & (dte <= max_dte)].reset_index(drop=True)
+        ch.attrs.update({"source": "databento", "fidelity": int(Fidelity.T0_QUOTE), "synthetic": False,
+                         "snapshot_ts": ts, "stale_days": (as_of - ts).total_seconds() / 86400})
+        return ch
+
+    def _opra_quote(self, instrument: Instrument, as_of: pd.Timestamp, max_stale_days: float, other_ts):
+        und = (instrument.underlying or "").upper()
+        if not und or not self._opra().has(und):
+            return None
+        r = self._opra().latest(und, instrument.symbol, as_of, max_stale_days)
+        if r is None or (other_ts is not None and r["ts"] < other_ts):
+            return None
+        return OptionQuote(instrument=instrument, ts=pd.Timestamp(r["ts"]), bid=float(r["bid"]), ask=float(r["ask"]),
+                           underlying_price=float("nan"), iv=float("nan"), delta=float("nan"), gamma=float("nan"),
+                           vega=float("nan"), theta=float("nan"), volume=float("nan"), open_interest=float("nan"),
+                           bid_size=float(r["bid_size"]), ask_size=float(r["ask_size"]), fidelity=Fidelity.T0_QUOTE)
+
     def option_chain(self, underlying: str, as_of, min_dte: int = 0, max_dte: int = 400,
                      synthetic: bool = True) -> pd.DataFrame:
         """Latest REAL chain snapshot with ts <= as_of (fidelity column T2_PROXY). If there is
@@ -1767,6 +1924,9 @@ class Portal:
         u = underlying.upper()
         su = self.resolve_symbol(u, as_of)[2]
         df, src = self._chain_frame(su, as_of) if su is not None else (pd.DataFrame(), "")
+        opra = self._opra_chain(su, u, as_of, df["ts"].max() if not df.empty else None, min_dte, max_dte)
+        if opra is not None:
+            return opra
         if not df.empty:
             ts = df["ts"].max()
             if (as_of - ts).total_seconds() / 86400 <= self.MAX_CHAIN_STALE_DAYS or not synthetic:
@@ -1886,9 +2046,11 @@ class Portal:
         Synthetic marks are the OPTIONS agent's job (atlasbt.options.marking)."""
         as_of = _utc(as_of)
         df, src = self._chain_frame((instrument.underlying or "").upper(), as_of)
-        if df.empty:
-            return None
-        hit = self._match_instrument(df, instrument)
+        hit = self._match_instrument(df, instrument) if not df.empty else df
+        oq = self._opra_quote(instrument, as_of, max_stale_days,
+                              hit["ts"].max() if not hit.empty else None)
+        if oq is not None:
+            return oq
         if hit.empty:
             return None
         r = hit.sort_values("ts").iloc[-1]
@@ -1920,6 +2082,10 @@ class Portal:
                     ok = self.store.exists(k, src, symbol) or self.store.exists(k, src, symbol.upper())
                 if ok:
                     out.append((k, src))
+        if eod and not any(src == "dolthub" for _k, src in out) and symbol not in ("*", None, "") \
+                and self._opra().has(symbol):
+            # no regular EOD chain source (hod = one sample day): OPRA closing samples count (SPX, S172)
+            out.append(("option_quotes", "databento"))
         return out
 
     def option_quotes(self, instrument: Instrument, start, end, as_of, synthetic: bool = True) -> pd.DataFrame:
@@ -1930,6 +2096,9 @@ class Portal:
         real = self._real_option_quotes(instrument, start, end, as_of)
         if len(real) or not synthetic:
             return real
+        und = (instrument.underlying or "").upper()
+        if self._opra().has(und) and self._opra().covers(und, instrument.symbol, _utc(start), min(_utc(end), _utc(as_of))):
+            return real            # real T0 samples exist that session: never substitute a model quote
         try:
             from atlasbt.options.marking import synthetic_option_quotes
         except ImportError:
@@ -1962,6 +2131,11 @@ class Portal:
                     df = self._match_instrument(df, instrument) if len(df) else df
                     if len(df):
                         parts.append(df.assign(source=src))
+        if self._opra().has(und):
+            from .providers import databento as _db
+            q = self._opra().contract(und, instrument.symbol, start, hi)
+            if len(q):
+                parts.append(_db.quote_rows_frame(q, und))
         extra = ["root", "settlement_date", "kind", "underlying_price_source", "source"]
         cols = [c for c in frames.CHAIN_COLS if c != "ts"] + extra
         if not parts:
@@ -1975,7 +2149,9 @@ class Portal:
                                        for u, t in zip(out["underlying_price"], out["ts"])]
         out = out.set_index(pd.DatetimeIndex(out["ts"], name="ts"))
         out = out[[c for c in cols if c in out.columns]]
-        out.attrs.update({"fidelity": int(Fidelity.T2_PROXY), "symbol": instrument.symbol, "synthetic": False})
+        out.attrs.update({"fidelity": int(pd.to_numeric(out["fidelity"], errors="coerce").max()) if "fidelity" in out
+                          and out["fidelity"].notna().any() else int(Fidelity.T2_PROXY),
+                          "symbol": instrument.symbol, "synthetic": False})
         return out
 
     # ================================================================ rates, borrow, fundamentals
@@ -2043,20 +2219,39 @@ class Portal:
         possible -- use risk_free_rate_info() to see which series was used and its fidelity."""
         return self.risk_free_rate_info(as_of, tenor)[0]
 
+    MAX_BORROW_STALE_DAYS = 7
+
+    def _borrow_cols(self, b: pd.DataFrame):
+        """(sorted known_at ns, fee %, available) of a cached borrow frame, memoized per frame."""
+        ck = ("borrow_cols", id(b))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is b:
+            return hit[1]
+        t = pd.to_datetime(b["time"], utc=True)
+        o = np.argsort(t.to_numpy(dtype="datetime64[ns]"), kind="stable")
+        ka = t.to_numpy(dtype="datetime64[ns]").astype("int64")[o]
+        fee = b["fee"].to_numpy(dtype=float)[o]
+        av = (b["available"].to_numpy(dtype=float) if "available" in b.columns else np.full(len(b), np.nan))[o]
+        cols = (ka, fee, av)
+        self._cache[ck] = (b, cols)
+        return cols
+
     def borrow(self, symbol: str, as_of) -> tuple[bool, float, Fidelity]:
         from .providers import borrow as B
         orig = symbol
         ss = self.resolve_symbol(symbol)[2]
         symbol = self._split_key(symbol)[0]
         if ss is not None and self.has(ss, "borrow"):
+            # real IBorrowDesk history (providers/iborrowdesk.py): last row known at as_of, unless
+            # it is older than MAX_BORROW_STALE_DAYS (series ended / gap) -> default model below
             b = self._read("borrow", "iborrowdesk", ss)
             if len(b) and "fee" in b.columns and "time" in b.columns:
-                t = pd.to_datetime(b["time"], utc=True)
-                b = b[t <= _utc(as_of)]
-                if len(b):
-                    fee = float(b["fee"].iloc[-1]) / 100.0
-                    avail = float(b.get("available", pd.Series([1])).iloc[-1]) > 0
-                    return avail, fee, Fidelity.T1_BAR
+                ka, fee_a, av_a = self._borrow_cols(b)
+                a_ns = _utc(as_of).value
+                i = int(np.searchsorted(ka, a_ns, side="right")) - 1
+                if i >= 0 and (a_ns - ka[i]) <= self.MAX_BORROW_STALE_DAYS * 86_400_000_000_000:
+                    av = av_a[i]
+                    return bool(not (av == av) or av > 0), float(fee_a[i]) / 100.0, Fidelity.T1_BAR
         su = symbol.upper()
         if su in B.LEVERAGED_ETFS or su in B.CORE_ETFS or self._is_etf(symbol):
             # perf (docs/PERF.md): default_fee ignores index membership for these symbols, so the
@@ -2077,10 +2272,71 @@ class Portal:
             pass
         return B.default_fee(symbol, is_etf=self._is_etf(symbol), is_index_member=member)
 
+    #: analyst-consensus fields served from fundamentals/estimates (providers/estimates.py; T2)
+    ESTIMATE_FIELDS = ("eps_consensus_ntm", "eps_num_analysts_ntm", "eps_consensus_fy1", "eps_consensus_fy2")
+
+    def _estimate_tickers(self) -> dict:
+        """CIK -> estimate-store tickers holding that issuer's snapshots (built once)."""
+        from .providers import estimates as EST
+        ck = ("estimate_tickers",)
+        if ck not in self._cache:
+            m: dict = {}
+            for t in self.store.symbols("fundamentals", EST.SOURCE):
+                f = self._read("fundamentals", EST.SOURCE, t, columns=["cik"])
+                for c in set(f["cik"].dropna().astype("int64")) if len(f) else ():
+                    m.setdefault(int(c), []).append(t)
+            self._cache[ck] = m
+        return self._cache[ck]
+
+    def _estimates(self, symbols, fields: Sequence[str], as_of: pd.Timestamp) -> pd.DataFrame:
+        """Latest weekly consensus snapshot known at as_of per (symbol, field); none when that
+        snapshot is older than estimates.MAX_STALE_DAYS. A security key gets only rows of its CIK."""
+        from .providers import estimates as EST
+        syms = list(symbols) if symbols is not None else self.store.symbols("fundamentals", EST.SOURCE)
+        parts = []
+        for s_ in syms:
+            t, kc = self._split_key(s_)
+            if kc is None:
+                f = self._read("fundamentals", EST.SOURCE, t)
+            else:   # a security key: that issuer's snapshots under every ticker it used (FB -> META)
+                fs = [self._read("fundamentals", EST.SOURCE, x) for x in self._estimate_tickers().get(int(kc), [t])]
+                fs = [x for x in fs if len(x)]
+                f = pd.concat(fs, ignore_index=True) if len(fs) > 1 else (fs[0] if fs else pd.DataFrame())
+            if not len(f):
+                continue
+            ka = pd.to_datetime(f["known_at"], utc=True)
+            m = f["field"].isin(list(fields)) & (ka <= as_of)
+            if kc is not None:
+                m &= f["cik"] == kc
+            f = f[m]
+            if not len(f):
+                continue
+            f = f.sort_values(["field", "known_at"]).groupby("field", as_index=False).tail(1)
+            f = f[pd.to_datetime(f["known_at"], utc=True) >= as_of - pd.Timedelta(days=EST.MAX_STALE_DAYS)]
+            if len(f):
+                parts.append(f.assign(symbol=s_))
+        cols = ["symbol", "field", "value", "period_end", "known_at", "source", "cik", "fy1_end", "w_fy1"]
+        if not parts:
+            return pd.DataFrame(columns=cols)
+        out = pd.concat(parts, ignore_index=True)
+        return out[[c for c in cols if c in out.columns]].reset_index(drop=True)
+
     def fundamentals(self, symbols: Optional[Iterable[str]], fields: Sequence[str], as_of) -> pd.DataFrame:
         """Latest value per (symbol, field) among facts filed (accepted) at or before as_of:
-        the most recent period_end, and for that period the most recently filed value."""
+        the most recent period_end, and for that period the most recently filed value.
+        ESTIMATE_FIELDS come from the weekly consensus snapshots instead (`_estimates`, T2)."""
         as_of = _utc(as_of)
+        est = [f for f in fields if f in self.ESTIMATE_FIELDS]
+        if est:
+            e = self._estimates(symbols, est, as_of)
+            rest = [f for f in fields if f not in self.ESTIMATE_FIELDS]
+            if not rest:
+                e.attrs.update({"source": "dolthub_eps_estimate", "fidelity": int(Fidelity.T2_PROXY)})
+                return e
+            o = self.fundamentals(symbols, rest, as_of)
+            out = pd.concat([x for x in (o, e) if len(x)], ignore_index=True) if (len(o) or len(e)) else o
+            out.attrs.update({"source": "sec+dolthub_eps_estimate", "fidelity": int(Fidelity.T2_PROXY)})
+            return out
         syms = list(symbols) if symbols is not None else self.store.symbols("fundamentals", "sec")
         parts = []
         for s in syms:
@@ -2163,6 +2419,11 @@ class Portal:
 def _prev_close(ex_date) -> pd.Timestamp:
     from .providers.yahoo import conservative_known_at
     return conservative_known_at(pd.Timestamp(ex_date))
+
+
+def _src_rank(src: Optional[str]) -> int:
+    order = INTRADAY_SOURCES + PROXY_INTRADAY_SOURCES
+    return order.index(src) if src in order else len(order)
 
 
 def resample_bars(df: pd.DataFrame, freq: str) -> pd.DataFrame:

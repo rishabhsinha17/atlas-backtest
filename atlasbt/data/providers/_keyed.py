@@ -1,9 +1,10 @@
 """Shared helpers for key-gated providers (activate only when env keys are set).
 
-All key-gated providers are UNVERIFIED: written from the official API docs
-(fetched 2026-10-28) but never exercised against the live API (no keys here).
+Alpaca (providers/alpaca.py) is LIVE-VERIFIED (2026-10-30, free paper key). The others (polygon,
+tiingo, databento, alphavantage) are UNVERIFIED: written from the official API docs (fetched
+2026-10-28) but never exercised against the live API (no keys here).
 They degrade gracefully: available() is False and fetch functions return
-{'skipped': 'no API key'} without touching the network.
+{'skipped': 'no API key'} without touching the network. Keys are read from the environment only.
 """
 from __future__ import annotations
 

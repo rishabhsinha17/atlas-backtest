@@ -303,6 +303,9 @@ class S160(OptionsEventBase):
     universe_name = "SP500"
     CHAIN_MAX_FID = Fidelity.T1_BAR
     QUOTE_MAX_AGE = pd.Timedelta(minutes=5)
+    #: the 252-day IV history is a series of DAILY CLOSE values: real EOD snapshots (DoltHub, T2) are accepted
+    #: for it; the 10:00 decision itself still needs a timestamped (T0/T1) snapshot
+    HISTORY_MAX_FID = Fidelity.T2_PROXY
     params = {"iv_pct": 70, "short_delta": 0.20, "wing_delta": 0.10, "dte": 30, "tp": 0.50, "exit_dte": 7,
               "low_n": 5, "entry": "10:00", "or_minutes": 30, "timing_proxy": False, "allow_synthetic": False}
     grid = {"iv_pct": [60, 70, 80], "short_delta": [0.20, 0.30]}
@@ -313,7 +316,9 @@ class S160(OptionsEventBase):
         "'First next trading-day 10:00 after earnings release' = the first session whose 10:00 ET is after the "
         "actual release timestamp (BMO on D -> D 10:00; AMC on D -> D+1 10:00).",
         "IV percentile = 30D constant-maturity ATM IV (real chain, total-variance interpolation) at the 10:00 snapshot "
-        "vs the previous 252 valid daily close values of the same name (percentile_rank, previous values).",
+        "vs the previous 252 valid daily close values of the same name (percentile_rank, previous values); the "
+        "daily close history comes from real EOD snapshots (DoltHub, T2, flagged) -- intraday OPRA samples are only "
+        "fetched around the events.",
         "'Only when stock closes above opening range' = opening range = first 30 minutes (09:30-10:00, the 10:00 "
         "decision bar completes it); the vertical is sold at the first 5m bar close ABOVE the OR high after 10:00 in "
         "the same session (one entry per release); no entry if that never happens.",
