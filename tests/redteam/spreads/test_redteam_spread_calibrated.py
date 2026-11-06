@@ -65,6 +65,24 @@ def _qlib(symbols):
 
 
 # ----------------------------------------------------------------------------- (2) reproducibility
+
+def _assert_close(a, b, rel=1e-3, path="era"):
+    """Structural equality to the docstring's 1e-3 relative (abs 1e-6 for near-zero coefficients):
+    an Accelerate (macOS) vs OpenBLAS build moves an ill-conditioned surface coefficient by ~7e-7."""
+    if isinstance(b, dict):
+        assert isinstance(a, dict) and a.keys() == b.keys(), path
+        for k in b:
+            _assert_close(a[k], b[k], rel, f"{path}.{k}")
+    elif isinstance(b, (list, tuple)):
+        assert isinstance(a, (list, tuple)) and len(a) == len(b), path
+        for i, (x, y) in enumerate(zip(a, b)):
+            _assert_close(x, y, rel, f"{path}[{i}]")
+    elif isinstance(b, float) and not isinstance(b, bool):
+        assert a == pytest.approx(b, rel=rel, abs=1e-6), path
+    else:
+        assert a == b, path
+
+
 def test_validation_report_reproducible_from_build_script(build):
     """SOUND: spread_calibration.json and validation_report.json are reproduced to 1e-3 relative
     from build_calibration.py + the shipped per-symbol datasets (the TAQ/IEX extraction itself
@@ -75,7 +93,7 @@ def test_validation_report_reproducible_from_build_script(build):
     for t, b in shipped_c["beta"].items():
         assert cal["beta"][t] == pytest.approx(b, abs=1e-5)
     assert cal["q"] == pytest.approx(shipped_c["q"], rel=1e-5)
-    assert cal["era"] == shipped_c["era"]                    # v2 schema (era_anchors -> era)
+    _assert_close(cal["era"], shipped_c["era"])                # v2 schema (era_anchors -> era)
     for k in ("in_sample", "holdout_symbols"):
         assert rep[k]["mae_bp"] == pytest.approx(shipped_r[k]["mae_bp"], rel=1e-6)
     for k in ("time_stability_all_symbols", "oos_symbol_and_day"):        # item 11 relabel

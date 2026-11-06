@@ -16,6 +16,8 @@ from __future__ import annotations
 import heapq
 import multiprocessing as mp
 import os
+import re
+import subprocess
 import sys
 import time
 import traceback
@@ -32,6 +34,17 @@ def mem_available_gb() -> float:
                 return int(line.split()[1]) / 1024 / 1024
     except Exception:
         pass
+    if sys.platform == "darwin":          # no /proc on macOS: free + inactive + speculative + purgeable pages
+        try:
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            page = int(re.search(r"page size of (\d+) bytes", out).group(1))
+            pages = {k.strip(): int(v.strip().rstrip(".")) for k, v in
+                     (ln.split(":", 1) for ln in out.splitlines()[1:] if ":" in ln)}
+            n = sum(pages.get(k, 0) for k in ("Pages free", "Pages inactive", "Pages speculative",
+                                              "Pages purgeable"))
+            return n * page / 1024 ** 3
+        except Exception:
+            pass
     return 99.0
 
 

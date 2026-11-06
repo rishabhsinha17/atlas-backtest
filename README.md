@@ -32,9 +32,9 @@ before being fixed. See [`docs/STATUS.md`](docs/STATUS.md).
 ## Quick start
 
 ```bash
-pip install -e .                                   # Python >= 3.11
+pip install -e '.[test]'                           # Python >= 3.11 (test extra: pytest, xdist, arch)
 python -m atlasbt.data.fetch --set core            # build the local data cache from free sources (~3 GB)
-ATLASBT_OFFLINE=1 python -m pytest -q              # test suite (offline; data-dependent tests skip without cache)
+ATLASBT_OFFLINE=1 python -m pytest -q -n 6         # test suite (offline; data-dependent tests skip without cache)
 python -m atlasbt.run plan                         # which strategies are testable, windows, expected fidelity
 python -m atlasbt.run replicate                    # end-to-end known-answer checks
 python -m atlasbt.run launch --commit HEAD --no-overlay final --workers 4   # full atlas, resumable

@@ -11,3 +11,4 @@ data_raw/*
 # atlas runner outputs (keep only the README)
 results/*
 !results/README.md
+*.egg-info/

@@ -3,6 +3,15 @@ name = "atlasbt"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["numpy", "pandas>=2.2", "pyarrow", "scipy", "statsmodels", "exchange_calendars", "yfinance", "requests", "matplotlib"]
+[project.optional-dependencies]
+test = ["pytest", "pytest-xdist", "arch"]
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools.packages.find]
+include = ["atlasbt*"]
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.csv", "*.csv.gz"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
