@@ -77,6 +77,12 @@ def _session_date(ts) -> pd.Timestamp:
     return _utc(ts).tz_convert(ET).tz_localize(None).normalize()
 
 
+def _pandas_uses_bottleneck() -> bool:
+    """True when pandas reductions go through bottleneck (whose summation order differs from numpy's)."""
+    from pandas.core import nanops
+    return bool(getattr(nanops, "_USE_BOTTLENECK", False))
+
+
 def _naive_date(d) -> pd.Timestamp:
     t = pd.Timestamp(d)
     if t.tzinfo is not None:
@@ -489,19 +495,180 @@ class Portal:
         if len(prior) < lookback:
             return []
         lo, hi = prior[-lookback], prior[-1]
-        scores = {}
-        for s in self.universe(base, as_of):
-            d = self._daily_frame(s, sess)
-            if not len(d):
-                continue
-            dd = frames.to_naive_date(d.index)
-            m = (dd >= lo) & (dd <= hi)
-            w = d.loc[m]
-            if len(w) >= lookback // 2:
-                scores[s] = float((w["close"] * w["volume"]).mean())
+        # The ranking for one session is n-independent: memoized per (base, session, lookback) so
+        # TOP10/TOP50/TOP100 on the same session score the members once.
+        sk = ("topdv_scores", base, sess, lookback)
+        scores = self._cache.get(sk)
+        if scores is None:
+            win = self._dv_window(sess, lo, hi)
+            scores = {}
+            for s in self.universe(base, as_of):
+                if win is None:     # unordered schedule (never in practice): the original per-member code
+                    d = self._daily_frame(s, sess)
+                    if not len(d):
+                        continue
+                    dd = frames.to_naive_date(d.index)
+                    w = d.loc[(dd >= lo) & (dd <= hi)]
+                    if len(w) >= lookback // 2:
+                        scores[s] = float((w["close"] * w["volume"]).mean())
+                    continue
+                sc = self._dv_window_score(s, win, lookback // 2)
+                if sc is not None:
+                    scores[s] = sc
+            self._cache[sk] = scores
         out = sorted(scores, key=lambda k: -scores[k])[:n]
         self._cache[key] = out
         return out
+
+    # ---------------------------------------------------------------- dollar-volume ranking (perf)
+    # perf (docs/PERF.md): for every member s, _dv_window_score(s, _dv_window(sess, lo, hi), k) is
+    # bit-identical to the original per-member code
+    #     d = self._daily_frame(s, sess)               # identity over [sess - 120 days, sess]
+    #     dd = frames.to_naive_date(d.index); w = d.loc[(dd >= lo) & (dd <= hi)]
+    #     score = float((w["close"] * w["volume"]).mean()) if len(w) >= k else (skipped)
+    # It reads the same data: the same _cik_series / _plain_frame series, chosen by the same rule
+    # as _window_identity (the issuer the ticker denotes on each session of the 120-day window;
+    # none or several -> skipped; lineage hint = first non-empty hint of that issuer's sessions),
+    # keeping only that issuer's sessions. What changes is the cost: the ticker's per-session
+    # identity is computed once over the whole schedule (run-length encoded, a pure function of
+    # the cached timeline), and each series' naive dates and close x volume products once per
+    # series object, so a session costs binary searches instead of full-history pandas masks.
+    def _dv_window(self, sess: pd.Timestamp, lo: pd.Timestamp, hi: pd.Timestamp) -> Optional[tuple]:
+        """Session-level constants of the ranking window: (schedule positions [j0, j1) of the
+        identity window _window_identity uses for _daily_frame(s, sess), bar-date bounds [a, b] in
+        int64 ns = [s0, sess] n [lo, hi]); None if the schedule is not strictly ordered."""
+        d = pd.Timestamp(sess).normalize()
+        s0 = d - pd.Timedelta(days=120)
+        sidx_ns, opens, mono = self._sched_open_arrays()
+        start = pd.Timestamp(s0, tz="UTC").as_unit("ns").value
+        end = (pd.Timestamp(d, tz="UTC") + pd.Timedelta(days=1)).as_unit("ns").value
+        if not mono:
+            return None
+        j0, j1 = int(np.searchsorted(opens, start, side="left")), int(np.searchsorted(opens, end, side="left"))
+        if j0 >= j1:                # no session in the window: the last session opening before `end`
+            j0 = j1 - 1
+        a = max(s0, pd.Timestamp(lo)).as_unit("ns").value
+        b = min(d, pd.Timestamp(hi)).as_unit("ns").value
+        return j0, j1, a, b
+
+    def _dv_window_score(self, symbol: str, win: tuple, min_rows: int) -> Optional[float]:
+        """Mean raw close x volume of the bars _daily_frame(symbol, sess) serves on [lo, hi], or
+        None when fewer than `min_rows` (or the identity fails closed). See the block comment."""
+        j0, j1, a, b = win
+        t, kc = self._split_key(symbol)
+        rk = None
+        if kc is not None:
+            f = self._cik_series(kc, t, self._key_hint_memo(t, kc))
+        elif self._is_plain(t):
+            f = self._plain_frame(t)
+        else:
+            rs, rc, rh = self._identity_runs(t)
+            r0 = int(np.searchsorted(rs, j0, side="right")) - 1
+            r1 = int(np.searchsorted(rs, j1, side="left"))
+            r0 = max(r0, 0)
+            u = {int(c) for c in rc[r0:r1] if c > 0}
+            if len(u) != 1:
+                return None         # _window_identity: unknown identity / several issuers -> fail closed
+            c = u.pop()
+            h = next((rh[r] for r in range(r0, r1) if rc[r] == c and rh[r]), None)
+            f = self._cik_series(c, t, h)
+            rk = (rs, rc, c)
+        if not len(f):
+            return None
+        dd, dv, mono = self._dv_arrays(f)
+        if mono:
+            i0, i1 = np.searchsorted(dd, a, side="left"), np.searchsorted(dd, b, side="right")
+            wd, wv = dd[i0:i1], dv[i0:i1]
+        else:
+            m = (dd >= a) & (dd <= b)
+            wd, wv = dd[m], dv[m]
+        if rk is not None and len(wd):
+            # keep only bars on sessions of the window on which the ticker denotes issuer c
+            rs, rc, c = rk
+            sidx_ns = self._sched_open_arrays()[0]
+            pos = np.searchsorted(sidx_ns, wd, side="left")
+            ok = pos < len(sidx_ns)
+            ok[ok] = sidx_ns[pos[ok]] == wd[ok]
+            ok &= (pos >= j0) & (pos < j1)
+            run = np.searchsorted(rs, pos, side="right") - 1
+            ok &= (run >= 0) & (rc[np.clip(run, 0, len(rc) - 1)] == c)
+            if not ok.all():
+                wd, wv = wd[ok], wv[ok]
+        if len(wv) < min_rows:
+            return None
+        if wv.dtype != np.float64 or _pandas_uses_bottleneck():
+            return float(pd.Series(wv).mean())
+        # pandas nanops.nanmean on float64 without bottleneck: NaN -> 0, numpy sum, / non-NaN count
+        nan = np.isnan(wv)
+        if nan.any():
+            wv = np.where(~nan, wv, 0.0)
+        cnt = np.float64(len(wv) - int(nan.sum()))
+        return float(wv.sum() / cnt) if cnt > 0 else float("nan")
+
+    def _key_hint_memo(self, ticker: str, cik: int) -> Optional[str]:
+        """_key_hint(ticker, cik), memoized per cached timeline object."""
+        tl = self.ticker_timeline(ticker)
+        ck = ("key_hint", ticker, cik)
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is tl:
+            return hit[1]
+        h = self._key_hint(ticker, cik)
+        self._cache[ck] = (tl, h)
+        return h
+
+    def _identity_runs(self, ticker: str):
+        """_identity_by_date(ticker, every schedule session) run-length encoded on (cik, hint):
+        (run start positions in the schedule, run cik, run hint), memoized per cached timeline
+        object. _identity_by_date is pointwise in the date, so any window's per-session identity
+        is a slice of this."""
+        tl = self.ticker_timeline(ticker)
+        ck = ("identity_runs", ticker)
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is tl:
+            return hit[1]
+        sc = frames.schedule().index
+        cik, _, hint = self._identity_by_date(ticker, sc)
+        if len(cik):
+            # a run never spans two hint OBJECTS (over-splitting equal hints is harmless): every
+            # session of a run has the same cik and the very same hint
+            hid = np.fromiter(map(id, hint), dtype=np.int64, count=len(hint))
+            chg = np.r_[True, (cik[1:] != cik[:-1]) | (hid[1:] != hid[:-1])]
+            starts = np.flatnonzero(chg)
+        else:
+            starts = np.zeros(0, dtype=np.int64)
+        arrs = (starts, cik[starts], hint[starts])
+        self._cache[ck] = (tl, arrs)
+        return arrs
+
+    def _sched_open_arrays(self):
+        """(session dates as int64 ns, UTC opens as int64 ns, opens strictly ordered?) of
+        frames.schedule(), memoized."""
+        ck = ("sched_open_arrays",)
+        hit = self._cache.get(ck)
+        if hit is None:
+            sc = frames.schedule()
+            opens = pd.DatetimeIndex(sc["open"])
+            ok = bool(len(opens)) and not opens.hasnans
+            o = opens.tz_convert("UTC").as_unit("ns").asi8 if opens.tz is not None else opens.as_unit("ns").asi8
+            sidx = pd.DatetimeIndex(sc.index).as_unit("ns").asi8
+            ok = ok and bool(np.all(o[1:] > o[:-1])) and bool(np.all(sidx[1:] > sidx[:-1]))
+            hit = (sidx, o, ok)
+            self._cache[ck] = hit
+        return hit
+
+    def _dv_arrays(self, f: pd.DataFrame):
+        """(naive bar dates as int64 ns, close x volume ndarray, dates sorted?) of a served daily
+        series, memoized per frame object (served series are cached and never mutated; the
+        identity check guards against a rebuilt frame, as in _timeline_arrays)."""
+        ck = ("dv_arrays", id(f))
+        hit = self._cache.get(ck)
+        if hit is not None and hit[0] is f:
+            return hit[1]
+        dd = frames.to_naive_date(f.index).as_unit("ns").asi8
+        dv = (f["close"] * f["volume"]).to_numpy()
+        arrs = (dd, dv, bool(np.all(dd[1:] >= dd[:-1])))
+        self._cache[ck] = (f, arrs)
+        return arrs
 
     def universe_survivorship_bias(self, name: str, as_of) -> dict:
         from .survivorship import universe_bias_report

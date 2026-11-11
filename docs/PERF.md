@@ -81,6 +81,32 @@ now about 3.5-6.5 CPU-min per year, including ~40 s of one-time data loading. Fo
 the remaining cost is startup (actions classification, imports: 10-20 s per process) plus strategy-side
 pandas indicators. Options are dominated by `options/marking.py` (section 4).
 
+### 3.1 `SP500_TOP<N>_DV` (2026-11, wip-perf)
+
+`Portal._top_dollar_volume` (the `SP500_TOP50_DV` universe of ~25 intraday strategies and the planner's
+per-session check) called `_daily_frame` for every S&P member on every session: a schedule-wide mask, the
+per-session identity, then `to_naive_date` / `isin` / boolean indexing over each member's FULL history.
+Now (`_dv_window`, `_dv_window_score`):
+
+* the ticker's per-session identity (`_identity_by_date` over the whole schedule) is computed once per ticker
+  and run-length encoded on (cik, hint object); `_identity_by_date` is pointwise in the date, so any 120-day
+  window is a slice of it (`_identity_runs`, memoized per cached timeline object);
+* each served series' naive bar dates and close x volume products are computed once per series object
+  (`_dv_arrays`); a session then costs binary searches on those arrays;
+* the scores of one session are memoized independently of N (`("topdv_scores", base, session, lookback)`).
+
+The rule is unchanged: the same 120-day identity window and fail-closed cases as `_window_identity`, the same
+`_cik_series` / `_plain_frame` series and lineage hint, the same bars (sessions where the ticker denotes that
+issuer, dated in the 20 sessions strictly before the session), the same pandas `nanmean` arithmetic. Proof:
+old vs new full score dicts (keys, order, float bits) and the TOP10/50/100 lists for all 2,731 sessions
+2016-01-04..2026-11-11 on a frozen copy of the real cache: 0 mismatches over 1.37 M member scores.
+`tests/data/test_topdv_equivalence.py` pins the same on a stubbed identity layer (reused ticker, late
+listing, carry-forward, security key, ETF, NaN closes, non-session bar).
+
+Per session on the real cache (FastPortal, `universe("SP500_TOP50_DV")`, member series already built):
+1.13 s -> 0.039 s (60 consecutive sessions; about half of the rest is the per-session `SP500` membership).
+The first call (~125 s: identity index and series builds) is unchanged. RSS +~30 MB.
+
 ## 4. Not done / recommendations (outside this agent's edit scope)
 
 * **OPTIONS (`options/marking.py`)**: `mark_contract` re-runs `prepare_chain` + `infer_forwards`
