@@ -24,8 +24,18 @@ Rules (documented in docs/RUNNING.md §2):
   ``WARMUP_SESSIONS`` (252) sessions is added for daily+ strategies, because no pre-listing history exists
   for indicators. Intraday strategies get no warm-up (their indicators read daily/intraday history before
   the window through the PIT portal).
-* Window end = the last cached session common to the critical bar inputs.
+  - intraday bars / quotes are scanned from 2016-01-01 (Alpaca SIP history, DATA.md §4.15);
+  - PIT universe (SP500, SP500_TOPn_DV) under an INTRADAY strategy: per-session coverage of THAT
+    session's members (bars of every no-symbol bars frequency ON the session and the engine's other
+    member checks) >= min_coverage at every sampled session of the window, plus the engine's
+    first-10-session PRE/POST probe of the kept members (``PlanContext.pit_window``);
+  - quotes: first quote session common to the symbols (static) or of the UNION of a PIT universe's
+    members (pre-open windows exist only on member sessions); Alpaca quote sessions are the recorded
+    windows of ``reference/alpaca/quote_windows`` (the Portal serves nothing outside them).
+* Window end = the last cached session common to the critical bar inputs (and the last quote session).
 * Minimum window: 252 sessions for daily+ strategies, 10 sessions for intraday ones.
+* The memo (results/plan_cache.json) is dropped on a new identity build / membership / events, and its
+  intraday entries on any change of the intraday bar / quote stores.
 """
 from __future__ import annotations
 
@@ -47,6 +57,15 @@ MIN_SESSIONS_INTRADAY = 10
 SMALL_UNIVERSE = 6
 UNIVERSE_SHARE = 0.80
 FUNDAMENTALS_START = pd.Timestamp("2009-07-22")
+#: intraday bar / quote history scanned by the planner: Alpaca SIP starts 2016-01-04 (DATA.md §4.15); the
+#: Yahoo-era ``now - 800 days`` start cut every Alpaca-backed intraday window to the last ~2 years
+INTRADAY_HISTORY_START = pd.Timestamp("2016-01-01", tz="UTC")
+#: PIT intraday universes: coverage is sampled every N sessions and refined by bisection at the edges
+PIT_STEP_SESSIONS = 10
+#: the engine probes PRE/POST bars and quotes of every kept member over the run's first N sessions
+#: (Backtester._probe_sessions n_probe)
+PROBE_SESSIONS = 10
+ET = "America/New_York"
 
 #: rough cost model (seconds) per config: SETUP + sessions * (BASE[freq] + PER_SYMBOL[freq] * n_symbols)
 SETUP_SEC = 15.0
@@ -79,6 +98,82 @@ def _data_version(portal) -> str:
     return f"identity={BUILD_VERSION};membership={mem};events={ev}"
 
 
+def _intraday_version(portal) -> str:
+    """Stamp of the intraday stores (every ``bars_<intraday>`` kind, ``quotes``, ``reference/alpaca`` with
+    the recorded quote windows): parquet file count and newest mtime per kind. A fetch that adds or
+    rewrites intraday bars / quotes changes it, which drops the memoised intraday facts (``bars|SYM|1m``,
+    ``quotes|SYM`` ... computed before the fetch, possibly as None) but keeps the daily ones."""
+    try:
+        root = Path(portal.store.root)
+    except Exception:
+        return ""
+    if not root.is_dir():
+        return ""
+    dirs = sorted(d for d in root.glob("bars_*") if d.is_dir() and d.name != "bars_1d")
+    dirs += [root / "quotes", root / "reference" / "alpaca"]
+    parts = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        n, newest = 0, 0
+        for f in d.rglob("*.parquet"):
+            try:
+                newest = max(newest, f.stat().st_mtime_ns)
+            except OSError:
+                continue
+            n += 1
+        parts.append(f"{d.relative_to(root)}={n}:{newest}")
+    return ";".join(parts)
+
+
+def _is_intraday_key(key: str) -> bool:
+    """Memo keys whose value depends on intraday bars or quotes."""
+    parts = str(key).split("|")
+    if parts[0] in ("quotes", "pit"):
+        return True
+    return parts[0] in ("bars", "spans") and len(parts) >= 3 and parts[2] != "1d"
+
+
+def _norm_freq(f, default: str) -> str:
+    f = f or default
+    return "1d" if f in (None, "1mo", "1w", "event") else f
+
+
+def _in_spans(spans, a: str, b: str) -> bool:
+    """True if a session span [x, y] (ISO dates) intersects [a, b]."""
+    return any(x <= b and y >= a for x, y in spans or ())
+
+
+def _bisect_first(lo: int, hi: int, ok) -> int:
+    """First index in (lo, hi] with ok() True, given ok(lo) False and ok(hi) True."""
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if ok(mid):
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
+def _bisect_last(lo: int, hi: int, ok) -> int:
+    """Last index in [lo, hi) with ok() True, given ok(lo) True and ok(hi) False."""
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if ok(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _is_pit_universe(name: Optional[str]) -> bool:
+    """Universes whose membership changes by session (S&P 500 PIT and its top-N dollar-volume subsets)."""
+    import re
+
+    n = (name or "").upper()
+    return n in ("SP500", "S&P500", "SPX_MEMBERS") or bool(re.fullmatch(r"SP500_TOP\d+_DV", n))
+
+
 class PlanContext:
     """Memoized availability facts (persisted in results/plan_cache.json)."""
 
@@ -95,6 +190,14 @@ class PlanContext:
         if self.cache.get("_data_version") != dv:
             self.cache = {"_data_version": dv}
             self.dirty = True
+        # intraday facts are also only valid for the intraday stores they were computed on: a fetch of
+        # Alpaca bars / quotes after a plan must not leave `bars|SYM|1m` / `quotes|SYM` memoised as None
+        iv = _intraday_version(portal)
+        if self.cache.get("_intraday_version") != iv:
+            self.cache = {k: v for k, v in self.cache.items() if not _is_intraday_key(k)}
+            self.cache["_intraday_version"] = iv
+            self.dirty = True
+        self._qwin: Optional[dict] = None
         from atlasbt.core.clock import nyse
 
         self.cal = nyse()
@@ -118,7 +221,7 @@ class PlanContext:
         def f():
             p = self.portal
             now = _today_utc()
-            start = pd.Timestamp("1960-01-01", tz="UTC") if freq == "1d" else now - pd.Timedelta(days=800)
+            start = pd.Timestamp("1960-01-01", tz="UTC") if freq == "1d" else INTRADAY_HISTORY_START
             try:
                 if hasattr(p, "bars_coverage"):        # f39aa6b+: computed BY bars() (identity-verified)
                     c = p.bars_coverage(sym, start, now, now, freq=freq)
@@ -139,23 +242,226 @@ class PlanContext:
 
         return self._memo(f"bars|{sym}|{freq}", f)
 
+    def _alpaca_quote_days(self) -> dict:
+        """{SYMBOL: set of ISO session dates} of the recorded Alpaca quote windows with at least one NBBO
+        update (``reference/alpaca/quote_windows``, one row per (symbol, window)). The Portal serves Alpaca
+        quotes only inside these windows, so they -- not the quotes parquet -- define the quote sessions."""
+        if self._qwin is None:
+            tab: dict = {}
+            try:
+                st = self.portal.store
+                w = st.read("reference", "alpaca", "quote_windows") if st.exists("reference", "alpaca",
+                                                                                "quote_windows") else None
+            except Exception:
+                w = None
+            if w is not None and len(w) and {"symbol", "w0"} <= set(w.columns):
+                if "n" in w.columns:
+                    w = w[pd.to_numeric(w["n"], errors="coerce").fillna(0) > 0]
+                t = pd.DatetimeIndex(pd.to_datetime(w["w0"], utc=True)).tz_convert(ET)
+                days = pd.Series(t.strftime("%Y-%m-%d"), index=w.index)
+                for s_, g in days.groupby(w["symbol"].astype(str).str.upper()):
+                    tab[s_] = set(g)
+            self._qwin = tab
+        return self._qwin
+
     def quote_range(self, sym: str) -> Optional[list]:
+        """Sorted ISO sessions on which the Portal serves quotes for ``sym``: Alpaca from the recorded
+        quote windows, the other sources from their stored quotes."""
         def f():
             store = self.portal.store
-            days = set()
-            for src in ("alpaca", "databento", "iex", "dukascopy"):
+            days = set(self._alpaca_quote_days().get(str(sym).upper(), ()))
+            for src in ("databento", "iex", "dukascopy"):
                 try:
                     if store.exists("quotes", src, sym):
                         q = store.read("quotes", src, sym)
                         idx = pd.DatetimeIndex(q.index if not isinstance(q.index, pd.RangeIndex) else q["ts"])
                         if idx.tz is None:
                             idx = idx.tz_localize("UTC")
-                        days |= {str(d.date()) for d in idx.tz_convert("America/New_York").normalize().unique()}
+                        days |= {str(d.date()) for d in idx.tz_convert(ET).normalize().unique()}
                 except Exception:
                     continue
             return sorted(days) if days else None
 
         return self._memo(f"quotes|{sym}", f)
+
+    def bar_spans(self, sym: str, freq: str) -> list:
+        """Maximal runs of consecutive NYSE sessions with ``freq`` bars, as [[first, last], ...] (ISO).
+        Alpaca intraday bars exist only around a stock's fetched sessions (top-60 sessions -30/+5), so
+        "has a bar in [a, b]" -- the engine's windowed has() -- is "a span intersects [a, b]". Daily
+        series are contiguous: one span = bar_range."""
+        freq = _norm_freq(freq, "1d")
+        if freq == "1d":
+            br = self.bar_range(sym, "1d")
+            return [br] if br else []
+
+        def f():
+            p = self.portal
+            now = _today_utc()
+            try:
+                df = p.bars(sym, freq, INTRADAY_HISTORY_START, now, as_of=now, adjusted=False)
+            except Exception:
+                df = None
+            finally:
+                ev = getattr(p, "_evict_intraday", None)
+                if callable(ev):
+                    try:
+                        ev(sym)
+                    except Exception:
+                        pass
+            if df is None or not len(df):
+                return []
+            idx = pd.DatetimeIndex(df.index)
+            idx = idx.tz_localize("UTC") if idx.tz is None else idx
+            days = idx.tz_convert(ET).tz_localize(None).normalize().unique().sort_values()
+            sess = self.cal.sessions(days[0], days[-1])
+            pos = sess.get_indexer(days)
+            pos = pos[pos >= 0]
+            if not len(pos):
+                return []
+            br = np.flatnonzero(np.diff(pos) > 1)
+            a, b = np.r_[0, br + 1], np.r_[br, len(pos) - 1]
+            return [[str(sess[pos[i]].date()), str(sess[pos[j]].date())] for i, j in zip(a, b)]
+
+        return self._memo(f"spans|{sym}|{freq}", f)
+
+    def _pit_sessions(self):
+        end = _today_utc().tz_localize(None).normalize()
+        sess = self.cal.sessions(INTRADAY_HISTORY_START.tz_localize(None), end)
+        idx = list(range(0, len(sess), PIT_STEP_SESSIONS))
+        if idx and idx[-1] != len(sess) - 1:
+            idx.append(len(sess) - 1)
+        return sess, idx
+
+    def pit_members(self, name: str) -> list:
+        """Union of a PIT universe's members over the sampled intraday-era sessions."""
+        def f():
+            sess, idx = self._pit_sessions()
+            out: set = set()
+            for i in idx:
+                out |= set(self.universe_at(name, sess[i]))
+            return sorted(out)
+
+        return self._memo(f"pit|members|{name}|{PIT_STEP_SESSIONS}", f)
+
+    def pit_window(self, name: str, freqs: tuple, kinds: tuple = (), probe_freqs: tuple = (),
+                   probe_quotes: bool = False) -> dict:
+        """Intraday window of a PIT universe by the engine's coverage rule, applied per session to THAT
+        session's members (like sp500_full_coverage_start for daily): a member counts at session d when
+        it has bars of every ``freqs`` frequency ON d and the portal has every non-bars ``kinds``
+        requirement (the engine's member verification). Coverage is sampled every PIT_STEP_SESSIONS
+        sessions; the longest run of samples with coverage >= min_coverage (ties: the latest) is the
+        window, its edges refined by bisection. Coverage of bars ON d is a lower bound of the engine's
+        (bars anywhere in the run window), so the engine accepts every sampled session of the window.
+        With PRE/POST requirements (``probe_freqs`` bars, ``probe_quotes``) the start also satisfies the
+        engine's probe: every member the engine keeps at the first session has those bars / quotes within
+        the first PROBE_SESSIONS sessions. Returns {start, end, why, cov_min} or {reason}."""
+        th = self.min_coverage
+        kinds_s = ";".join(f"{k}:{q or ''}" for k, q in kinds)
+        key = (f"pit|window|{name}|{','.join(freqs)}|{kinds_s}|probe={','.join(probe_freqs)}"
+               f"{'+quotes' if probe_quotes else ''}|{th:.3f}|{PIT_STEP_SESSIONS}")
+
+        def f():
+            sess, idx = self._pit_sessions()
+            if not idx:
+                return {"reason": f"{name}: no sessions in the intraday era"}
+            iso = [str(d.date()) for d in sess]
+            has_memo: dict = {}
+
+            def kinds_ok(m) -> bool:
+                for k, q in kinds:
+                    if (m, k, q) not in has_memo:
+                        try:
+                            has_memo[(m, k, q)] = bool(self.portal.has(m, k, q))
+                        except Exception:
+                            has_memo[(m, k, q)] = False
+                    if not has_memo[(m, k, q)]:
+                        return False
+                return True
+
+            stat_memo: dict = {}
+
+            def stat(i):
+                if i not in stat_memo:
+                    mem = self.universe_at(name, sess[i])
+                    miss = [m for m in mem if not (all(_in_spans(self.bar_spans(m, q), iso[i], iso[i]) for q in freqs)
+                                                   and kinds_ok(m))]
+                    stat_memo[i] = (len(mem), miss)
+                return stat_memo[i]
+
+            def cov(i):
+                n, miss = stat(i)
+                return (n - len(miss)) / n if n else float("nan")
+
+            def good(i):
+                return stat(i)[0] > 0 and cov(i) >= th
+
+            flags = [good(i) for i in idx]
+            best, j = None, 0
+            while j < len(idx):
+                if not flags[j]:
+                    j += 1
+                    continue
+                k = j
+                while k + 1 < len(idx) and flags[k + 1]:
+                    k += 1
+                if best is None or k - j >= best[1] - best[0]:
+                    best = (j, k)
+                j = k + 1
+            if best is None:
+                vals = [(cov(i), i) for i in idx if stat(i)[0]]
+                if not vals:
+                    return {"reason": f"{name} has no members in the intraday era"}
+                c, i = max(vals)
+                n, miss = stat(i)
+                return {"reason": (f"{name}: per-session {'+'.join(freqs)} coverage never reaches "
+                                   f"{th:.0%} (best {c:.0%} on {iso[i]}: {len(miss)}/{n} members without bars that "
+                                   f"session, e.g. {', '.join(miss[:4])}); the engine refuses below "
+                                   f"min_universe_coverage")}
+            j, k = best
+            i0 = _bisect_first(idx[j - 1], idx[j], good) if j > 0 else idx[j]
+            i1 = _bisect_last(idx[k], idx[k + 1], good) if k + 1 < len(idx) else idx[k]
+            why = f"{name} per-session {'+'.join(freqs)} coverage >= {th:.0%}"
+            if probe_freqs or probe_quotes:
+                def probe_ok(i) -> bool:
+                    d0, d1 = iso[i], iso[i1]
+                    pe = iso[min(i + PROBE_SESSIONS - 1, len(iso) - 1)]
+                    for m in self.universe_at(name, sess[i]):
+                        if not (all(_in_spans(self.bar_spans(m, q), d0, d1) for q in freqs) and kinds_ok(m)):
+                            continue                  # not kept by the engine: never probed
+                        if any(not _in_spans(self.bar_spans(m, q), d0, pe) for q in probe_freqs):
+                            return False
+                        if probe_quotes and not any(d0 <= d <= pe for d in (self.quote_range(m) or ())):
+                            return False
+                    return True
+
+                if not probe_ok(i0):
+                    prev, hit = i0, None
+                    for i in [x for x in idx if i0 < x < i1] + [i1]:
+                        if probe_ok(i):
+                            hit = i
+                            break
+                        prev = i
+                    if hit is None:
+                        return {"reason": (f"{name}: members kept at the first session lack PRE/POST data in "
+                                           f"the first {PROBE_SESSIONS} sessions of every candidate start "
+                                           f"(engine probe)")}
+                    i0 = _bisect_first(prev, hit, probe_ok)
+                    why += f" + engine PRE/POST probe of kept members ({PROBE_SESSIONS} sessions)"
+            run = sorted({i0, i1, *[i for i in idx if i0 <= i <= i1]})
+
+            def engine_cov(i):
+                # the engine keeps a member with bars anywhere in the run window; below 100 % it flags the
+                # run T2_PROXY ("universe coverage ... members without verified data excluded")
+                mem = self.universe_at(name, sess[i])
+                kept = [m for m in mem if all(_in_spans(self.bar_spans(m, q), iso[i0], iso[i1]) for q in freqs)
+                        and kinds_ok(m)]
+                return len(kept) / len(mem) if mem else 1.0
+
+            return {"start": iso[i0], "end": iso[i1], "why": why,
+                    "cov_min": float(np.nanmin([cov(i) for i in run])),
+                    "engine_cov_min": float(min(engine_cov(i) for i in run))}
+
+        return self._memo(key, f)
 
     def event_first(self, kind: str) -> Optional[str]:
         def f():
@@ -396,6 +702,24 @@ def _plan_instance(sid: str, inst, freq: str, pc: PlanContext, row: dict) -> dic
         if not syms0:
             row["reason"] = why0
             return row
+    # PIT universe under an intraday strategy (SP500_TOP50_DV, S&P 500 5m): the engine verifies the members
+    # of EVERY session it queries the universe (base-frequency bars in the run window + every critical
+    # requirement without symbols) against min_universe_coverage, and Alpaca bars exist only around each
+    # stock's own member sessions -> the window comes from per-session coverage (PlanContext.pit_window),
+    # computed once for all bars requirements without explicit symbols
+    pit_intraday = intraday and _is_pit_universe(uname)
+    pit_done = False
+    if pit_intraday:
+        nosym = [r for r in reqs if r.critical and not r.symbols]       # the engine's member checks
+
+        def ext(r) -> bool:                    # PRE/POST data the engine probes over the first sessions
+            return bool(set(getattr(r, "sessions", ()) or ()) & {"PRE", "POST"})
+
+        pit_freqs = tuple(dict.fromkeys([_norm_freq(freq, freq)] + [_norm_freq(r.freq, freq) for r in nosym
+                                                                     if r.kind == "bars"]))
+        pit_kinds = tuple(dict.fromkeys((r.kind, r.freq) for r in nosym if r.kind != "bars"))
+        pit_probe = tuple(dict.fromkeys(_norm_freq(r.freq, freq) for r in nosym if r.kind == "bars" and ext(r)))
+        pit_probe_q = any(r.kind == "quotes" and ext(r) for r in nosym)
     for r in reqs:
         if not r.critical:
             # non-critical inputs never block a run, but when available they TIER it exactly like the
@@ -487,18 +811,71 @@ def _plan_instance(sid: str, inst, freq: str, pc: PlanContext, row: dict) -> dic
                         starts.append((pd.Timestamp(f0), f"real option chains {s}", False))
             continue
         if kind == "quotes":
-            days_all = None
-            for s in syms:
-                q = pc.quote_range(s)
-                if not q:
-                    row["reason"] = f"required quotes for {s} unavailable"
-                    return row
-                days_all = set(q) if days_all is None else days_all & set(q)
-            n = len(days_all or [])
             need = MIN_SESSIONS_INTRADAY if intraday else MIN_SESSIONS_DAILY
-            row["reason"] = (f"required quotes exist on only {n} common session(s) "
-                             f"({', '.join(sorted(days_all or [])[:4])}); minimum window {need} sessions")
-            return row
+            if not explicit and _is_pit_universe(uname):
+                # PIT universe: a stock needs quotes only on the sessions it is a member (Alpaca pre-open
+                # windows are recorded exactly for the day's top-N) -> UNION of the members' quote sessions
+                pool = pc.pit_members(uname) or syms
+                days_all, used = set(), []
+                for s in pool:
+                    q = pc.quote_range(s)
+                    if q:
+                        days_all |= set(q)
+                        used.append(s)
+                if not days_all:
+                    row["reason"] = f"required quotes for the {uname} members unavailable"
+                    return row
+                what = f"quote sessions (union of {len(used)} {uname} members)"
+            else:
+                days_all, used = None, list(syms)
+                for s in syms:
+                    q = pc.quote_range(s)
+                    if not q:
+                        row["reason"] = f"required quotes for {s} unavailable"
+                        return row
+                    days_all = set(q) if days_all is None else days_all & set(q)
+                days_all = days_all or set()
+                what = "quote sessions common to " + ",".join(used[:4]) + ("..." if len(used) > 4 else "")
+            n = len(days_all)
+            if n < need:
+                row["reason"] = (f"required quotes exist on only {n} common session(s) "
+                                 f"({', '.join(sorted(days_all)[:4])}); minimum window {need} sessions")
+                return row
+            days = sorted(days_all)
+            starts.append((pd.Timestamp(days[0]), f"first of {n} {what}", False))
+            ends.append(pd.Timestamp(days[-1]))
+            for s in used[:50]:
+                try:
+                    fq = Fidelity(int(p.fidelity_of(s, "quotes", rfreq)))
+                except Exception:
+                    continue
+                if fq != Fidelity.NA:
+                    worst = max(worst, fq)
+            continue
+        if kind == "bars" and pit_intraday and not explicit:
+            f = _norm_freq(rfreq, freq)
+            if not pit_done:
+                pit_done = True
+                w = pc.pit_window(uname, pit_freqs, pit_kinds, pit_probe, pit_probe_q)
+                if "reason" in w:
+                    row["reason"] = w["reason"]
+                    return row
+                starts.append((pd.Timestamp(w["start"]), w["why"], False))
+                ends.append(pd.Timestamp(w["end"]))
+                if w.get("engine_cov_min", 1.0) < 1.0:
+                    # the engine flags a run whose universe coverage drops below 100 % as T2_PROXY
+                    worst = max(worst, Fidelity.T2_PROXY)
+                    notes.append(f"{uname} coverage {w['engine_cov_min']:.1%} at worst (members without "
+                                 f"{'+'.join(pit_freqs)} bars in the window are dropped and the engine flags "
+                                 f"the run T2_PROXY)")
+            for s in syms:      # tier from the members' sources (the engine drops a worse-than-minimum member)
+                try:
+                    fid = Fidelity(int(p.fidelity_of(s, "bars", f))) if p.has(s, "bars", f) else Fidelity.NA
+                except Exception:
+                    fid = Fidelity.NA
+                if fid != Fidelity.NA and fid <= r.min_fidelity:
+                    worst = max(worst, fid)
+            continue
         if kind == "bars":
             f = rfreq or freq
             f = "1d" if f in ("1mo", "1w", "event") else f
@@ -680,11 +1057,10 @@ def _runtime_coverage(pc: "PlanContext", name: str, freq: str, d0: pd.Timestamp,
             return f"run-time universe {name} unavailable ({type(e).__name__}: {e})"
         if not members:
             continue
-        missing = []
-        for s_ in members:
-            br = pc.bar_range(s_, f)
-            if br is None or pd.Timestamp(br[1]) < d0 or pd.Timestamp(br[0]) > d1:
-                missing.append(s_)
+        a, b = str(pd.Timestamp(d0).date()), str(pd.Timestamp(d1).date())
+        # the engine's windowed has(): a bar anywhere in [d0, d1] (intraday spans: gaps between a stock's
+        # fetched periods count as missing)
+        missing = [s_ for s_ in members if not _in_spans(pc.bar_spans(s_, f), a, b)]
         cov = 1 - len(missing) / len(members)
         if cov < th:
             from .common import display_symbol
