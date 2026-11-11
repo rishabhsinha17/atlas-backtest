@@ -1874,12 +1874,14 @@ class Portal:
 
     def _opra_target(self, u: str) -> tuple[Optional[str], Optional[str]]:
         """Requested underlying -> (OPRA store underlying if it has files, OSI root filter):
-        'SPXW' -> ('SPX', 'SPXW'), 'SPX' -> ('SPX', None); (None, None) when nothing is stored."""
+        'SPXW' -> ('SPX', 'SPXW'), 'SPX' -> ('SPX', None); (None, None) when nothing is stored. A root
+        filter counts only when the files hold rows of that root: SPX files with SPX AM monthlies only do
+        not make 'SPXW' T0 (option_chain('SPXW') would serve the synthetic fallback)."""
         from .providers.databento import store_underlying
         if not u:
             return None, None
         su, rf = store_underlying(str(u).upper())
-        return (su, rf) if self._opra().has(su) else (None, None)
+        return (su, rf) if self._opra().has(su, rf) else (None, None)
 
     def opra_coverage(self, underlying: str = "*", detail: bool = False) -> dict:
         """Coverage of the stored OPRA quotes (T0) of this Portal's store: see databento.coverage."""

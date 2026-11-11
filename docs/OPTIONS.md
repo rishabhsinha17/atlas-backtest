@@ -415,7 +415,21 @@ trading day: an SPX AM monthly listed by OPRA under Friday 2024-01-19 is `SPX   
 2024-01-19 open (SOQ). `Portal.instrument(symbol)` rebuilds the same settlement from the root, so
 `lifecycle.settlement_due` settles AM at the next session and PM at the expiry close.
 `option_chain('SPX')` returns both roots; `option_chain('SPXW')`, `has('SPXW', 'options', '1m')` and
-`fidelity_of` serve only the SPXW rows of the SPX files.
+`fidelity_of` serve only the SPXW rows of the SPX files. SPX files that hold no SPXW row (SPX AM
+monthlies only) do not make `SPXW` T0: `has('SPXW', 'options', '1m')` is then False, like
+`coverage('SPXW')`.
+
+**0DTE strike band (no lookahead).** The `spx0dte` plan stores, for each session, the SPXW contracts
+expiring that session with a strike in `prev_close x (1 -+ m)`, `m = max(5 %, 5 x (VIX_prev / 100) / sqrt(252))`
+(`databento.spx0dte_band`). `prev_close` is the previous session's SPX close and `VIX_prev` the previous
+session's VIX close, both known before the open. The strike set is part of what `option_chain` serves from
+09:31, so it may not depend on the session itself. The earlier band, `[low x (1 - m), high x (1 + m)]` of
+the same session, told a strategy at the open how far the market would move that day. The width was
+measured on the cache: over 908 sessions (2023-03-28 .. 2026-11-05), the largest move from the previous
+close to the day's high or low was 4.25 daily VIX sigmas (2026-11-05, -4.4 %), and the largest in percent was
++10.5 % (2025-04-09, VIX_prev 52, m = 16.5 %). No session's range leaves the band. A decision strike beyond the
+band on an extreme day is missing from the stored chain. That is a data gap fixed before the open, not a leak.
+Rows fetched with the earlier band must be refetched before they are used.
 
 **Coverage (for the planner; no network, no key).**
 
@@ -431,7 +445,9 @@ Portal.opra_coverage(underlying="*", detail=False)    # same, rooted at the Port
 ```
 
 `n_chain_ts` counts the instants that `option_chain` can serve as a chain. The other instants are valuation
-marks (`chain=False`) that `option_quote(s)` serves. A planner can call a strategy T0 for a window when
+marks (`chain=False`) that `option_quote(s)` serves. The planner bounds the window of a T0 (or intraday)
+options requirement on an explicit underlying by `opra_coverage(u)` first..last, and labels such an OPT
+strategy's chains T0 instead of synthetic (RUNNING.md §2). A planner can call a strategy T0 for a window when
 `coverage(u)['by_underlying']` lists its sessions and `coverage_minutes` holds an instant <= each decision time
 (chain_only for chain-based selection). The fetch plans are listed in DATA.md §4.15c. The fetch is
 `fetch --only databento_options`: budget-guarded, resumable, and every request is priced with

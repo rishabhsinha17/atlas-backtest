@@ -152,11 +152,13 @@ def test_rt_spx0dte_strike_set_depends_on_the_days_realized_high_low(cache):
     d = pd.Timestamp("2024-01-10")
     lst = D.parse_osi([f"SPXW  240110{r_}0{K}000" for K in range(4400, 5105, 5) for r_ in "CP"])
 
-    def ref(hi):
-        return pd.DataFrame({"ratio": 10.0, "hi": hi, "lo": 4700.0, "close": 4750.0, "vix_prev": 13.0},
-                            index=pd.DatetimeIndex([d]))
+    def ref(hi, lo=4700.0, close=4750.0):
+        # (verifier) prev_close: the reference now carries the previous session's close explicitly (the
+        # only pre-open level the band may use); every same-day field (hi, lo, close) is future information
+        return pd.DataFrame({"ratio": 10.0, "hi": hi, "lo": lo, "close": close, "prev_close": 4750.0,
+                             "vix_prev": 13.0}, index=pd.DatetimeIndex([d]))
 
-    calm, rally = (D.plan_spx_0dte(d, d, ref(h)) for h in (4760.0, 4860.0))
+    calm, rally = D.plan_spx_0dte(d, d, ref(4760.0)), D.plan_spx_0dte(d, d, ref(4860.0, 4650.0, 4850.0))
     assert len(calm) == len(rally) == 1
     k_calm = set(D.parse_osi(calm[0].select(lst))["strike"])
     k_rally = set(D.parse_osi(rally[0].select(lst))["strike"])
@@ -190,10 +192,15 @@ def test_rt_get_range_retry_after_transport_error_is_not_ledgered(cache, monkeyp
     monkeypatch.setattr(D.requests, "post", fake_post)
     monkeypatch.setattr(D.time, "sleep", lambda s: None)
     monkeypatch.setenv("DATABENTO_BUDGET_USD", "1.0")
-    D.get_range_csv(D.OPRA, "cbbo-1m", ["SPXW  240102C04700000"], utc("2024-01-02 14:30"), utc("2024-01-02 14:32"))
+    # (verifier) policy: billable calls are never retried; the failed transport aborts the request
+    with pytest.raises(D.TransportFailed):
+        D.get_range_csv(D.OPRA, "cbbo-1m", ["SPXW  240102C04700000"], utc("2024-01-02 14:30"),
+                        utc("2024-01-02 14:32"))
     lg = D.read_ledger()
     n_req = int((lg["status"] == "requested").sum())
     assert len(sent) == n_req, f"{len(sent)} get_range downloads sent, {n_req} priced in the ledger"
+    assert lg["status"].str.startswith("failed").sum() == 1          # the failure is on record
+    assert D.spent_usd() == pytest.approx(0.5)                       # and still counted as spent
 
 
 def test_rt_budget_check_and_ledger_append_are_not_atomic(cache, monkeypatch):
@@ -233,3 +240,14 @@ def test_rt_budget_check_and_ledger_append_are_not_atomic(cache, monkeypatch):
     [t.join() for t in th]
     spent = orig()
     assert spent <= D.budget_usd() + 1e-9, f"spent ${spent:.2f} > cap ${D.budget_usd():.2f} ({len(errs)} refused)"
+
+
+def test_planner_eod_options_accepting_t3_are_not_cut_to_opra(cache):
+    """(verifier) counterpart of the OPRA bound: an EOD options requirement that accepts T3 is served by the
+    synthetic fallback outside the OPRA sessions, so the window is not cut, and the run is tiered T3."""
+    _spxw_0dte_month(cache / "store")
+    port = _OPortal(cache, spans={"SPY": ALL})
+    reqs = [Requirement("bars", "1m", symbols=("SPY",)), Requirement("options", None, symbols=("SPX",))]
+    r = _plan_instance("T", _IInst(reqs, universe=["SPY"]), "1m", PlanContext(port, cache / "res"), _row())
+    assert r["testable"] == "Y", r["reason"]
+    assert r["start"] < "2024-01-02" and r["expected_fidelity"] == "T3_MODELED", r

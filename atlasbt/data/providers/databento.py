@@ -10,6 +10,13 @@ Budget discipline (new accounts run on free credits):
   ``DATABENTO_BUDGET_USD`` (default $71.58, see ``budget_usd``) is refused (``BudgetExceeded``).
 * Raw responses are cached (gzip CSV under ``<cache>/raw/hist.databento.com/``) keyed by the
   request, so a re-run never pays twice.
+* Billable calls (``timeseries.get_range``) are NEVER retried automatically: a retry after a transport
+  error may be a second billed download that the single ledger row does not price. A failed transport
+  raises ``TransportFailed``; the ledger keeps the 'requested' row (counted, conservative) plus a
+  'failed:...' row, and ``run_jobs`` stops. Only the free endpoints (get_cost, symbology) back off.
+* The read of the spend, the cap check and the 'requested' append run under an OS file lock
+  (``fcntl.flock`` on ``databento_ledger.csv.lock``), so concurrent fetch processes cannot both pass the
+  cap on the same remaining budget.
 
 Endpoints (https://hist.databento.com/v0/, POST form):
   metadata.get_cost       dataset, symbols, schema, start, end, stype_in -> USD (float)
@@ -31,7 +38,9 @@ snapshots (``portal.OPTION_SOURCE_FIDELITY['databento']``), ``known_at = ts``.
 """
 from __future__ import annotations
 
+import contextlib
 import csv
+import fcntl
 import gzip
 import hashlib
 import io
@@ -71,6 +80,15 @@ class NeedsUser(RuntimeError):
     """The account requires something from the user (payment details, credits exhausted, auth)."""
 
 
+class TransportFailed(RuntimeError):
+    """A billable request failed in transport (network error, 429, 5xx). Not retried: the download may
+    have been billed. The ledger keeps it as spent."""
+
+
+#: endpoints that bill per request: never retried automatically
+BILLABLE_ENDPOINTS = frozenset({"timeseries.get_range"})
+
+
 def available() -> bool:
     return env("DATABENTO_API_KEY") is not None
 
@@ -95,22 +113,30 @@ def raw_dir() -> Path:
 
 # ============================================================================ HTTP
 def _post(endpoint: str, data: dict, timeout: int = 600) -> requests.Response:
+    """POST one endpoint. Free endpoints back off and retry (5 attempts) on network errors / 429 / 5xx;
+    billable endpoints (BILLABLE_ENDPOINTS) make exactly ONE attempt and raise TransportFailed."""
     if os.environ.get("ATLASBT_OFFLINE") == "1":
         raise RuntimeError("ATLASBT_OFFLINE=1: Databento requests disabled")
     key = env("DATABENTO_API_KEY")
     if key is None:
         raise RuntimeError("DATABENTO_API_KEY not set")
+    billable = endpoint in BILLABLE_ENDPOINTS
     last = None
-    for attempt in range(5):
+    for attempt in range(1 if billable else 5):
         try:
             r = requests.post(BASE + endpoint, data=data, auth=(key["DATABENTO_API_KEY"], ""), timeout=timeout,
                               headers={"User-Agent": config.USER_AGENT})
-        except requests.RequestException as e:          # network: back off and retry
+        except requests.RequestException as e:          # network: back off and retry (free endpoints)
             last = e
+            if billable:
+                raise TransportFailed(f"Databento {endpoint}: {type(e).__name__}: {e} (not retried: "
+                                      f"the request may have been billed)") from e
             time.sleep(2 ** attempt)
             continue
         if r.status_code in (429,) or r.status_code >= 500:
             last = RuntimeError(f"HTTP {r.status_code}")
+            if billable:
+                raise TransportFailed(f"Databento {endpoint}: HTTP {r.status_code} (not retried)")
             time.sleep(float(r.headers.get("Retry-After", 2 ** attempt)))
             continue
         if r.status_code in (401, 402, 403):
@@ -156,15 +182,37 @@ def spent_usd(ledger: Optional[pd.DataFrame] = None) -> float:
     return float(pd.to_numeric(lg.loc[lg["status"] == "requested", "cost_usd"], errors="coerce").fillna(0).sum())
 
 
-def _ledger_append(row: dict) -> None:
+@contextlib.contextmanager
+def _ledger_lock():
+    """Exclusive OS lock (fcntl.flock) of the ledger across processes and threads: each holder opens its own
+    descriptor of ``<ledger>.lock``, and flock locks of distinct open descriptions exclude each other."""
     p = ledger_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    new = not p.exists()
+    with open(p.with_name(p.name + ".lock"), "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _ledger_write(row: dict) -> None:
+    """Append one row; the caller holds _ledger_lock."""
+    p = ledger_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    new = not p.exists() or p.stat().st_size == 0
     with open(p, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=LEDGER_COLS)
         if new:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in LEDGER_COLS})
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _ledger_append(row: dict) -> None:
+    with _ledger_lock():
+        _ledger_write(row)
 
 
 def _request_key(p: dict) -> str:
@@ -195,20 +243,26 @@ def get_range_csv(dataset: str, schema: str, symbols, start, end, stype_in: str 
             return fh.read()
     n, ssum = _sym_summary(symbols)
     cost = get_cost(dataset, schema, symbols, start, end, stype_in)
-    spent = spent_usd()
     base = {"timestamp": pd.Timestamp.now(tz="UTC").isoformat(), "dataset": dataset, "schema": schema,
             "stype_in": stype_in, "n_symbols": n, "symbols": ssum, "start": p["start"], "end": p["end"],
             "cost_usd": round(cost, 6), "tag": tag, "request_key": key}
-    if spent + cost > budget_usd() or (max_cost_usd is not None and cost > max_cost_usd):
-        _ledger_append({**base, "status": "refused"})
-        raise BudgetExceeded(f"cost ${cost:.4f} (spent ${spent:.2f}, budget ${budget_usd():.2f}, "
-                             f"per-request cap {max_cost_usd})")
-    _ledger_append({**base, "status": "requested"})
+    # read spend -> check the cap -> append 'requested' is one critical section across processes: two
+    # fetches must not both pass the cap on the same remaining budget
+    with _ledger_lock():
+        spent = spent_usd()
+        if spent + cost > budget_usd() or (max_cost_usd is not None and cost > max_cost_usd):
+            _ledger_write({**base, "status": "refused"})
+            raise BudgetExceeded(f"cost ${cost:.4f} (spent ${spent:.2f}, budget ${budget_usd():.2f}, "
+                                 f"per-request cap {max_cost_usd})")
+        _ledger_write({**base, "status": "requested"})
     _LAST_COST[0] = cost
     try:
-        r = _post("timeseries.get_range", p)
+        r = _post("timeseries.get_range", p)          # one attempt: never retried (may be billed)
     except Exception as e:
-        _ledger_append({**base, "cost_usd": 0.0, "status": f"failed:{type(e).__name__}"})
+        # the 'requested' row stays and keeps counting in spent_usd (conservative: the server may have
+        # billed it); this row records the failure with the same cost for the audit trail and is NOT
+        # summed again (spent_usd counts 'requested' rows only)
+        _ledger_append({**base, "status": f"failed:{type(e).__name__}"})
         raise
     body = r.content
     if len(body) <= RAW_CACHE_MAX_BYTES:
@@ -471,9 +525,30 @@ class OpraReader:
         self.max_days = max_days
         self._days: dict = {}
         self._frames: dict = {}
+        self._roots: dict = {}
 
-    def has(self, und: str) -> bool:
-        return len(self.days(und)) > 0
+    def has(self, und: str, root: Optional[str] = None) -> bool:
+        """Files exist for ``und``; with ``root`` (e.g. 'SPXW' inside the SPX files): some file holds a row
+        of that OSI root (the first hit ends the scan; memoized)."""
+        if root is None:
+            return len(self.days(und)) > 0
+        return self.has_root(und, root)
+
+    def has_root(self, und: str, root: str) -> bool:
+        key = (str(und).upper(), str(root).upper())
+        memo = self._roots
+        if key not in memo:
+            hit = False
+            for d in self.days(key[0]):
+                try:
+                    f = pd.read_parquet(day_path(key[0], d, self.root), columns=["symbol"])
+                except Exception:
+                    continue
+                if (f["symbol"].astype(str).str[:6].str.strip() == key[1]).any():
+                    hit = True
+                    break
+            memo[key] = hit
+        return memo[key]
 
     def days(self, und: str) -> list:
         key = str(und).upper()
@@ -793,6 +868,12 @@ def run_jobs(jobs: Iterable[Job], dry_run: bool = False, log=print, max_cost_per
             tot["stopped"] = f"budget: {e}"
             log(f"[databento] STOP {job.key}: {e}")
             break
+        except TransportFailed as e:
+            # a billable download failed in transport: stop (no automatic re-request; the job is not
+            # marked done, so a later run resumes it and pays -- and ledgers -- it again)
+            tot["stopped"] = f"transport: {e}"
+            log(f"[databento] STOP {job.key}: {e}")
+            break
         except NeedsUser as e:
             tot["stopped"] = f"NEEDS USER: {e}"
             log(f"[databento] STOP {job.key}: {e}")
@@ -876,8 +957,11 @@ def _daily_close_table(portal, symbol: str, start, end) -> pd.Series:
 
 
 def spx_reference(portal, start, end) -> pd.DataFrame:
-    """Per session: SPX-scaled day high/low and previous VIX close, for 0DTE strike bands (fetch
-    selection only). SPX level = SPY raw high/low x (SPX close / SPY close) of the previous session."""
+    """Per session (fetch selection only): ``prev_close`` = SPX close of the PREVIOUS session (SPX daily
+    close, else SPY close x the SPX/SPY ratio) and ``vix_prev`` = VIX close of the previous session -- the
+    only inputs of the 0DTE strike band, both known before the open. Also the same-day SPX-scaled
+    ``hi`` / ``lo`` / ``close`` (SPY raw x the previous session's SPX/SPY ratio), which no strike band may
+    use (the stored strike set would leak the session's later range)."""
     spy = _daily_close_table(portal, "SPY", start, end)
     spx = _daily_close_table(portal, "SPX", start, end)
     vix = _daily_close_table(portal, "VIX", start, end)
@@ -887,22 +971,39 @@ def spx_reference(portal, start, end) -> pd.DataFrame:
     out["hi"] = spy["high"] * out["ratio"]
     out["lo"] = spy["low"] * out["ratio"]
     out["close"] = spy["close"] * out["ratio"]
+    spx_c = spx["close"].reindex(out.index)
+    out["prev_close"] = spx_c.fillna(out["close"]).shift(1)
     out["vix_prev"] = vix["close"].reindex(out.index).ffill().shift(1).fillna(20.0)
     return out
+
+
+#: 0DTE strike band half-width around the previous SPX close: m = max(SPX0DTE_FLOOR, SPX0DTE_SIGMAS x
+#: VIX_prev / sqrt(252)). Measured on the cache (908 sessions 2023-03-28..2026-11-05): the largest move
+#: from the previous close to the day's high or low is 4.25 daily VIX sigmas (2026-11-05, -4.4 %); the
+#: largest in % is +10.5 % (2025-04-09, VIX_prev 52 -> m 16.5 %); no session leaves the band.
+SPX0DTE_FLOOR = 0.05
+SPX0DTE_SIGMAS = 5.0
+
+
+def spx0dte_band(prev_close: float, vix_prev: float) -> tuple[float, float]:
+    """[lo, hi] strike band of the spx0dte plan from information known before the open only."""
+    m = max(SPX0DTE_FLOOR, SPX0DTE_SIGMAS * float(vix_prev) / 100.0 / np.sqrt(252))
+    return float(prev_close) * (1 - m), float(prev_close) * (1 + m)
 
 
 # ============================================================================ plans
 def plan_spx_0dte(start, end, ref: pd.DataFrame) -> list:
     """S161-S164: every SPXW contract expiring THAT session (0DTE, PM-settled) with a strike inside
-    [low x (1-m), high x (1+m)], m = max(3%, 3.5 x VIX_prev/sqrt(252)) (covers 5-delta wings at the
-    09:45-11:00 decisions), sampled every minute from the open to the close (cbbo-1m)."""
+    prev_close x (1 -+ m), m = max(5%, 5 x VIX_prev/sqrt(252)) (spx0dte_band), sampled every minute from
+    the open to the close (cbbo-1m). The band uses only the previous close and the previous VIX close:
+    the stored chain's strike set is served from the first minute, so a band built from the session's
+    own high/low would tell a strategy at 09:31 how far the market moves that day (lookahead)."""
     jobs = []
     for d in sessions(max(pd.Timestamp(start), OPRA_START.tz_localize(None)), end):
-        if d not in ref.index or not np.isfinite(ref.loc[d, "hi"]):
+        if d not in ref.index or not np.isfinite(float(ref.loc[d, "prev_close"])):
             continue
         r = ref.loc[d]
-        m = max(0.03, 3.5 * float(r["vix_prev"]) / 100.0 / np.sqrt(252))
-        lo, hi = float(r["lo"]) * (1 - m), float(r["hi"]) * (1 + m)
+        lo, hi = spx0dte_band(r["prev_close"], r["vix_prev"])
         o, c = open_close(d)
 
         def sel(lst, d=d, lo=lo, hi=hi):

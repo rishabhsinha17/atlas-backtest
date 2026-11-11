@@ -119,9 +119,15 @@ def test_rt_pit_probe_checked_at_pit_start_not_at_final_start(tmp_path):
     port = _EPortal(tmp_path, spans=spans, daily={m: "2010-01-04" for m in mem + ["SPY"]}, members=lambda d: mem)
     reqs = [Requirement("bars", "1m", sessions=("PRE", "RTH")), Requirement("bars", "1m", symbols=("SPY",))]
     r = _plan(port, reqs, tmp_path, universe_name=TOP)
-    assert r["testable"] == "Y" and r["start"] == "2020-01-02", r
+    # (verifier) the start may move past 2020-01-02: no start before M24's bars resume passes the probe
+    assert r["testable"] == "Y" and r["start"] >= "2020-01-02", r
     ok, why, _ = _engine(port, reqs, r["start"], r["end"], universe_name=TOP)
     assert ok, f"planner: testable {r['start']}..{r['end']}; engine refuses: {why}"
+    # and the start is not later than needed: the engine refuses one session earlier
+    if r["start"] > "2020-01-02":
+        prev = str(CAL.sessions(pd.Timestamp("2020-01-02"), pd.Timestamp(r["start"]))[-2].date())
+        ok_prev, why_prev, _ = _engine(port, reqs, prev, r["end"], universe_name=TOP)
+        assert not ok_prev and "PRE" in why_prev, (prev, why_prev)
 
 
 def test_rt_pit_engine_coverage_tier_uses_pit_window_not_final_window(tmp_path):
@@ -173,6 +179,20 @@ def test_rt_pit_pre_quote_probe_accepts_rth_only_quote_sessions(tmp_path):
         _record_windows(port.store, s, _sessions("2024-01-02", "2024-06-28"), window="close_m10")
     reqs = [Requirement("bars", "1m"), Requirement("quotes", None, sessions=("PRE",))]
     r = _plan(port, reqs, tmp_path, universe_name=TOP)
-    assert r["testable"] == "Y", r["reason"]
-    ok, why, _ = _engine(port, reqs, r["start"], r["end"], universe_name=TOP)
-    assert ok, f"planner: testable {r['start']}..{r['end']}; engine refuses: {why}"
+    # (verifier) no PRE quote exists anywhere, so the correct planner answer is NOT_TESTABLE; the original
+    # premise `testable == "Y"` encoded the defect. Contract in both directions:
+    if r["testable"] == "Y":
+        ok, why, _ = _engine(port, reqs, r["start"], r["end"], universe_name=TOP)
+        assert ok, f"planner: testable {r['start']}..{r['end']}; engine refuses: {why}"
+    else:
+        ok, why, _ = _engine(port, reqs, "2024-01-02", "2024-06-28", universe_name=TOP)
+        assert not ok and "PRE" in why, why
+    # positive control: recorded pre-open windows -> the planner says testable and the engine accepts
+    port2 = _EPortal(tmp_path / "pre", spans={s: ALL for s in mem}, daily={s: "2010-01-04" for s in mem},
+                     members=lambda d: mem)
+    for s in mem:
+        _record_windows(port2.store, s, _sessions("2024-01-02", "2024-06-28"), window="pre_0920")
+    r2 = _plan(port2, reqs, tmp_path, universe_name=TOP, tag="pre")
+    assert r2["testable"] == "Y", r2["reason"]
+    ok2, why2, _ = _engine(port2, reqs, r2["start"], r2["end"], universe_name=TOP)
+    assert ok2, f"planner: testable {r2['start']}..{r2['end']}; engine refuses: {why2}"

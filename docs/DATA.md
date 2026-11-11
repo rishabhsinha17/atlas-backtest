@@ -591,7 +591,14 @@ Key `DATABENTO_API_KEY` (environment only, sourced from `~/.atlasbt/secrets.env`
 account runs on free credits, so **every data request is priced first** (`metadata.get_cost`), written to the
 ledger `cache/raw/databento_ledger.csv` (timestamp, dataset, schema, symbols, window, cost, status) and refused
 if the cumulative spend would exceed `DATABENTO_BUDGET_USD` (default **$71.58**: the remaining credit; the
-ledger of the first $18.42 was lost with the old machine, so the cap must be what is left). Listings come from the free
+ledger of the first $18.42 was lost with the old machine, so the cap must be what is left). Reading the
+spend, checking the cap and appending the 'requested' row run under an OS file lock (`fcntl.flock` on
+`databento_ledger.csv.lock`), so concurrent fetch processes cannot both spend the same remaining budget.
+**Billable downloads (`timeseries.get_range`) are never retried automatically**: a retry after a transport
+error could be a second billed download that one ledger row does not price. A network error, 429 or 5xx
+raises `TransportFailed`; the 'requested' row stays counted (conservative), a `failed:...` row records it,
+and `run_jobs` stops without marking the job done (a later run re-requests and re-ledgers it). Only the
+free endpoints (`metadata.get_cost`, `symbology.resolve`) back off and retry. Listings come from the free
 `symbology.resolve` (parent `<ROOT>.OPT` -> every OSI symbol listed that day). Small raw responses are cached
 (`cache/raw/hist.databento.com/`); large ones are not (disk) -- the parquet store plus the progress ledger
 `cache/logs/databento_progress.jsonl` make `python -m atlasbt.data.fetch --only databento_options` resumable
@@ -630,12 +637,14 @@ option_meta, SPX vs SPXW keep their roots/settlement), bid, ask, bid_size, ask_s
   of the two samples (no intra-minute path), volume 0. Check vs the Cboe official close on the pilot week
   (2024-01-29..02-02): -0.10, +0.31, -0.17, -0.37, +0.69 index points (<= 0.014%).
 
-**Plans** (`databento.PLANS`; fetch selection uses data known later, e.g. the day's high/low, only to choose WHAT
-to download -- strategies never see it):
+**Plans** (`databento.PLANS`). Fetch selection must not use information a strategy could not have at the
+decision time: the stored contract set is visible to strategies (it is the strike list `option_chain`
+serves from the first minute), so a strike band built from the session's own high/low would leak how far
+the market moves that day. The 0DTE band therefore uses only the previous close and the previous VIX close.
 
 | plan | strategies | contracts | samples |
 |---|---|---|---|
-| `spx0dte` | S161-S164 | SPXW expiring that session, strike in [low(1-m), high(1+m)], m = max(3%, 3.5 VIX_prev/sqrt(252)) | every minute open..close (chain until close-20m) |
+| `spx0dte` | S161-S164 | SPXW expiring that session, strike in prev_close x (1 -+ m), m = max(5%, 5 (VIX_prev/100)/sqrt(252)) (`spx0dte_band`, OPTIONS.md §12.1) | every minute open..close (chain until close-20m) |
 | `spxeod` | S172 | month-end session + next: SPX & SPXW, DTE 1-60 within +-15%, 61-300 within +-6% (chain); other sessions: the series S172 would pick at each of the last month-ends (DTE 30/90/180) +-75 pts (marks) | 15:59 |
 | `earnings` | S158/S159 | every PIT S&P 500 member with a scheduled BMO/AMC release: expiries [max(next session, E+2d), E+11d], strikes +-25% | entry session E 15:00-15:31, next session 09:30-09:46 |
 | `s160` | S160 | decision session R (first 10:00 after the actual release): 10:00-10:01 puts 0.8-1.05 S / calls 0.95-1.2 S DTE 14-60; 10:00-close the puts (0.7-1.02 S) of the 30-DTE expiry S160 selects (choose_expiry replicated); 15:59 marks of those puts until 6 days before expiry | see left |
