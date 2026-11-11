@@ -282,7 +282,8 @@ QQQ/IWM 0.5-1.2 points cheap). Their quoted spreads are 1.7-2.6x the real NBBO, 
 conservative on cost. The 25-delta skew is close for SPY (93%) and too steep for IWM (154%: VIX-shaped
 skew applied to RVX). The +1.5%/yr richness against the Cboe PUT index (above) is an SPX/AM-monthly,
 2008-2026 result. It does not appear as an SPY premium bias at the 15:59 close in this window (premium
-ratio 0.99). Detail: `cache/store/reference/databento_validation/{detail,summary}.csv`.
+ratio 0.99). Detail: `cache/store/reference/databento_validation/{detail,summary}.csv`. Contract-level bias by
+moneyness / DTE bucket: `surface_bias` (§12.1).
 
 ### 7.5 Fallback quote stream (`marking.synthetic_option_quotes`)
 
@@ -389,6 +390,63 @@ not enough for any backtest; `data_raw/gh_quantconnect_lean_data` has minute quo
 SPX contracts (2021-01-04, 2021-01-14) and SPY options (2023-08-03) — test fixtures only;
 `hf_samples/fabhaus_equities_5m_options` has one month (2024-01) of 5-minute option TRADE bars
 (no quotes). None of these makes an intraday strategy testable over a meaningful period.
+
+### 12.1 Serving the OPRA quotes (T0) and the planner coverage API
+
+**Point in time.** A `cbbo-1m` record covers the minute [T, T+1m) and Databento stamps it `ts_recv` = T+1m,
+the END of the interval ("clamped to the minute boundary"); it holds the book at T+1m. The store keeps that
+stamp as `ts`, and `ts` is the knowledge time: a row is served only to `as_of >= ts`, the same rule as bar
+`known_at` = bar end. `parse_cbbo_csv` refuses a CSV without `ts_recv` (`ts_event` is the last trade, earlier
+than the book the record carries) and moves an off-grid stamp up to the next boundary. Tests:
+`test_cbbo_minute_record_visible_only_at_interval_end`, `test_parse_cbbo_requires_ts_recv_and_ceils_off_grid_stamps`.
+
+**Fallback order** (per contract and instant): real OPRA sample (T0) > DoltHub / hod EOD row (T2; at equal ts
+OPRA wins) > `marking.synthetic_option_quotes`: same-day real surface mark (T2_PROXY) > synthetic (T3).
+`option_quotes` skips the synthetic fallback when the contract already has an OPRA sample stamped <= as_of
+that session. A sample stamped later that session does not count, because knowing it will exist is future
+information. `option_chain(u, as_of)` serves the latest chain-flagged instant <= as_of if it is <= 15 min old
+and newer than the EOD snapshot. OPRA quote rows carry `underlying_price` = close of the last 1m (else 5m) bar
+with known_at <= ts (<= 30 min old; SPX = the `opra_parity` bars), `underlying_price_source`
+`pit_1m_bar_close_at_ts`.
+
+**SPX vs SPXW.** The files `option_quotes/databento/SPX/` hold both roots. Each row keeps `root`, `settlement`
+(`CASH_AM` for SPX monthlies, `CASH_PM` for SPXW), `settlement_date` and `kind`. The internal expiry is the last
+trading day: an SPX AM monthly listed by OPRA under Friday 2024-01-19 is `SPX   240118...` and settles at the
+2024-01-19 open (SOQ). `Portal.instrument(symbol)` rebuilds the same settlement from the root, so
+`lifecycle.settlement_due` settles AM at the next session and PM at the expiry close.
+`option_chain('SPX')` returns both roots; `option_chain('SPXW')`, `has('SPXW', 'options', '1m')` and
+`fidelity_of` serve only the SPXW rows of the SPX files.
+
+**Coverage (for the planner; no network, no key).**
+
+```python
+from atlasbt.data.providers import databento as D
+D.coverage(underlying="*", root=None, detail=False)
+# -> {'first': 'YYYY-MM-DD' | None, 'last': ..., 'n_days': int, 'underlyings': int,
+#     'by_underlying': {'SPX': {'first', 'last', 'n_days', 'days': ['YYYY-MM-DD', ...]}, ...}}
+#    underlying 'SPXW' = SPX files restricted to the SPXW root; file names only unless detail
+#    detail=True adds 'minutes': DataFrame[underlying, day, n_ts, n_chain_ts, first_ts, last_ts, n_symbols, roots]
+D.coverage_minutes(underlying, day, root=None, chain_only=False, symbol=None) -> DatetimeIndex (UTC sample stamps)
+Portal.opra_coverage(underlying="*", detail=False)    # same, rooted at the Portal's store
+```
+
+`n_chain_ts` counts the instants that `option_chain` can serve as a chain. The other instants are valuation
+marks (`chain=False`) that `option_quote(s)` serves. A planner can call a strategy T0 for a window when
+`coverage(u)['by_underlying']` lists its sessions and `coverage_minutes` holds an instant <= each decision time
+(chain_only for chain-based selection). The fetch plans are listed in DATA.md §4.15c. The fetch is
+`fetch --only databento_options`: budget-guarded, resumable, and every request is priced with
+`metadata.get_cost` first. `DATABENTO_BUDGET_USD` is the REMAINING cap (default $71.58: the earlier $18.42 is
+not in the current ledger). Tests: `tests/data/test_databento_opra.py::test_fetch_task_*`.
+
+**Bias measurement.** `options.validate_real.surface_bias(real_quotes, synthetic=None, spot=None, rates=None,
+portal=None, syn_as_of=None, otm_only=True) -> BiasResult(detail, summary, n_skipped)` takes stored rows (any
+`option_quotes/databento` day file or `reference/databento_validation`, via `load_stored_quotes`). It prices each
+two-sided OTM quote on the synthetic surface (`SyntheticChainGenerator.quote_contract`, same spot, r and q; index
+spot = parity of the snapshot). It then reports synthetic minus real mid in $ per share and in vol points (both
+mids inverted with the same solver), with the spreads, by K/S bucket (<0.90, 0.90-0.95, 0.95-0.98, 0.98-1.02,
+1.02-1.05, 1.05-1.10, >1.10) and DTE bucket (0, 1-7, 8-30, 31-60, 61-120, 121+). `bias_from_store()` and
+`python -m atlasbt.options.validate_real --bias` run it on the stored closing samples and write `bias.csv`.
+They have not been run on real data on this machine: the quotes were lost with the old machine.
 
 ### DoltHub `post-no-preference/options`
 

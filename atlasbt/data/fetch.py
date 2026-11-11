@@ -592,7 +592,7 @@ def task_databento_options(symbols=None):
     """Databento OPRA option quotes (key-gated, budget-guarded, resumable; docs/DATA.md §4.15c).
     Env: ATLASBT_DATABENTO_PLANS (default spx0dte,spxeod,earnings,s160), ATLASBT_DATABENTO_START /
     _END (default 2023-03-28 .. yesterday), ATLASBT_DATABENTO_DRY_RUN=1 (price only),
-    DATABENTO_BUDGET_USD (cumulative cap, default 90; ledger cache/raw/databento_ledger.csv)."""
+    DATABENTO_BUDGET_USD (cumulative cap = REMAINING credit, default 71.58; ledger cache/raw/databento_ledger.csv)."""
     from .providers import databento
     plans = [p.strip() for p in os.environ.get("ATLASBT_DATABENTO_PLANS", "spx0dte,spxeod,earnings,s160").split(",")
              if p.strip()]

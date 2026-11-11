@@ -1872,28 +1872,69 @@ class Portal:
             r = self._cache["opra_reader"] = OpraReader(self.store.root)
         return r
 
+    def _opra_target(self, u: str) -> tuple[Optional[str], Optional[str]]:
+        """Requested underlying -> (OPRA store underlying if it has files, OSI root filter):
+        'SPXW' -> ('SPX', 'SPXW'), 'SPX' -> ('SPX', None); (None, None) when nothing is stored."""
+        from .providers.databento import store_underlying
+        if not u:
+            return None, None
+        su, rf = store_underlying(str(u).upper())
+        return (su, rf) if self._opra().has(su) else (None, None)
+
+    def opra_coverage(self, underlying: str = "*", detail: bool = False) -> dict:
+        """Coverage of the stored OPRA quotes (T0) of this Portal's store: see databento.coverage."""
+        from .providers import databento as _db
+        return _db.coverage(underlying, root=self.store.root, detail=detail)
+
     def _opra_spot(self, u: str, ts: pd.Timestamp) -> float:
         """Underlying price known at ts for an OPRA chain: close of the last 1m (else 5m) bar ending <= ts."""
+        v, _src = self._pit_spot_series(u, pd.DatetimeIndex([ts]))
+        return float(v[0])
+
+    OPRA_SPOT_MAX_AGE = pd.Timedelta(minutes=30)
+
+    def _pit_spot_series(self, u: str, ts) -> tuple[np.ndarray, Optional[str]]:
+        """(levels, source label) of ``u`` known at each instant of ``ts``: close of the last 1m (else 5m) RTH
+        bar with known_at (= bar end) <= ts and at most OPRA_SPOT_MAX_AGE old; NaN where none."""
+        ts = pd.DatetimeIndex(ts)
+        out = np.full(len(ts), np.nan)
+        if not len(ts):
+            return out, None
+        u = {"SPXW": "SPX", "NDXP": "NDX", "RUTW": "RUT"}.get(u.upper(), u.upper())
         for f in ("1m", "5m"):
-            if self._bar_source(u, f):
-                try:
-                    b = self.bars(u, f, ts - pd.Timedelta(minutes=30), ts, ts, sessions=("RTH",))
-                except Exception:
-                    b = None
-                if b is not None and len(b) and pd.Timestamp(b["known_at"].iloc[-1]) <= ts:
-                    return float(b["close"].iloc[-1])
-        return float("nan")
+            if not self._bar_source(u, f):
+                continue
+            try:
+                b = self.bars(u, f, ts.min() - self.OPRA_SPOT_MAX_AGE, ts.max(), ts.max(), sessions=("RTH",))
+            except Exception:
+                b = None
+            if b is None or not len(b):
+                continue
+            b = b.sort_values("known_at", kind="mergesort")
+            k = pd.DatetimeIndex(pd.to_datetime(b["known_at"], utc=True))
+            pos = k.searchsorted(ts, side="right") - 1
+            ok = pos >= 0
+            age = np.where(ok, (ts - k[np.clip(pos, 0, None)]).total_seconds(), np.inf)
+            ok &= age <= self.OPRA_SPOT_MAX_AGE.total_seconds()
+            close = b["close"].to_numpy(float)
+            out = np.where(ok, close[np.clip(pos, 0, None)], np.nan)
+            return out, f"pit_{f}_bar_close_at_ts"
+        return out, None
 
     def _opra_chain(self, su, u: str, as_of: pd.Timestamp, other_ts, min_dte: int, max_dte: int):
-        """Latest OPRA chain snapshot (chain-flagged samples) if it is <= CHAIN_FRESH old at as_of and
-        strictly newer than the EOD chain snapshot; else None (EOD / synthetic path unchanged)."""
-        if su is None or not self._opra().has(su):
+        """Latest OPRA chain snapshot (chain-flagged samples, T0) if it is <= CHAIN_FRESH old at as_of and
+        strictly newer than the EOD chain snapshot; else None (EOD / synthetic path unchanged).
+        'SPXW' serves the SPXW rows of the SPX files (PM series only); 'SPX' serves both roots."""
+        if su is None:
             return None
-        rows = self._opra().snapshot(su, as_of)
+        ou, rf = self._opra_target(su)
+        if ou is None:
+            return None
+        rows = self._opra().snapshot(ou, as_of, root=rf)
         if rows.empty or (other_ts is not None and not rows["ts"].iloc[0] > other_ts):
             return None
         from .providers import databento as _db
-        ch = _db.chain_frame(rows, u if u != "SPXW" else "SPX", spot_fn=lambda t: self._opra_spot(su, t))
+        ch = _db.chain_frame(rows, ou, spot_fn=lambda t: self._opra_spot(ou, t))
         ts = pd.Timestamp(rows["ts"].iloc[0])
         dte = (pd.to_datetime(ch["expiry"]) - _session_date(ts)).dt.days
         ch = ch[(dte >= min_dte) & (dte <= max_dte)].reset_index(drop=True)
@@ -1902,13 +1943,18 @@ class Portal:
         return ch
 
     def _opra_quote(self, instrument: Instrument, as_of: pd.Timestamp, max_stale_days: float, other_ts):
-        und = (instrument.underlying or "").upper()
-        if not und or not self._opra().has(und):
+        """Latest OPRA sample (T0) of the contract known at as_of (stamp ts <= as_of), unless the EOD source
+        has a strictly newer row."""
+        und, _rf = self._opra_target((instrument.underlying or "").upper())
+        if und is None:
             return None
         r = self._opra().latest(und, instrument.symbol, as_of, max_stale_days)
         if r is None or (other_ts is not None and r["ts"] < other_ts):
             return None
-        return OptionQuote(instrument=instrument, ts=pd.Timestamp(r["ts"]), bid=float(r["bid"]), ask=float(r["ask"]),
+        ts = pd.Timestamp(r["ts"])
+        return OptionQuote(instrument=instrument, ts=ts, bid=float(r["bid"]), ask=float(r["ask"]),
+                           # underlying NaN on this hot path (engine marks use bid/ask only); option_quotes
+                           # rows carry the PIT level
                            underlying_price=float("nan"), iv=float("nan"), delta=float("nan"), gamma=float("nan"),
                            vega=float("nan"), theta=float("nan"), volume=float("nan"), open_interest=float("nan"),
                            bid_size=float(r["bid_size"]), ask_size=float(r["ask_size"]), fidelity=Fidelity.T0_QUOTE)
@@ -2082,9 +2128,11 @@ class Portal:
                     ok = self.store.exists(k, src, symbol) or self.store.exists(k, src, symbol.upper())
                 if ok:
                     out.append((k, src))
-        if eod and not any(src == "dolthub" for _k, src in out) and symbol not in ("*", None, "") \
-                and self._opra().has(symbol):
-            # no regular EOD chain source (hod = one sample day): OPRA closing samples count (SPX, S172)
+        opra = symbol not in ("*", None, "") and self._opra_target(symbol)[0] is not None
+        if opra and ("option_quotes", "databento") not in out and \
+                (not eod or not any(src == "dolthub" for _k, src in out)):
+            # intraday: 'SPXW' is served from the SPX files; EOD: no regular EOD chain source (hod = one
+            # sample day) -> OPRA closing samples count (SPX, S172)
             out.append(("option_quotes", "databento"))
         return out
 
@@ -2096,9 +2144,10 @@ class Portal:
         real = self._real_option_quotes(instrument, start, end, as_of)
         if len(real) or not synthetic:
             return real
-        und = (instrument.underlying or "").upper()
-        if self._opra().has(und) and self._opra().covers(und, instrument.symbol, _utc(start), min(_utc(end), _utc(as_of))):
-            return real            # real T0 samples exist that session: never substitute a model quote
+        ou, _rf = self._opra_target((instrument.underlying or "").upper())
+        if ou is not None and self._opra().covers(ou, instrument.symbol, _utc(start), min(_utc(end), _utc(as_of))):
+            # real T0 samples known by as_of exist that session: never substitute a model quote
+            return real
         try:
             from atlasbt.options.marking import synthetic_option_quotes
         except ImportError:
@@ -2131,19 +2180,27 @@ class Portal:
                     df = self._match_instrument(df, instrument) if len(df) else df
                     if len(df):
                         parts.append(df.assign(source=src))
-        if self._opra().has(und):
+        ou, _rf = self._opra_target(und)
+        if ou is not None:
             from .providers import databento as _db
-            q = self._opra().contract(und, instrument.symbol, start, hi)
+            q = self._opra().contract(ou, instrument.symbol, start, hi)
             if len(q):
-                parts.append(_db.quote_rows_frame(q, und))
+                x = _db.quote_rows_frame(q, ou)
+                spot, lab = self._pit_spot_series(ou, pd.DatetimeIndex(x["ts"]))
+                x["underlying_price"] = spot
+                x["underlying_price_source"] = np.where(np.isfinite(spot), lab or "", None)
+                parts.append(x)
         extra = ["root", "settlement_date", "kind", "underlying_price_source", "source"]
         cols = [c for c in frames.CHAIN_COLS if c != "ts"] + extra
         if not parts:
             out = pd.DataFrame(columns=cols)
             out.index = pd.DatetimeIndex([], tz="UTC", name="ts")
             return out
-        out = pd.concat(parts, ignore_index=True).sort_values(["ts", "source"])
-        out = out.drop_duplicates("ts", keep="first")           # 'dolthub' sorts before 'hod'
+        # one row per ts, best tier first: OPRA NBBO sample (T0) > DoltHub EOD (T2) > hod (T2)
+        rank = {"databento": 0, "dolthub": 1, "hod": 2}
+        out = pd.concat(parts, ignore_index=True)
+        out = out.assign(_rk=out["source"].map(rank).fillna(9)).sort_values(["ts", "_rk"], kind="mergesort")
+        out = out.drop_duplicates("ts", keep="first").drop(columns="_rk")
         if out["underlying_price"].isna().any():
             out["underlying_price"] = [u if pd.notna(u) else self._close_at(und, t)
                                        for u, t in zip(out["underlying_price"], out["ts"])]

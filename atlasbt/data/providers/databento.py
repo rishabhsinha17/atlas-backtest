@@ -7,7 +7,7 @@ Budget discipline (new accounts run on free credits):
 * EVERY data request is priced first with ``metadata.get_cost`` and appended to the ledger
   ``<cache>/raw/databento_ledger.csv`` (timestamp, dataset, schema, symbols, window, cost, status)
   BEFORE the download; a request that would push the cumulative spend above
-  ``DATABENTO_BUDGET_USD`` (default $90) is refused (``BudgetExceeded``).
+  ``DATABENTO_BUDGET_USD`` (default $71.58, see ``budget_usd``) is refused (``BudgetExceeded``).
 * Raw responses are cached (gzip CSV under ``<cache>/raw/hist.databento.com/``) keyed by the
   request, so a re-run never pays twice.
 
@@ -22,11 +22,11 @@ OPRA (dataset OPRA.PILLAR, history from 2023-03-28):
     monthlies the SETTLEMENT Friday; converted to the internal last-trading-day convention by
     ``option_meta.last_trading_day`` exactly like DoltHub / historicaloptiondata rows).
   * schema ``cbbo-1m``: consolidated (across all OPRA exchanges) best bid/offer SAMPLED on a 1-minute
-    grid. Verified semantics are recorded in docs/DATA.md §4.15c (ts_recv = sample instant on the
-    minute grid; ts_event = time of the last book change at or before it).
+    grid. Verified semantics are recorded in docs/DATA.md §4.15c (ts_recv = END of the sampled minute, the
+    knowledge time; ts_event = time of the last TRADE, not of the last book change).
 Stored quotes: kind ``option_quotes``, source ``databento``, one parquet file per (underlying,
 session) ``option_quotes/databento/<UND>/<YYYY-MM-DD>.parquet`` (rows: ts, symbol, bid, ask, sizes,
-ts_event); served by ``Portal.option_chain`` / ``option_quote`` / ``option_quotes`` as T0 quote
+age_s, chain); served by ``Portal.option_chain`` / ``option_quote`` / ``option_quotes`` as T0 quote
 snapshots (``portal.OPTION_SOURCE_FIDELITY['databento']``), ``known_at = ts``.
 """
 from __future__ import annotations
@@ -75,8 +75,14 @@ def available() -> bool:
     return env("DATABENTO_API_KEY") is not None
 
 
+#: default cumulative cap when DATABENTO_BUDGET_USD is unset: the account's remaining credit after the
+#: $18.42 spent before 2026-11-06 whose ledger rows were lost with the old machine ($90 - $18.42). The
+#: ledger only knows the spend recorded since then, so the cap must be the REMAINING amount.
+DEFAULT_BUDGET_USD = 71.58
+
+
 def budget_usd() -> float:
-    return float(os.environ.get("DATABENTO_BUDGET_USD", "90"))
+    return float(os.environ.get("DATABENTO_BUDGET_USD", str(DEFAULT_BUDGET_USD)))
 
 
 def ledger_path() -> Path:
@@ -375,14 +381,30 @@ def day_path(und: str, day, root: Optional[Path] = None) -> Path:
     return day_dir(und, root) / f"{pd.Timestamp(day):%Y-%m-%d}.parquet"
 
 
-def parse_cbbo_csv(content: bytes) -> pd.DataFrame:
-    """cbbo-1m / cbbo-1s / bbo CSV (pretty_px, pretty_ts, map_symbols) -> ts (= ts_recv, the sample
-    instant on the interval grid), raw_symbol, bid, ask, bid_size, ask_size, ts_event (last book change)."""
+#: sampling grid of the interval schemas (ts_recv is clamped to this grid)
+SCHEMA_GRID = {"cbbo-1m": "1min", "bbo-1m": "1min", "cbbo-1s": "1s", "bbo-1s": "1s"}
+
+
+def parse_cbbo_csv(content: bytes, interval: Optional[str] = None) -> pd.DataFrame:
+    """cbbo-1m / cbbo-1s / bbo CSV (pretty_px, pretty_ts, map_symbols) -> ts, raw_symbol, bid, ask, bid_size,
+    ask_size, ts_event.
+
+    Point in time: ``ts`` = ``ts_recv`` = the END of the sampling interval (Databento: "the end timestamp of
+    the interval, clamped to the second/minute boundary"); the record of the minute [T, T+1m) is stamped
+    T+1m and holds the book at T+1m, so it is known at ``ts`` and served only to as_of >= ts (the bar-end
+    rule of bars' known_at). ``ts_recv`` is REQUIRED: ``ts_event`` is the last TRADE time (earlier than the
+    book state the record carries), so it can never stand in for the knowledge time. With ``interval``
+    ('1min', '1s') a stamp off the grid is moved UP to the next boundary (never earlier)."""
     if not content or not content.strip():
         return pd.DataFrame(columns=["ts", "raw_symbol", "bid", "ask", "bid_size", "ask_size", "ts_event"])
     df = pd.read_csv(io.BytesIO(content), dtype={"symbol": str})
-    tcol = "ts_recv" if "ts_recv" in df.columns else "ts_event"
-    return pd.DataFrame({"ts": pd.to_datetime(df[tcol], utc=True), "raw_symbol": df["symbol"].astype(str),
+    if "ts_recv" not in df.columns:
+        raise ValueError("cbbo/bbo CSV without ts_recv: the sample instant is unknown (ts_event is the last "
+                         "trade, not the knowledge time)")
+    ts = pd.to_datetime(df["ts_recv"], utc=True, format="ISO8601")
+    if interval:
+        ts = ts.dt.ceil(interval)
+    return pd.DataFrame({"ts": ts, "raw_symbol": df["symbol"].astype(str),
                          "bid": pd.to_numeric(df["bid_px_00"], errors="coerce"),
                          "ask": pd.to_numeric(df["ask_px_00"], errors="coerce"),
                          "bid_size": pd.to_numeric(df["bid_sz_00"], errors="coerce").fillna(0).astype("int64"),
@@ -480,14 +502,18 @@ class OpraReader:
         lo = sess - pd.Timedelta(days=back_days + 1)
         return [d for d in reversed(self.days(und)) if lo <= d <= sess]
 
-    def snapshot(self, und: str, as_of, chain_only: bool = True, max_age: pd.Timedelta = CHAIN_FRESH) -> pd.DataFrame:
-        """Rows of the latest sample instant ts <= as_of (chain rows only by default), if as_of - ts <= max_age."""
+    def snapshot(self, und: str, as_of, chain_only: bool = True, max_age: pd.Timedelta = CHAIN_FRESH,
+                 root: Optional[str] = None) -> pd.DataFrame:
+        """Rows of the latest sample instant ts <= as_of (chain rows only by default), if as_of - ts <= max_age.
+        ``root`` (e.g. 'SPXW') keeps only that OSI root (the SPX files hold SPX AM and SPXW PM series)."""
         as_of = pd.Timestamp(as_of)
         for d in self._days_upto(und, as_of, max_age / pd.Timedelta(days=1)):
             f = self.frame(und, d)
             if not len(f):
                 continue
             g = f[f["chain"]] if chain_only else f
+            if root is not None:
+                g = g[g["symbol"].str[:6].str.strip() == str(root).upper()]
             g = g[g["ts"] <= as_of]
             if len(g):
                 ts = g["ts"].iloc[-1]
@@ -529,15 +555,17 @@ class OpraReader:
         return None
 
     def covers(self, und: str, symbol: str, start, end) -> bool:
-        """True when the contract has samples on any session of [start, end] (real T0 data exists that
-        day, so a synthetic fallback must not be substituted for a window without samples)."""
+        """True when the contract has a sample stamped <= ``end`` on any session of [start, end] (real T0
+        data exists that day, so a synthetic fallback must not be substituted for a window without
+        samples). Point in time: the caller passes end = min(end, as_of); samples stamped later that
+        session do not count (that they will exist is future information)."""
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         s0 = start.tz_convert("America/New_York").tz_localize(None).normalize()
         s1 = end.tz_convert("America/New_York").tz_localize(None).normalize()
         for d in self.days(und):
             if s0 <= d <= s1:
                 f = self.frame(und, d)
-                if len(f) and (f["symbol"] == symbol).any():
+                if len(f) and ((f["symbol"] == symbol) & (f["ts"] <= end)).any():
                     return True
         return False
 
@@ -743,7 +771,7 @@ def run_jobs(jobs: Iterable[Job], dry_run: bool = False, log=print, max_cost_per
                     body = get_range_csv(OPRA, job.schema, ch, a, b, "raw_symbol", tag=job.tag,
                                          max_cost_usd=max_cost_per_request)
                     cost_n += _LAST_COST[0]
-                    raw = parse_cbbo_csv(body)
+                    raw = parse_cbbo_csv(body, interval=SCHEMA_GRID.get(job.schema))
                     raw = raw[(raw["ts"] > pd.Timestamp(a)) & (raw["ts"] < pd.Timestamp(b))]
                     if not job.store:              # validation samples: kept apart, never served
                         vr = to_store_rows(raw, chain=False)
@@ -1393,22 +1421,83 @@ def rebuild_spx_parity_bars(days=None, root: Optional[Path] = None) -> int:
     return n
 
 
-def coverage(underlying: str = "*", root: Optional[Path] = None) -> dict:
-    """OPRA quote coverage for planners: {'first', 'last', 'n_days', 'underlyings'} of the stored
-    per-session files (underlying '*' = union over all underlyings)."""
+def store_underlying(u: str) -> tuple[str, Optional[str]]:
+    """Requested underlying -> (directory underlying, OSI root filter): 'SPXW' -> ('SPX', 'SPXW') (the SPX
+    files hold both SPX AM monthlies and SPXW PM series), 'SPX' -> ('SPX', None), 'SPY' -> ('SPY', None)."""
+    u = opra_root(u)
+    return (UNDERLYING_OF_ROOT[u], u) if u in UNDERLYING_OF_ROOT else (u, None)
+
+
+def coverage(underlying: str = "*", root: Optional[Path] = None, detail: bool = False) -> dict:
+    """OPRA quote coverage of the served store (``option_quotes/databento``) for planners. No network.
+
+    Returns ``{'first', 'last', 'n_days', 'underlyings', 'by_underlying'}``: first/last session
+    ('YYYY-MM-DD') and session count over the selected underlyings ('*' = all; 'SPXW' = the SPX files),
+    ``by_underlying = {UND: {'first', 'last', 'n_days', 'days': [...]}}``. Built from file names only
+    (cheap). With ``detail=True`` also ``'minutes'``: one row per (underlying, day) with n_ts (distinct
+    sample instants), n_chain_ts (instants flagged chain, i.e. servable as a chain snapshot), first_ts,
+    last_ts (UTC), n_symbols, roots ('SPX,SPXW') -- reads the ts/symbol/chain columns of every file.
+    Instants are sample stamps = knowledge times (``parse_cbbo_csv``)."""
     base = Path(root or _store_root()) / KIND / SOURCE
+    empty = {"first": None, "last": None, "n_days": 0, "underlyings": 0, "by_underlying": {}}
+    if detail:
+        empty["minutes"] = pd.DataFrame(columns=["underlying", "day", "n_ts", "n_chain_ts", "first_ts", "last_ts",
+                                                 "n_symbols", "roots"])
     if not base.is_dir():
-        return {"first": None, "last": None, "n_days": 0, "underlyings": 0}
+        return empty
     from ..store import safe_symbol
-    dirs = [d for d in base.iterdir() if d.is_dir()] if underlying in ("*", None, "") else \
-        [base / safe_symbol(underlying)]
-    days = set()
-    n_und = 0
+    rf = None
+    if underlying in ("*", None, ""):
+        dirs = sorted(d for d in base.iterdir() if d.is_dir())
+    else:
+        und, rf = store_underlying(underlying)
+        dirs = [base / safe_symbol(und)]
+    days, by, det = set(), {}, []
     for d in dirs:
-        if d.is_dir():
-            ds = {p.stem for p in d.glob("*.parquet")}
-            n_und += bool(ds)
-            days |= ds
+        if not d.is_dir():
+            continue
+        ds = sorted(p.stem for p in d.glob("*.parquet"))
+        if detail or rf is not None:
+            kept = []
+            for day in ds:
+                f = pd.read_parquet(d / f"{day}.parquet", columns=["ts", "symbol", "chain"])
+                if rf is not None:
+                    f = f[f["symbol"].str[:6].str.strip() == rf]
+                if f.empty:
+                    continue
+                kept.append(day)
+                if detail:
+                    ts = pd.to_datetime(f["ts"], utc=True)
+                    det.append({"underlying": d.name, "day": day, "n_ts": int(ts.nunique()),
+                                "n_chain_ts": int(ts[f["chain"].astype(bool)].nunique()), "first_ts": ts.min(),
+                                "last_ts": ts.max(), "n_symbols": int(f["symbol"].nunique()),
+                                "roots": ",".join(sorted(f["symbol"].str[:6].str.strip().unique()))})
+            ds = kept
+        if ds:
+            by[d.name] = {"first": ds[0], "last": ds[-1], "n_days": len(ds), "days": ds}
+            days |= set(ds)
     days = sorted(days)
-    return {"first": days[0] if days else None, "last": days[-1] if days else None, "n_days": len(days),
-            "underlyings": n_und}
+    out = {"first": days[0] if days else None, "last": days[-1] if days else None, "n_days": len(days),
+           "underlyings": len(by), "by_underlying": by}
+    if detail:
+        out["minutes"] = pd.DataFrame(det, columns=list(empty["minutes"].columns))
+    return out
+
+
+def coverage_minutes(underlying: str, day, root: Optional[Path] = None, chain_only: bool = False,
+                     symbol: Optional[str] = None) -> pd.DatetimeIndex:
+    """Sorted distinct sample instants (UTC) stored for ``underlying`` on session ``day`` (optionally only
+    chain-flagged instants, or only those of one internal OCC ``symbol``). Empty when nothing is stored.
+    A strategy decision at as_of can use the latest instant <= as_of."""
+    und, rf = store_underlying(underlying)
+    p = day_path(und, day, root)
+    if not p.exists():
+        return pd.DatetimeIndex([], tz="UTC", name="ts")
+    f = pd.read_parquet(p, columns=["ts", "symbol", "chain"])
+    if rf is not None:
+        f = f[f["symbol"].str[:6].str.strip() == rf]
+    if chain_only:
+        f = f[f["chain"].astype(bool)]
+    if symbol is not None:
+        f = f[f["symbol"] == symbol]
+    return pd.DatetimeIndex(sorted(pd.to_datetime(f["ts"], utc=True).unique()), name="ts")
