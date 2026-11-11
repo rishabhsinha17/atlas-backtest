@@ -16,7 +16,9 @@ irrelevant for T-bill/treasury yields, relevant for macro series).
 from __future__ import annotations
 
 import io
+import json
 import logging
+import os
 from typing import Optional
 
 import pandas as pd
@@ -26,12 +28,13 @@ from atlasbt.core.types import Fidelity
 
 from .. import frames
 from .. import config
-from ..http import FetchError, HttpClient, client
+from ..http import FetchError, HttpClient, cache_key, client
 from ..store import ParquetStore, default_store
 
 log = logging.getLogger("atlasbt.data.fred")
 SOURCE = "fred"
 URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+API_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 SERIES = {
     "DTB3": "3-Month T-bill secondary market rate, DISCOUNT basis, % (daily, 1954-)",
@@ -125,12 +128,42 @@ def known_at_for(dates: pd.DatetimeIndex, monthly: bool = False) -> pd.DatetimeI
     return pd.DatetimeIndex(out)
 
 
+def api_key() -> str:
+    return os.environ.get("FRED_API_KEY", "").strip()
+
+
+def _fetch_api(series_id: str, key: str) -> bytes:
+    """Official FRED API (free key, FRED_API_KEY). Same data as fredgraph.csv (latest vintage).
+    The key travels as a query parameter, so this response is NEVER written to the raw cache
+    under the API URL (HttpClient stores request params in its .json sidecar) and errors are
+    re-raised without the URL. Returns fredgraph-format CSV bytes."""
+    try:
+        raw = HttpClient(max_retries=3, timeout=60).get(
+            API_URL, params={"series_id": series_id, "api_key": key, "file_type": "json"}, cache=False)
+        obs = json.loads(raw)["observations"]
+    except Exception as e:                      # sanitized: no URL / params (would leak the key)
+        raise FetchError(API_URL, None, f"FRED API {series_id}: {type(e).__name__}") from None
+    lines = [f"observation_date,{series_id}"] + [f"{o['date']},{o['value']}" for o in obs]
+    return ("\n".join(lines) + "\n").encode()
+
+
 def fetch_series(series_id: str, store: Optional[ParquetStore] = None, ttl_hours: float = 12) -> dict:
-    """Network first (cached); FRED stopped answering the plain 'atlasbt-research/0.1' UA on
-    2026-10-28 (read timeouts), so on failure we fall back to the stale raw cache and then to
-    the scout's copy under data_raw/fred/<ID>.csv (same fredgraph.csv format)."""
+    """With FRED_API_KEY: the official API (the CSV is then cached under the key-free fredgraph
+    URL, so offline runs and later fetches without a key reuse it). Otherwise fredgraph.csv
+    (FRED stopped answering the plain 'atlasbt-research/0.1' UA on 2026-10-28), then the stale
+    raw cache, then the scout's copy under data_raw/fred/<ID>.csv (same fredgraph.csv format)."""
     store = store or default_store()
     origin = "network"
+    key = api_key()
+    if key and not config.offline():
+        try:
+            content = _fetch_api(series_id, key)
+            c = client()
+            body_p, meta_p = c._paths(URL, cache_key(URL, {"id": series_id}))
+            c._store(body_p, meta_p, URL, {"id": series_id}, 200, content)
+            return _write(series_id, parse_csv(series_id, content), store, "fred_api")
+        except FetchError as e:
+            log.warning("%s; falling back to fredgraph/raw cache", e)
     try:
         content = HttpClient(max_retries=1, timeout=25).get(URL, params={"id": series_id}, ttl=ttl_hours * 3600)
     except FetchError:
@@ -141,8 +174,11 @@ def fetch_series(series_id: str, store: Optional[ParquetStore] = None, ttl_hours
             if not local.exists():
                 raise
             content, origin = local.read_bytes(), f"data_raw/fred/{series_id}.csv"
-    df = parse_csv(series_id, content)
-    fid = Fidelity.T2_PROXY if series_id in MONTHLY else Fidelity.T1_BAR
+    return _write(series_id, parse_csv(series_id, content), store, origin)
+
+
+def _write(series_id: str, df: pd.DataFrame, store: ParquetStore, origin: str) -> dict:
+    fid =Fidelity.T2_PROXY if series_id in MONTHLY else Fidelity.T1_BAR
     store.write("rates", SOURCE, series_id, df, fidelity=int(fid), replace=True,
                 extra={"description": SERIES.get(series_id, ""), "units": "percent", "origin": origin,
                        "first_ts": str(df.index[0].date()), "last_ts": str(df.index[-1].date())})
