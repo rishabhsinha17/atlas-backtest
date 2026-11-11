@@ -184,7 +184,10 @@ def classify(symbol: str, acts: pd.DataFrame, raw_bars: pd.DataFrame | None, chi
         pc = prev_close(ex)
         r_s = spec.get("split")
         spl = on[on["type"] == "SPLIT"]
-        nonc = spl[[not is_common(float(f)) for f in spl["ratio"]]] if len(spl) else spl
+        # every split row on a known spin-off date encodes the spin-off unless it IS the table's same-day
+        # split: GE 2024-04-02 1.253 (GE Vernova) is within rounding of 5:4 and was kept as a SPLIT next
+        # to the SPINOFF row (the distribution applied twice)
+        nonc = spl[[abs(np.log(float(f) / r_s)) > 0.004 for f in spl["ratio"]]] if (len(spl) and r_s) else spl
         divs = on[on["type"].isin(["CASH_DIVIDEND", "SPECIAL_DIVIDEND"]) &
                   (on["amount"] > (0.03 * pc if np.isfinite(pc) else 0))]
         D, how = spin_value(spec, ex, child_close)
@@ -207,9 +210,17 @@ def classify(symbol: str, acts: pd.DataFrame, raw_bars: pd.DataFrame | None, chi
             D, how = pc * (1 - (r_s or 1.0) / f), f"Yahoo price factor {f:g}" + (f" / split {r_s:g}" if r_s else "")
         else:
             D = np.nan
+        if not (np.isfinite(D) and D > 0) and len(nonc) and np.isfinite(pc):
+            # the dropped factor row must not take the event with it: the factor's implied value
+            f = float(nonc["ratio"].iloc[0])
+            D, how = pc * (1 - (r_s or 1.0) / f), f"price factor {f:g} (no value from prices)"
         drop |= set(divs.index) | set(nonc.index) | (set(spl.index) if r_s else set())
         ch = spec["children"]
         if np.isfinite(D) and D > 0:
+            # idempotent: Yahoo actions are stored already classified (providers/yahoo.py) and classified
+            # again on read with child prices -> the stored SPINOFF row is replaced, not doubled (GE
+            # 2023-01-04 was served as 16.57 + 19.37)
+            drop |= set(on.index[on["type"] == "SPINOFF"])
             add.append({"symbol": sym, "type": "SPINOFF", "ex_date": ex, "known_at": ka,
                         "ratio": ch[0][1] if len(ch) == 1 else np.nan, "amount": D,
                         "new_symbol": "+".join(c for c, _ in ch) or None, "fidelity": int(Fidelity.T2_PROXY),

@@ -107,7 +107,7 @@ def test_summary_rates_and_flags(store, tmp_path):
     assert pd.read_csv(p1).shape[0] == len(rep)
 
 
-def test_known_spinoff_served_as_split_is_an_error(tmp_path):
+def _ge_2024_split_store(tmp_path):
     st = ParquetStore(tmp_path)
     st.write("bars_1d", "yahoo", "GE", synthetic_bars("2024-03-01", "2024-04-30", lambda d: (100.0, 100.0)))
     st.write("actions", "yahoo", "GE", synthetic_actions("GE", [("SPLIT", "2024-04-02", 1.253, 0.0)]))
@@ -116,6 +116,19 @@ def test_known_spinoff_served_as_split_is_an_error(tmp_path):
              key=["act_symbol", "ex_date"])
     st.write("reference", "dolthub", "DIVIDEND", pd.DataFrame({"act_symbol": ["X"], "ex_date": ["2020-01-02"],
                                                                "amount": [0.1]}), key=["act_symbol", "ex_date"])
-    rep = CrossChecker(st).run(["GE"])
+    return st
+
+
+def test_known_spinoff_served_as_split_is_an_error(tmp_path, monkeypatch):
+    # detector: a classifier regression that leaves GE 2024-04-02 (factor 1.253) as a SPLIT row
+    import atlasbt.data.actions_classify as AC
+    monkeypatch.setattr(AC, "classify", lambda sym, a, *args, **kw: a)
+    rep = CrossChecker(_ge_2024_split_store(tmp_path)).run(["GE"])
     assert list(rep.status) == ["spinoff_served_as_split"] and list(rep.severity) == ["error"]
     assert summarize(rep)["SPLIT"]["spinoff_served_as_split"] == ["GE 2024-04-02"]
+
+
+def test_known_spinoff_with_near_common_factor_is_classified(tmp_path):
+    # 1.253 is within rounding of 5:4; the classifier now serves it as a SPINOFF, not a SPLIT
+    rep = CrossChecker(_ge_2024_split_store(tmp_path)).run(["GE"])
+    assert "spinoff_served_as_split" not in set(rep.status) if len(rep) else True

@@ -226,10 +226,10 @@ def validate(portal, symbols: Iterable[str], start=START, end=None) -> dict:
     """Source-level check on cached responses: Tiingo raw vs every overlapping trusted as-traded
     source of the same ticker (Yahoo raw for survivors; Alpaca SIP / DoltHub for names that died
     2016+, restricted to dates the ticker denotes the same issuer in both), and Tiingo splits vs
-    Yahoo splits. Accepted when >= 95 % of comparisons pass and every split matches."""
+    Yahoo splits. Accepted when >= 95 % of comparisons pass, every split matches and every spin-off shows a price drop."""
     from .alpaca_eod import compare, split_check
     idx = portal.identity_index()
-    rows, splits = [], []
+    rows, splits, spins = [], [], []
     for s in symbols:
         r = cached_eod(s, start, end)
         if not r:
@@ -237,6 +237,7 @@ def validate(portal, symbols: Iterable[str], start=START, end=None) -> dict:
         t_bars, t_acts = parse_eod(r)
         if not len(t_bars):
             continue
+        t_acts = classified_actions(portal, s, t_bars, t_acts)
         td = frames.to_naive_date(t_bars.index)
         own = int(idx.label_dates(s, pd.DatetimeIndex([td[-1]]))[0]) or (idx.cik_now(s) or 0)
         for ref in ("yahoo", "alpaca_eod", "dolthub"):
@@ -259,6 +260,14 @@ def validate(portal, symbols: Iterable[str], start=START, end=None) -> dict:
             j = compare(t_bars, b[frames.to_naive_date(b.index).isin(common)])
             rows.append({"symbol": s, "ref": ref, **c, "junction_ok": j["ok"], "junction_n": j["n"],
                          "trusted_from": common[0], "checked_to": common[-1]})
+        # Tiingo encodes spin-offs as a splitFactor (GE 2023-01-04 1.281 = GE HealthCare, DD 2019-04-02
+        # 1.487 = Dow, FTI 2021-02-16, JEF 2019/2023); classify() turned them into SPINOFF rows, which
+        # are served as distributions, not share multiplications. Gate: the ex-date must show a price
+        # DROP (raw open < previous close); the exact value is the classifier's (as for Yahoo).
+        for x in _spinoff_check(t_bars, t_acts):
+            ex = pd.Timestamp(x["ex_date"])
+            if own and int(idx.label_dates(s, pd.DatetimeIndex([ex]))[0]) == own:
+                spins.append({"symbol": s, **x})
         if portal.store.exists("actions", "yahoo", s) and len(t_acts):
             ya = portal._read("actions", "yahoo", s)
             ysp = ya[ya["type"] == "SPLIT"] if len(ya) else ya
@@ -282,6 +291,7 @@ def validate(portal, symbols: Iterable[str], start=START, end=None) -> dict:
                 splits.append({"symbol": s, **x})
     df = pd.DataFrame(rows)
     sp = pd.DataFrame(splits)
+    so = pd.DataFrame(spins)
     share = float(df["ok"].mean()) if len(df) else 0.0
     rep = {"comparisons": int(len(df)), "symbols": int(df["symbol"].nunique()) if len(df) else 0,
            "pass_share": round(share, 4),
@@ -289,11 +299,13 @@ def validate(portal, symbols: Iterable[str], start=START, end=None) -> dict:
            "vol_med_median": float(df["vol_med"].median()) if len(df) else np.nan,
            "splits_checked": int(len(sp)), "splits_ok": int((sp["ok"] & sp["in_yahoo"]).sum()) if len(sp) else 0,
            "splits_in_yahoo": int(sp["in_yahoo"].sum()) if len(sp) else 0,
+           "spinoffs_checked": int(len(so)), "spinoffs_ok": int(so["ok"].sum()) if len(so) else 0,
            "junction_pass_share": round(float(df["junction_ok"].mean()), 4) if len(df) else 0.0,
            "failed": df.loc[~df["ok"], ["symbol", "ref", "close_med", "close_p99", "vol_med", "junction_ok"]]
            .to_dict("records") if len(df) else []}
-    rep["accepted"] = bool(len(df) >= 20 and share >= 0.95 and (not len(sp) or bool((sp["ok"] & sp["in_yahoo"]).all())))
-    rep["detail"], rep["split_detail"] = df, sp
+    rep["accepted"] = bool(len(df) >= 20 and share >= 0.95 and (not len(sp) or bool((sp["ok"] & sp["in_yahoo"]).all()))
+                           and (not len(so) or bool(so["ok"].all())))
+    rep["detail"], rep["split_detail"], rep["spinoff_detail"] = df, sp, so
     return rep
 
 
@@ -336,10 +348,47 @@ def ingest(portal, symbols: Iterable[str], validation: dict, start=START, end=No
                            extra={"origin": "tiingo /tiingo/daily/<t>/prices (raw)", "raw": True,
                                   "line_end": str(end_d.date()), "n_lines": int(len(ln)),
                                   "validation_pass_share": validation.get("pass_share")})
+        acts = classified_actions(portal, s, bars, acts)
         if len(acts):
-            portal.store.write("actions", SOURCE, s, acts.assign(symbol=s), key=["type", "ex_date"], replace=True,
-                               fidelity=int(Fidelity.T2_PROXY), extra={"origin": "tiingo divCash/splitFactor"})
+            portal.store.write("actions", SOURCE, s, acts, key=["type", "ex_date"], replace=True,
+                               fidelity=int(Fidelity.T2_PROXY),
+                               extra={"origin": "tiingo divCash/splitFactor, reclassified (actions_classify)"})
         out["stored"].append(s)
+    return out
+
+
+def classified_actions(portal, symbol: str, bars: pd.DataFrame, acts: pd.DataFrame) -> pd.DataFrame:
+    """Tiingo actions through the same reclassification as Yahoo's (actions_classify.classify):
+    a splitFactor that is no common split ratio is a spin-off price factor -> SPINOFF (value =
+    child close x terms for known spin-offs, else P_prev x (1 - 1/factor)); dividends > 10 % of
+    the previous close -> SPECIAL_DIVIDEND."""
+    if acts is None or not len(acts):
+        return acts if acts is not None else pd.DataFrame()
+    from ..actions_classify import classify
+    a = acts.assign(symbol=symbol.upper())
+    if "new_symbol" not in a:
+        a["new_symbol"] = None
+    return classify(symbol, a, bars, getattr(portal, "_child_close", None))
+
+
+def _spinoff_check(bars: pd.DataFrame, acts: pd.DataFrame) -> list[dict]:
+    """Every SPINOFF row must show a price drop on its ex-date: raw open / previous close, times the
+    ratio of a same-day split (DD 2019-06-03: 1:3 reverse split + Corteva), below 1."""
+    if acts is None or not len(acts) or not len(bars):
+        return []
+    c = pd.Series(bars["close"].to_numpy(), index=frames.to_naive_date(bars.index))
+    o = pd.Series(bars["open"].to_numpy(), index=c.index)
+    out = []
+    for r in acts[acts["type"] == "SPINOFF"].itertuples():
+        ex = pd.Timestamp(r.ex_date).normalize()
+        if ex not in c.index or c.index.get_loc(ex) == 0:
+            continue
+        j = c.index.get_loc(ex)
+        g = float(o.iloc[j] / c.iloc[j - 1])
+        same = acts[(acts["type"] == "SPLIT") & (pd.to_datetime(acts["ex_date"]).dt.normalize() == ex)]
+        f = float(np.prod(same["ratio"].astype(float))) if len(same) else 1.0
+        out.append({"ex_date": str(ex.date()), "amount": float(r.amount), "gap": g, "split_same_day": f,
+                    "ok": bool(g * f < 1.0)})
     return out
 
 

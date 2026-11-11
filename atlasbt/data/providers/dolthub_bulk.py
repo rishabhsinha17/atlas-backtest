@@ -80,6 +80,33 @@ def _bucket(sym: pd.Series) -> np.ndarray:
     return np.array([sum(map(ord, x)) % N_BUCKETS for x in sym.astype(str)])
 
 
+def _forget_sql_dates_after(store: ParquetStore, symbols: Iterable[str], last_date) -> int:
+    """The bulk load rewrites each symbol's year partitions (replace=True), which wipes chains the
+    SQL path (dolthub.fetch_option_chains) had stored for dates after the mirror's last date, while
+    its resumability ledger reference/dolthub/option_chain_done still marked them done, so the next
+    `--only options` never fetched them again (lost 2026-01-28..11-06 for the 10 SQL underlyings on
+    2026-11-10). Drop those ledger rows so the SQL path refetches them (raw HTTP cache: no network)."""
+    if last_date is None:
+        return 0
+    done = store.read("reference", SOURCE, "option_chain_done")
+    if not len(done) or "symbol" not in done:
+        return 0
+    syms = {str(x).upper() for x in symbols}
+    stale = done["symbol"].astype(str).str.upper().isin(syms) & \
+        (pd.to_datetime(done["date"].astype(str)) > pd.Timestamp(str(last_date)[:10]))
+    n = int(stale.sum())
+    if n:
+        keep = done.loc[~stale].reset_index(drop=True)
+        if len(keep):
+            store.write("reference", SOURCE, "option_chain_done", keep, key=["date", "symbol"], replace=True)
+        else:                       # write() ignores an empty frame: remove the ledger instead
+            for f in store._files("reference", SOURCE, "option_chain_done"):
+                f.unlink()
+        log.info("option_chain_done: %d SQL dates after the bulk last date %s forgotten (refetched by "
+                 "--only options)", n, str(last_date)[:10])
+    return n
+
+
 def load_option_chain_csv(path: str | Path, symbols: Optional[Iterable[str]] = None,
                           store: Optional[ParquetStore] = None, chunksize: int = 4_000_000,
                           parts_dir: Optional[str | Path] = None) -> dict:
@@ -131,6 +158,7 @@ def load_option_chain_csv(path: str | Path, symbols: Optional[Iterable[str]] = N
             log.info("option_chain bucket %s done (%d symbols so far)", d.name, len(syms_done))
         store.write("reference", SOURCE, "option_chain_bulk",
                     pd.DataFrame({"symbol": syms_done, "bulk_last_date": last_date}), key=["symbol"])
+        _forget_sql_dates_after(store, syms_done, last_date)
         return {"rows_read": n_in, "rows_kept": n_keep, "symbols": len(syms_done), "last_date": last_date}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

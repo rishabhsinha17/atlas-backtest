@@ -49,7 +49,7 @@ from . import config, frames, qa
 
 log = logging.getLogger("atlasbt.data.identity")
 ZL = config.DATA_RAW / "hf_ziplime_earnings_calendar" / "data"
-BUILD_VERSION = "2026-10-30.6"     # bump when the series construction rules change
+BUILD_VERSION = "2026-11-11.1"     # bump when the series construction rules change (11-11: Tiingo actions classified, known spin-offs idempotent)
 MAX_EVIDENCE_GAP_DAYS = 548
 EDGE_DAYS = 120
 COMMON_SPLITS = np.array([2, 3, 4, 5, 6, 7, 8, 10, 15, 20, 1 / 2, 1 / 3, 1 / 4, 1 / 5, 1 / 8, 1 / 10, 1 / 15,
