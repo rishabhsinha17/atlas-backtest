@@ -35,7 +35,7 @@ Rules (documented in docs/RUNNING.md §2):
 * Window end = the last cached session common to the critical bar inputs (and the last quote session).
 * Minimum window: 252 sessions for daily+ strategies, 10 sessions for intraday ones.
 * The memo (results/plan_cache.json) is dropped on a new identity build / membership / events, and its
-  intraday entries on any change of the intraday bar / quote stores.
+  intraday entries on any change of the intraday bar / quote / option-quote stores.
 """
 from __future__ import annotations
 
@@ -100,9 +100,11 @@ def _data_version(portal) -> str:
 
 def _intraday_version(portal) -> str:
     """Stamp of the intraday stores (every ``bars_<intraday>`` kind, ``quotes``, ``reference/alpaca`` with
-    the recorded quote windows): parquet file count and newest mtime per kind. A fetch that adds or
-    rewrites intraday bars / quotes changes it, which drops the memoised intraday facts (``bars|SYM|1m``,
-    ``quotes|SYM`` ... computed before the fetch, possibly as None) but keeps the daily ones."""
+    the recorded quote windows, the option quote / option bar stores -- Databento OPRA answers
+    ``has(member, 'options', '1m')``, one of the engine's member checks): parquet file count and newest
+    mtime per kind. A fetch that adds or rewrites intraday bars / quotes / option quotes changes it, which
+    drops the memoised intraday facts (``bars|SYM|1m``, ``quotes|SYM``, ``pit|window|...`` computed before
+    the fetch, possibly as None / NOT_TESTABLE) but keeps the daily ones."""
     try:
         root = Path(portal.store.root)
     except Exception:
@@ -111,6 +113,7 @@ def _intraday_version(portal) -> str:
         return ""
     dirs = sorted(d for d in root.glob("bars_*") if d.is_dir() and d.name != "bars_1d")
     dirs += [root / "quotes", root / "reference" / "alpaca"]
+    dirs += sorted(d for d in root.glob("option_bars_*") if d.is_dir()) + [root / "option_quotes"]
     parts = []
     for d in dirs:
         if not d.is_dir():
