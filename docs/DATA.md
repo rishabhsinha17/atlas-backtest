@@ -590,7 +590,8 @@ Without keys `available()` is False and fetch functions return `{'skipped': ...}
 Key `DATABENTO_API_KEY` (environment only, sourced from `~/.atlasbt/secrets.env`; never logged/stored). The
 account runs on free credits, so **every data request is priced first** (`metadata.get_cost`), written to the
 ledger `cache/raw/databento_ledger.csv` (timestamp, dataset, schema, symbols, window, cost, status) and refused
-if the cumulative spend would exceed `DATABENTO_BUDGET_USD` (default **$90**). Listings come from the free
+if the cumulative spend would exceed `DATABENTO_BUDGET_USD` (default **$71.58**: the remaining credit; the
+ledger of the first $18.42 was lost with the old machine, so the cap must be what is left). Listings come from the free
 `symbology.resolve` (parent `<ROOT>.OPT` -> every OSI symbol listed that day). Small raw responses are cached
 (`cache/raw/hist.databento.com/`); large ones are not (disk) -- the parquet store plus the progress ledger
 `cache/logs/databento_progress.jsonl` make `python -m atlasbt.data.fetch --only databento_options` resumable
@@ -612,7 +613,7 @@ samples are taken at close - 1 minute (15:59 ET).
 `store/option_quotes/databento/<UND>/<YYYY-MM-DD>.parquet` with `ts, symbol (internal OCC: expiry = last
 trading day; SPX AM monthlies listed by OPRA under the settlement Friday are moved to the Thursday by
 option_meta, SPX vs SPXW keep their roots/settlement), bid, ask, bid_size, ask_size, age_s, chain`.
-`known_at = ts`. The Portal serves them as **T0_QUOTE** (`OPTION_SOURCE_FIDELITY['databento']`):
+`known_at = ts` (ts = `ts_recv` = END of the sampled minute, OPTIONS.md §12.1). The Portal serves them as **T0_QUOTE** (`OPTION_SOURCE_FIDELITY['databento']`):
 * `option_chain(u, as_of)`: the latest sample instant <= as_of whose rows are flagged `chain` (fetched as a
   decision snapshot, see plans) if it is <= 15 min old and strictly newer than the EOD (DoltHub/hod) snapshot;
   otherwise the EOD / synthetic path is unchanged. Valuation-only rows (`chain=False`, e.g. daily SPX box
