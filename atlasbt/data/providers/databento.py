@@ -957,8 +957,11 @@ def _daily_close_table(portal, symbol: str, start, end) -> pd.Series:
 
 
 def spx_reference(portal, start, end) -> pd.DataFrame:
-    """Per session: SPX-scaled day high/low and previous VIX close, for 0DTE strike bands (fetch
-    selection only). SPX level = SPY raw high/low x (SPX close / SPY close) of the previous session."""
+    """Per session (fetch selection only): ``prev_close`` = SPX close of the PREVIOUS session (SPX daily
+    close, else SPY close x the SPX/SPY ratio) and ``vix_prev`` = VIX close of the previous session -- the
+    only inputs of the 0DTE strike band, both known before the open. Also the same-day SPX-scaled
+    ``hi`` / ``lo`` / ``close`` (SPY raw x the previous session's SPX/SPY ratio), which no strike band may
+    use (the stored strike set would leak the session's later range)."""
     spy = _daily_close_table(portal, "SPY", start, end)
     spx = _daily_close_table(portal, "SPX", start, end)
     vix = _daily_close_table(portal, "VIX", start, end)
@@ -968,22 +971,39 @@ def spx_reference(portal, start, end) -> pd.DataFrame:
     out["hi"] = spy["high"] * out["ratio"]
     out["lo"] = spy["low"] * out["ratio"]
     out["close"] = spy["close"] * out["ratio"]
+    spx_c = spx["close"].reindex(out.index)
+    out["prev_close"] = spx_c.fillna(out["close"]).shift(1)
     out["vix_prev"] = vix["close"].reindex(out.index).ffill().shift(1).fillna(20.0)
     return out
+
+
+#: 0DTE strike band half-width around the previous SPX close: m = max(SPX0DTE_FLOOR, SPX0DTE_SIGMAS x
+#: VIX_prev / sqrt(252)). Measured on the cache (908 sessions 2023-03-28..2026-11-05): the largest move
+#: from the previous close to the day's high or low is 4.25 daily VIX sigmas (2026-11-05, -4.4 %); the
+#: largest in % is +10.5 % (2025-04-09, VIX_prev 52 -> m 16.5 %); no session leaves the band.
+SPX0DTE_FLOOR = 0.05
+SPX0DTE_SIGMAS = 5.0
+
+
+def spx0dte_band(prev_close: float, vix_prev: float) -> tuple[float, float]:
+    """[lo, hi] strike band of the spx0dte plan from information known before the open only."""
+    m = max(SPX0DTE_FLOOR, SPX0DTE_SIGMAS * float(vix_prev) / 100.0 / np.sqrt(252))
+    return float(prev_close) * (1 - m), float(prev_close) * (1 + m)
 
 
 # ============================================================================ plans
 def plan_spx_0dte(start, end, ref: pd.DataFrame) -> list:
     """S161-S164: every SPXW contract expiring THAT session (0DTE, PM-settled) with a strike inside
-    [low x (1-m), high x (1+m)], m = max(3%, 3.5 x VIX_prev/sqrt(252)) (covers 5-delta wings at the
-    09:45-11:00 decisions), sampled every minute from the open to the close (cbbo-1m)."""
+    prev_close x (1 -+ m), m = max(5%, 5 x VIX_prev/sqrt(252)) (spx0dte_band), sampled every minute from
+    the open to the close (cbbo-1m). The band uses only the previous close and the previous VIX close:
+    the stored chain's strike set is served from the first minute, so a band built from the session's
+    own high/low would tell a strategy at 09:31 how far the market moves that day (lookahead)."""
     jobs = []
     for d in sessions(max(pd.Timestamp(start), OPRA_START.tz_localize(None)), end):
-        if d not in ref.index or not np.isfinite(ref.loc[d, "hi"]):
+        if d not in ref.index or not np.isfinite(float(ref.loc[d, "prev_close"])):
             continue
         r = ref.loc[d]
-        m = max(0.03, 3.5 * float(r["vix_prev"]) / 100.0 / np.sqrt(252))
-        lo, hi = float(r["lo"]) * (1 - m), float(r["hi"]) * (1 + m)
+        lo, hi = spx0dte_band(r["prev_close"], r["vix_prev"])
         o, c = open_close(d)
 
         def sel(lst, d=d, lo=lo, hi=hi):

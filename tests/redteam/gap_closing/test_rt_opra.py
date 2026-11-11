@@ -152,11 +152,13 @@ def test_rt_spx0dte_strike_set_depends_on_the_days_realized_high_low(cache):
     d = pd.Timestamp("2024-01-10")
     lst = D.parse_osi([f"SPXW  240110{r_}0{K}000" for K in range(4400, 5105, 5) for r_ in "CP"])
 
-    def ref(hi):
-        return pd.DataFrame({"ratio": 10.0, "hi": hi, "lo": 4700.0, "close": 4750.0, "vix_prev": 13.0},
-                            index=pd.DatetimeIndex([d]))
+    def ref(hi, lo=4700.0, close=4750.0):
+        # (verifier) prev_close: the reference now carries the previous session's close explicitly (the
+        # only pre-open level the band may use); every same-day field (hi, lo, close) is future information
+        return pd.DataFrame({"ratio": 10.0, "hi": hi, "lo": lo, "close": close, "prev_close": 4750.0,
+                             "vix_prev": 13.0}, index=pd.DatetimeIndex([d]))
 
-    calm, rally = (D.plan_spx_0dte(d, d, ref(h)) for h in (4760.0, 4860.0))
+    calm, rally = D.plan_spx_0dte(d, d, ref(4760.0)), D.plan_spx_0dte(d, d, ref(4860.0, 4650.0, 4850.0))
     assert len(calm) == len(rally) == 1
     k_calm = set(D.parse_osi(calm[0].select(lst))["strike"])
     k_rally = set(D.parse_osi(rally[0].select(lst))["strike"])

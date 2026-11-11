@@ -419,6 +419,18 @@ trading day: an SPX AM monthly listed by OPRA under Friday 2024-01-19 is `SPX   
 monthlies only) do not make `SPXW` T0: `has('SPXW', 'options', '1m')` is then False, like
 `coverage('SPXW')`.
 
+**0DTE strike band (no lookahead).** The `spx0dte` plan stores, for each session, the SPXW contracts
+expiring that session with a strike in `prev_close x (1 -+ m)`, `m = max(5 %, 5 x (VIX_prev / 100) / sqrt(252))`
+(`databento.spx0dte_band`). `prev_close` is the previous session's SPX close and `VIX_prev` the previous
+session's VIX close, both known before the open. The strike set is part of what `option_chain` serves from
+09:31, so it may not depend on the session itself. The earlier band, `[low x (1 - m), high x (1 + m)]` of
+the same session, told a strategy at the open how far the market would move that day. The width was
+measured on the cache: over 908 sessions (2023-03-28 .. 2026-11-05), the largest move from the previous
+close to the day's high or low was 4.25 daily VIX sigmas (2026-11-05, -4.4 %), and the largest in percent was
++10.5 % (2025-04-09, VIX_prev 52, m = 16.5 %). No session's range leaves the band. A decision strike beyond the
+band on an extreme day is missing from the stored chain. That is a data gap fixed before the open, not a leak.
+Rows fetched with the earlier band must be refetched before they are used.
+
 **Coverage (for the planner; no network, no key).**
 
 ```python

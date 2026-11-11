@@ -393,7 +393,8 @@ def _fake_client(calls, cost=0.01, listed=("SPXW  240102C04750000", "SPXW  24010
 
 def _ref(days):
     idx = pd.DatetimeIndex([pd.Timestamp(d) for d in days])
-    return pd.DataFrame({"ratio": 10.0, "hi": 4760.0, "lo": 4740.0, "close": 4750.0, "vix_prev": 13.0}, index=idx)
+    return pd.DataFrame({"ratio": 10.0, "hi": 4760.0, "lo": 4740.0, "close": 4750.0, "prev_close": 4750.0,
+                         "vix_prev": 13.0}, index=idx)
 
 
 def test_fetch_task_databento_options_offline(cache, monkeypatch):
@@ -489,6 +490,46 @@ def test_budget_default_is_the_remaining_cap(monkeypatch):
     monkeypatch.setenv("DATABENTO_BUDGET_USD", "12.5")
     assert D.budget_usd() == pytest.approx(12.5)
 
+
+# ---------------------------------------------------------------- spx0dte strike band: no lookahead
+class _DailyPortal:
+    """bars(sym, '1d', ...) for SPY / SPX / VIX from {sym: DataFrame[close, high, low]} by ET session date."""
+
+    def __init__(self, tabs):
+        self.tabs = tabs
+
+    def bars(self, sym, freq, start, end, as_of=None, adjusted=False):
+        t = self.tabs[sym]
+        idx = (pd.DatetimeIndex(t.index) + pd.Timedelta(hours=16)).tz_localize("America/New_York").tz_convert("UTC")
+        return pd.DataFrame(t.to_numpy(), columns=t.columns, index=idx)
+
+
+def test_spx0dte_strikes_use_only_pre_open_information():
+    """Perturb everything about session d that is unknown at its open (SPY/SPX high, low, close of d, VIX
+    close of d): the strike set of d's 0DTE fetch must not change. Perturbing the previous close must."""
+    days = pd.DatetimeIndex(["2024-01-08", "2024-01-09", "2024-01-10"])
+    d = days[-1]
+
+    def tabs(spy_d=(475.0, 476.0, 474.0), spx_d=4750.0, vix_d=13.0, spx_prev=4750.0):
+        spy = pd.DataFrame({"close": [474.0, 475.0, spy_d[0]], "high": [475.0, 476.0, spy_d[1]],
+                            "low": [473.0, 474.0, spy_d[2]]}, index=days)
+        spx = pd.DataFrame({"close": [4740.0, spx_prev, spx_d], "high": np.nan, "low": np.nan}, index=days)
+        vix = pd.DataFrame({"close": [12.0, 13.0, vix_d], "high": np.nan, "low": np.nan}, index=days)
+        return {"SPY": spy, "SPX": spx, "VIX": vix}
+
+    lst = D.parse_osi([f"SPXW  240110{r_}0{K}000" for K in range(4000, 5505, 5) for r_ in "CP"])
+
+    def strikes(t):
+        jobs = D.plan_spx_0dte(d, d, D.spx_reference(_DailyPortal(t), days[0], d))
+        assert len(jobs) == 1
+        return set(D.parse_osi(jobs[0].select(lst))["strike"])
+
+    base = strikes(tabs())
+    assert strikes(tabs(spy_d=(440.0, 480.0, 430.0), spx_d=4400.0, vix_d=40.0)) == base
+    lo, hi = D.spx0dte_band(4750.0, 13.0)          # VIX_prev 13 -> sigma 0.82 %: the 5 % floor binds
+    assert (lo, hi) == pytest.approx((4750.0 * 0.95, 4750.0 * 1.05))
+    assert min(base) == 4515.0 and max(base) == 4985.0
+    assert strikes(tabs(spx_prev=4600.0)) != base   # the previous close does move the band
 
 
 def test_run_jobs_stops_on_a_failed_billable_transport(cache, monkeypatch):
