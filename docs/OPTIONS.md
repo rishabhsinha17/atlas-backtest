@@ -431,7 +431,9 @@ Portal.opra_coverage(underlying="*", detail=False)    # same, rooted at the Port
 ```
 
 `n_chain_ts` counts the instants that `option_chain` can serve as a chain. The other instants are valuation
-marks (`chain=False`) that `option_quote(s)` serves. A planner can call a strategy T0 for a window when
+marks (`chain=False`) that `option_quote(s)` serves. The planner bounds the window of a T0 (or intraday)
+options requirement on an explicit underlying by `opra_coverage(u)` first..last, and labels such an OPT
+strategy's chains T0 instead of synthetic (RUNNING.md §2). A planner can call a strategy T0 for a window when
 `coverage(u)['by_underlying']` lists its sessions and `coverage_minutes` holds an instant <= each decision time
 (chain_only for chain-based selection). The fetch plans are listed in DATA.md §4.15c. The fetch is
 `fetch --only databento_options`: budget-guarded, resumable, and every request is priced with

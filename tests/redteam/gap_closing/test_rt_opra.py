@@ -233,3 +233,14 @@ def test_rt_budget_check_and_ledger_append_are_not_atomic(cache, monkeypatch):
     [t.join() for t in th]
     spent = orig()
     assert spent <= D.budget_usd() + 1e-9, f"spent ${spent:.2f} > cap ${D.budget_usd():.2f} ({len(errs)} refused)"
+
+
+def test_planner_eod_options_accepting_t3_are_not_cut_to_opra(cache):
+    """(verifier) counterpart of the OPRA bound: an EOD options requirement that accepts T3 is served by the
+    synthetic fallback outside the OPRA sessions, so the window is not cut, and the run is tiered T3."""
+    _spxw_0dte_month(cache / "store")
+    port = _OPortal(cache, spans={"SPY": ALL})
+    reqs = [Requirement("bars", "1m", symbols=("SPY",)), Requirement("options", None, symbols=("SPX",))]
+    r = _plan_instance("T", _IInst(reqs, universe=["SPY"]), "1m", PlanContext(port, cache / "res"), _row())
+    assert r["testable"] == "Y", r["reason"]
+    assert r["start"] < "2024-01-02" and r["expected_fidelity"] == "T3_MODELED", r

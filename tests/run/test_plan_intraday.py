@@ -287,3 +287,19 @@ def test_plan_cache_drops_intraday_memo_when_intraday_data_changes(tmp_path):
     assert "bars|SPY|1d" in pc.cache                                # daily facts are not intraday-dependent
     assert pc.bar_range("SPY", "1m") == ["2024-01-02", "2024-01-31"]
     assert pc.quote_range("SPY") == _iso(days)
+
+
+def test_pit_members_every_session_persist_as_diffs(tmp_path):
+    # the per-session membership (every session, not samples) is stored as changes and replayed exactly
+    calls = []
+    rot = lambda d: (calls.append(d), ["A", "B", "C"] if d < pd.Timestamp("2020-01-02") else ["A", "B", "D"])[1]
+    port = _IPortal(tmp_path, spans={s: ALL for s in "ABCD"}, daily={s: "2010-01-04" for s in "ABCD"}, members=rot)
+    pc = PlanContext(port, tmp_path / "r", min_coverage=0.95)
+    first = pc._members_every_session(TOP)
+    n_calls = len(calls)
+    assert n_calls == len(first) and first[0] == ["A", "B", "C"] and first[-1] == ["A", "B", "D"]
+    rec = pc.cache[f"universe|{TOP}|every_session"]
+    assert len(rec["diffs"]) == 2                       # the first session + the 2020-01-02 swap
+    pc.save()
+    again = PlanContext(port, tmp_path / "r", min_coverage=0.95)._members_every_session(TOP)
+    assert again == first and len(calls) == n_calls     # replayed from plan_cache.json, no portal call

@@ -66,8 +66,8 @@ For each sheet id the runner instantiates the registered class with its sheet pa
 derive `universe` and `requires` from params; options strategies, for example, take them from
 `underlying`. Each critical `Requirement` is then resolved the way the engine resolves it at run start:
 `portal.has` must be true, and `portal.fidelity_of` must be neither NA nor worse than `min_fidelity`.
-The plan also checks facts that `has` cannot see. Intraday option quotes do not exist. Quote
-requirements are covered on 1 or 2 sample sessions only. `inav` has no source. A DAY_* sizing profile
+The plan also checks facts that `has` cannot see: the stored sessions of quotes and OPRA option
+quotes, and the engine's PRE/POST probes over the run's first 10 sessions. `inav` has no source. A DAY_* sizing profile
 on a daily bar frequency is untestable, which is the engine's own rule.
 
 Window start is the first session at which every critical input exists:
@@ -79,6 +79,9 @@ Window start is the first session at which every critical input exists:
 | PIT universe `SP500` | first month start at which PIT price coverage (`universe(require_bars=True)` / `universe()`, the engine's own windowed-`has()` definition) >= `--min-universe-coverage` (default 0.95 → 2018-04). The engine NOT_TESTABLEs a run when ANY member lacks data at the first session, and under the fail-closed identity layer some member always does (2008: 94 of 497 lack data, 2018: 8, 2024: 1). Since eea82fa the engine filters natively (`BacktestConfig.min_universe_coverage`; coverage in `meta['universe_coverage']`, flagged T2), and `--universe-coverage engine` (default) passes the threshold through. The runner's earlier `CoverageFilteredPortal` is kept as `--universe-coverage filter`. It drops members without daily data (has() true AND bars returned), logs every drop, and records the coverage per result. `strict` reproduces the engine rule (coverage 1.0, never met). Members without INTRADAY data are not dropped: those stay NOT_TESTABLE. |
 | events / fundamentals | first event in the store / first XBRL filing (2009-07-22) |
 | real option chains (`min_fidelity <= T2`) | first DoltHub snapshot of the underlying |
+| PIT universe (`SP500`, `SP500_TOPn_DV`) under an intraday strategy | the longest run of sessions at which coverage of THAT session's members is >= `--min-universe-coverage`, checked at EVERY session. A member counts when it has bars of every no-symbol bars frequency ON the session and passes the engine's member checks: `has` for the other no-symbol kinds, and every tier no worse than its `min_fidelity` (`Backtester._member_verified`). On the FINAL window the plan then runs the engine's window-dependent checks: the PRE/POST probe of the members kept at the first session over the first 10 sessions (the start moves forward until it passes), and the T2_PROXY flag when engine coverage (members with bars anywhere in the window) is below 100 % at any session |
+| quotes | first and last quote session, common to static symbols or the union over a PIT universe's members. A PRE/POST requirement counts only sessions with quotes the engine's probe classifies PRE/POST (Alpaca: a recorded window lying inside that period). The tier is compared with `min_fidelity`: an explicit symbol is refused, a universe member is dropped |
+| intraday or T0 options of an explicit underlying served by Databento OPRA | `Portal.opra_coverage(u)` first..last stored session (no other T0 option source exists) |
 
 When the binding constraint is a listing date, daily+ strategies get a 252-session warm-up, because no
 pre-listing history exists for indicators. Intraday strategies get none: they read prior daily and
@@ -88,7 +91,8 @@ family, module, bar_freq, sizing, testable, reason, start, end, n_sessions, expe
 critical tier), fidelity_notes, n_grid, est_runtime_min_baseline/grid (cost model in `plan.py`,
 calibrated on S050/S105 runs), universe, n_symbols, binding_constraint, hold, activity, stale; plus `variant_of`
 (base id of a proxy variant, §2b; empty for sheet strategies). Facts
-(bar ranges, SP500 coverage) are memoized in `results/plan_cache.json`. Delete that file after a data refresh.
+(bar ranges, SP500 coverage) are memoized in `results/plan_cache.json`. The intraday entries are dropped
+automatically when the intraday bar, quote or option-quote stores change; delete the file after any other data refresh.
 
 ## 2b. Proxy variants (`variants.py`)
 
