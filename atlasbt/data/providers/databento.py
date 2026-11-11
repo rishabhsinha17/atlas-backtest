@@ -10,6 +10,13 @@ Budget discipline (new accounts run on free credits):
   ``DATABENTO_BUDGET_USD`` (default $71.58, see ``budget_usd``) is refused (``BudgetExceeded``).
 * Raw responses are cached (gzip CSV under ``<cache>/raw/hist.databento.com/``) keyed by the
   request, so a re-run never pays twice.
+* Billable calls (``timeseries.get_range``) are NEVER retried automatically: a retry after a transport
+  error may be a second billed download that the single ledger row does not price. A failed transport
+  raises ``TransportFailed``; the ledger keeps the 'requested' row (counted, conservative) plus a
+  'failed:...' row, and ``run_jobs`` stops. Only the free endpoints (get_cost, symbology) back off.
+* The read of the spend, the cap check and the 'requested' append run under an OS file lock
+  (``fcntl.flock`` on ``databento_ledger.csv.lock``), so concurrent fetch processes cannot both pass the
+  cap on the same remaining budget.
 
 Endpoints (https://hist.databento.com/v0/, POST form):
   metadata.get_cost       dataset, symbols, schema, start, end, stype_in -> USD (float)
@@ -31,7 +38,9 @@ snapshots (``portal.OPTION_SOURCE_FIDELITY['databento']``), ``known_at = ts``.
 """
 from __future__ import annotations
 
+import contextlib
 import csv
+import fcntl
 import gzip
 import hashlib
 import io
@@ -71,6 +80,15 @@ class NeedsUser(RuntimeError):
     """The account requires something from the user (payment details, credits exhausted, auth)."""
 
 
+class TransportFailed(RuntimeError):
+    """A billable request failed in transport (network error, 429, 5xx). Not retried: the download may
+    have been billed. The ledger keeps it as spent."""
+
+
+#: endpoints that bill per request: never retried automatically
+BILLABLE_ENDPOINTS = frozenset({"timeseries.get_range"})
+
+
 def available() -> bool:
     return env("DATABENTO_API_KEY") is not None
 
@@ -95,22 +113,30 @@ def raw_dir() -> Path:
 
 # ============================================================================ HTTP
 def _post(endpoint: str, data: dict, timeout: int = 600) -> requests.Response:
+    """POST one endpoint. Free endpoints back off and retry (5 attempts) on network errors / 429 / 5xx;
+    billable endpoints (BILLABLE_ENDPOINTS) make exactly ONE attempt and raise TransportFailed."""
     if os.environ.get("ATLASBT_OFFLINE") == "1":
         raise RuntimeError("ATLASBT_OFFLINE=1: Databento requests disabled")
     key = env("DATABENTO_API_KEY")
     if key is None:
         raise RuntimeError("DATABENTO_API_KEY not set")
+    billable = endpoint in BILLABLE_ENDPOINTS
     last = None
-    for attempt in range(5):
+    for attempt in range(1 if billable else 5):
         try:
             r = requests.post(BASE + endpoint, data=data, auth=(key["DATABENTO_API_KEY"], ""), timeout=timeout,
                               headers={"User-Agent": config.USER_AGENT})
-        except requests.RequestException as e:          # network: back off and retry
+        except requests.RequestException as e:          # network: back off and retry (free endpoints)
             last = e
+            if billable:
+                raise TransportFailed(f"Databento {endpoint}: {type(e).__name__}: {e} (not retried: "
+                                      f"the request may have been billed)") from e
             time.sleep(2 ** attempt)
             continue
         if r.status_code in (429,) or r.status_code >= 500:
             last = RuntimeError(f"HTTP {r.status_code}")
+            if billable:
+                raise TransportFailed(f"Databento {endpoint}: HTTP {r.status_code} (not retried)")
             time.sleep(float(r.headers.get("Retry-After", 2 ** attempt)))
             continue
         if r.status_code in (401, 402, 403):
@@ -156,15 +182,37 @@ def spent_usd(ledger: Optional[pd.DataFrame] = None) -> float:
     return float(pd.to_numeric(lg.loc[lg["status"] == "requested", "cost_usd"], errors="coerce").fillna(0).sum())
 
 
-def _ledger_append(row: dict) -> None:
+@contextlib.contextmanager
+def _ledger_lock():
+    """Exclusive OS lock (fcntl.flock) of the ledger across processes and threads: each holder opens its own
+    descriptor of ``<ledger>.lock``, and flock locks of distinct open descriptions exclude each other."""
     p = ledger_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    new = not p.exists()
+    with open(p.with_name(p.name + ".lock"), "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _ledger_write(row: dict) -> None:
+    """Append one row; the caller holds _ledger_lock."""
+    p = ledger_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    new = not p.exists() or p.stat().st_size == 0
     with open(p, "a", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=LEDGER_COLS)
         if new:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in LEDGER_COLS})
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _ledger_append(row: dict) -> None:
+    with _ledger_lock():
+        _ledger_write(row)
 
 
 def _request_key(p: dict) -> str:
@@ -195,20 +243,26 @@ def get_range_csv(dataset: str, schema: str, symbols, start, end, stype_in: str 
             return fh.read()
     n, ssum = _sym_summary(symbols)
     cost = get_cost(dataset, schema, symbols, start, end, stype_in)
-    spent = spent_usd()
     base = {"timestamp": pd.Timestamp.now(tz="UTC").isoformat(), "dataset": dataset, "schema": schema,
             "stype_in": stype_in, "n_symbols": n, "symbols": ssum, "start": p["start"], "end": p["end"],
             "cost_usd": round(cost, 6), "tag": tag, "request_key": key}
-    if spent + cost > budget_usd() or (max_cost_usd is not None and cost > max_cost_usd):
-        _ledger_append({**base, "status": "refused"})
-        raise BudgetExceeded(f"cost ${cost:.4f} (spent ${spent:.2f}, budget ${budget_usd():.2f}, "
-                             f"per-request cap {max_cost_usd})")
-    _ledger_append({**base, "status": "requested"})
+    # read spend -> check the cap -> append 'requested' is one critical section across processes: two
+    # fetches must not both pass the cap on the same remaining budget
+    with _ledger_lock():
+        spent = spent_usd()
+        if spent + cost > budget_usd() or (max_cost_usd is not None and cost > max_cost_usd):
+            _ledger_write({**base, "status": "refused"})
+            raise BudgetExceeded(f"cost ${cost:.4f} (spent ${spent:.2f}, budget ${budget_usd():.2f}, "
+                                 f"per-request cap {max_cost_usd})")
+        _ledger_write({**base, "status": "requested"})
     _LAST_COST[0] = cost
     try:
-        r = _post("timeseries.get_range", p)
+        r = _post("timeseries.get_range", p)          # one attempt: never retried (may be billed)
     except Exception as e:
-        _ledger_append({**base, "cost_usd": 0.0, "status": f"failed:{type(e).__name__}"})
+        # the 'requested' row stays and keeps counting in spent_usd (conservative: the server may have
+        # billed it); this row records the failure with the same cost for the audit trail and is NOT
+        # summed again (spent_usd counts 'requested' rows only)
+        _ledger_append({**base, "status": f"failed:{type(e).__name__}"})
         raise
     body = r.content
     if len(body) <= RAW_CACHE_MAX_BYTES:
@@ -812,6 +866,12 @@ def run_jobs(jobs: Iterable[Job], dry_run: bool = False, log=print, max_cost_per
                         job.post(raw)
         except BudgetExceeded as e:
             tot["stopped"] = f"budget: {e}"
+            log(f"[databento] STOP {job.key}: {e}")
+            break
+        except TransportFailed as e:
+            # a billable download failed in transport: stop (no automatic re-request; the job is not
+            # marked done, so a later run resumes it and pays -- and ledgers -- it again)
+            tot["stopped"] = f"transport: {e}"
             log(f"[databento] STOP {job.key}: {e}")
             break
         except NeedsUser as e:

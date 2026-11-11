@@ -190,10 +190,15 @@ def test_rt_get_range_retry_after_transport_error_is_not_ledgered(cache, monkeyp
     monkeypatch.setattr(D.requests, "post", fake_post)
     monkeypatch.setattr(D.time, "sleep", lambda s: None)
     monkeypatch.setenv("DATABENTO_BUDGET_USD", "1.0")
-    D.get_range_csv(D.OPRA, "cbbo-1m", ["SPXW  240102C04700000"], utc("2024-01-02 14:30"), utc("2024-01-02 14:32"))
+    # (verifier) policy: billable calls are never retried; the failed transport aborts the request
+    with pytest.raises(D.TransportFailed):
+        D.get_range_csv(D.OPRA, "cbbo-1m", ["SPXW  240102C04700000"], utc("2024-01-02 14:30"),
+                        utc("2024-01-02 14:32"))
     lg = D.read_ledger()
     n_req = int((lg["status"] == "requested").sum())
     assert len(sent) == n_req, f"{len(sent)} get_range downloads sent, {n_req} priced in the ledger"
+    assert lg["status"].str.startswith("failed").sum() == 1          # the failure is on record
+    assert D.spent_usd() == pytest.approx(0.5)                       # and still counted as spent
 
 
 def test_rt_budget_check_and_ledger_append_are_not_atomic(cache, monkeypatch):

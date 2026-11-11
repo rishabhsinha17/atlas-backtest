@@ -591,7 +591,14 @@ Key `DATABENTO_API_KEY` (environment only, sourced from `~/.atlasbt/secrets.env`
 account runs on free credits, so **every data request is priced first** (`metadata.get_cost`), written to the
 ledger `cache/raw/databento_ledger.csv` (timestamp, dataset, schema, symbols, window, cost, status) and refused
 if the cumulative spend would exceed `DATABENTO_BUDGET_USD` (default **$71.58**: the remaining credit; the
-ledger of the first $18.42 was lost with the old machine, so the cap must be what is left). Listings come from the free
+ledger of the first $18.42 was lost with the old machine, so the cap must be what is left). Reading the
+spend, checking the cap and appending the 'requested' row run under an OS file lock (`fcntl.flock` on
+`databento_ledger.csv.lock`), so concurrent fetch processes cannot both spend the same remaining budget.
+**Billable downloads (`timeseries.get_range`) are never retried automatically**: a retry after a transport
+error could be a second billed download that one ledger row does not price. A network error, 429 or 5xx
+raises `TransportFailed`; the 'requested' row stays counted (conservative), a `failed:...` row records it,
+and `run_jobs` stops without marking the job done (a later run re-requests and re-ledgers it). Only the
+free endpoints (`metadata.get_cost`, `symbology.resolve`) back off and retry. Listings come from the free
 `symbology.resolve` (parent `<ROOT>.OPT` -> every OSI symbol listed that day). Small raw responses are cached
 (`cache/raw/hist.databento.com/`); large ones are not (disk) -- the parquet store plus the progress ledger
 `cache/logs/databento_progress.jsonl` make `python -m atlasbt.data.fetch --only databento_options` resumable

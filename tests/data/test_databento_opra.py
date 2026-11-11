@@ -488,3 +488,44 @@ def test_budget_default_is_the_remaining_cap(monkeypatch):
     assert D.budget_usd() == pytest.approx(71.58)
     monkeypatch.setenv("DATABENTO_BUDGET_USD", "12.5")
     assert D.budget_usd() == pytest.approx(12.5)
+
+
+
+def test_run_jobs_stops_on_a_failed_billable_transport(cache, monkeypatch):
+    """A transport failure of timeseries.get_range is not retried and stops run_jobs: the next job is not
+    requested, the failed job is not marked done, and its 'requested' row stays counted."""
+    calls = []
+    inner = _fake_client(calls)
+
+    def flaky(endpoint, data, timeout=600):
+        if endpoint == "timeseries.get_range":
+            calls.append((endpoint, dict(data)))
+            raise D.TransportFailed("read timed out")
+        return inner(endpoint, data, timeout)
+
+    monkeypatch.setattr(D, "_post", flaky)
+    monkeypatch.setenv("DATABENTO_BUDGET_USD", "71.58")
+    jobs = D.plan_spx_0dte("2024-01-02", "2024-01-03", _ref(["2024-01-02", "2024-01-03"]))
+    r = D.run_jobs(jobs, log=lambda *a: None)
+    assert str(r["stopped"]).startswith("transport")
+    assert [e for e, _ in calls].count("timeseries.get_range") == 1
+    lg = D.read_ledger()
+    assert list(lg["status"]) == ["requested", "failed:TransportFailed"]
+    assert D.spent_usd() == pytest.approx(0.01) and not D.done_keys()
+
+
+def test_post_never_retries_billable_endpoints(cache, monkeypatch):
+    import requests as rq
+    sent = []
+
+    def boom(url, **kw):
+        sent.append(url.rsplit("/", 1)[-1])
+        raise rq.exceptions.ConnectionError("reset")
+
+    monkeypatch.setattr(D.requests, "post", boom)
+    monkeypatch.setattr(D.time, "sleep", lambda s: None)
+    with pytest.raises(D.TransportFailed):
+        D._post("timeseries.get_range", {})
+    with pytest.raises(RuntimeError, match="retries exhausted"):
+        D._post("metadata.get_cost", {})          # free endpoint: backs off and retries
+    assert sent == ["timeseries.get_range"] + ["metadata.get_cost"] * 5
