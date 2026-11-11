@@ -471,9 +471,30 @@ class OpraReader:
         self.max_days = max_days
         self._days: dict = {}
         self._frames: dict = {}
+        self._roots: dict = {}
 
-    def has(self, und: str) -> bool:
-        return len(self.days(und)) > 0
+    def has(self, und: str, root: Optional[str] = None) -> bool:
+        """Files exist for ``und``; with ``root`` (e.g. 'SPXW' inside the SPX files): some file holds a row
+        of that OSI root (the first hit ends the scan; memoized)."""
+        if root is None:
+            return len(self.days(und)) > 0
+        return self.has_root(und, root)
+
+    def has_root(self, und: str, root: str) -> bool:
+        key = (str(und).upper(), str(root).upper())
+        memo = self._roots
+        if key not in memo:
+            hit = False
+            for d in self.days(key[0]):
+                try:
+                    f = pd.read_parquet(day_path(key[0], d, self.root), columns=["symbol"])
+                except Exception:
+                    continue
+                if (f["symbol"].astype(str).str[:6].str.strip() == key[1]).any():
+                    hit = True
+                    break
+            memo[key] = hit
+        return memo[key]
 
     def days(self, und: str) -> list:
         key = str(und).upper()

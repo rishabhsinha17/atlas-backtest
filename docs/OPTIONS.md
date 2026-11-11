@@ -415,7 +415,9 @@ trading day: an SPX AM monthly listed by OPRA under Friday 2024-01-19 is `SPX   
 2024-01-19 open (SOQ). `Portal.instrument(symbol)` rebuilds the same settlement from the root, so
 `lifecycle.settlement_due` settles AM at the next session and PM at the expiry close.
 `option_chain('SPX')` returns both roots; `option_chain('SPXW')`, `has('SPXW', 'options', '1m')` and
-`fidelity_of` serve only the SPXW rows of the SPX files.
+`fidelity_of` serve only the SPXW rows of the SPX files. SPX files that hold no SPXW row (SPX AM
+monthlies only) do not make `SPXW` T0: `has('SPXW', 'options', '1m')` is then False, like
+`coverage('SPXW')`.
 
 **Coverage (for the planner; no network, no key).**
 
